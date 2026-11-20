@@ -1,0 +1,52 @@
+# KubeCause kind 新案例：demo-bad-image 镜像拉取失败场景
+# 用法（Mac 上，kind 集群已建好）：
+#   kubectl apply -f scripts/kind/demo-bad-image.yaml
+#   # 或一键：
+#   bash scripts/kind/setup-bad-image.sh
+#
+# 设计说明：
+# - 这是给 Agent 的“通用发现能力”测试案例，不是给 demo-api 换皮：
+#   镜像用一个不存在的 tag（nginx:9.9.9-nonexistent），Pod 永远拉不到镜像，
+#   卡在 ImagePullBackOff，事件里有 Failed to pull image，日志为空。
+# - 不要给它加内存泄漏逻辑，不要改成 OOM 场景——这个案例就是要看
+#   Agent 能不能靠通用工具（list_problem_pods、get_pod、get_events、
+#   search_runbooks）自己发现“镜像 tag 不存在”，而不是靠代码里的特例。
+# - 代码里没有任何针对这个案例的特殊处理：Go 代码里没有 demo-bad-image
+#   这个字符串，没有为它加 runbook（已有的 runbooks/imagepull.md 已够用），
+#   fake 客户端里也没有预置它。这个案例只在真集群上测。
+# - 预期：Agent 应该给出文字建议“镜像 tag 不存在，改成存在的 tag，
+#   例如 nginx:1.25”，并且不应该给出一张内存修复卡——
+#   不是 OOM，调内存 limit 对拉不到镜像没有任何帮助。
+#   如果 Agent 给了内存修复卡，就是 bug。
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-bad-image
+  namespace: demo
+  labels:
+    app: demo-bad-image
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: demo-bad-image
+  template:
+    metadata:
+      labels:
+        app: demo-bad-image
+    spec:
+      containers:
+        - name: demo-bad-image
+          image: nginx:9.9.9-nonexistent
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "100m"
+            limits:
+              memory: "128Mi"
+              cpu: "500m"

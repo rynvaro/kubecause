@@ -80,6 +80,31 @@ type Report struct {
 	SuggestedRepair *SuggestedRepair `json:"suggestedRepair,omitempty"`
 }
 
+// Normalize 把 Report 里的切片字段补成空数组而不是 nil。
+// 为什么必须做：真模型返回的 JSON 缺字段时，Go 解出来是 nil，
+// 再序列化成 JSON 就是 null，前端读 report.facts.length 会直接抛错，
+// 整个 React 应用白屏（Slice 7 用户在 Mac 真机上遇到的就是这个）。
+// 归一化后序列化出来是 []，前端读 length 得到 0，不会崩。
+// 调用点：ValidateReport（单次诊断和对话的报告都要过它），
+// 以及 model.parseDiagnosisArgs（模型刚解析完报告时就归一化）。
+func (r *Report) Normalize() {
+	if r == nil {
+		return
+	}
+	if r.Facts == nil {
+		r.Facts = []string{}
+	}
+	if r.EvidenceIDs == nil {
+		r.EvidenceIDs = []string{}
+	}
+	if r.Recommendations == nil {
+		r.Recommendations = []string{}
+	}
+	if r.OpenQuestions == nil {
+		r.OpenQuestions = []string{}
+	}
+}
+
 // ToolCall 是模型返回的一次结构化工具调用。
 type ToolCall struct {
 	ID   string            `json:"id"`
@@ -220,6 +245,9 @@ func ValidateReport(rep *Report, validEvidence map[string]bool) {
 	if rep == nil {
 		return
 	}
+	// 先归一化：缺失的切片字段补成空数组，序列化后是 [] 而不是 null，
+	// 前端读 .length 不会抛错（见 Report.Normalize 的注释）。
+	rep.Normalize()
 	kept := make([]string, 0, len(rep.EvidenceIDs))
 	for _, id := range rep.EvidenceIDs {
 		if validEvidence[id] {

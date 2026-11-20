@@ -4,9 +4,9 @@
 // 也不要靠猜 JSON 的形状（见 types.buildBlocks）；
 // 系统命名空间的行带“系统”徽章；工具失败要显示失败原因，不要吞掉。
 
-import { useState } from 'react'
-import type { ReactNode } from 'react'
-import { buildBlocks } from './types'
+import { Component, useState } from 'react'
+import type { ErrorInfo, ReactNode } from 'react'
+import { buildBlocks, normalizeReport } from './types'
 import type {
   ChangeRequest,
   ClusterOverview,
@@ -14,6 +14,7 @@ import type {
   PodRow,
   Report,
   ResultBlock,
+  RunbookSnippet,
   RunSnapshot,
   RunStep,
   SuggestedRepair,
@@ -25,6 +26,122 @@ function argsText(args?: Record<string, string>): string {
   return Object.entries(args)
     .map(([k, v]) => `${k}=${v}`)
     .join(' ')
+}
+
+/** 错误边界（Slice 7）：包住聊天消息区和正式诊断卡片。
+ * 某个卡片渲染出错时只显示这个 fallback，不让整个页面白屏。
+ * 白屏的根因是 Report 里的 null 数组（已在后端归一化 + 前端兜底），
+ * 但以后任何一个渲染组件再抛错，这里都是最后一道防线。 */
+export class ErrorBoundary extends Component<{ children: ReactNode }, { hasError: boolean; message: string }> {
+  constructor(props: { children: ReactNode }) {
+    super(props)
+    this.state = { hasError: false, message: '' }
+  }
+  static getDerivedStateFromError(err: Error) {
+    return { hasError: true, message: err.message }
+  }
+  componentDidCatch(err: Error, info: ErrorInfo) {
+    // 只记日志，不上报、不吞掉其他状态。
+    console.error('KubeCause 渲染出错（已被错误边界接住）：', err, info)
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="card error-fallback">
+          <h4>这个卡片渲染失败了</h4>
+          <p className="small muted">{this.state.message || '未知渲染错误'}</p>
+          <p className="small">其他内容不受影响。点下面刷新页面，重新拉一次会话。</p>
+          <button onClick={() => window.location.reload()}>刷新页面</button>
+        </div>
+      )
+    }
+    return this.props.children
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 轻量 Markdown 渲染（Slice 7，手写，不引入重型 Markdown 库）。
+// 助手消息以前是 white-space: pre-wrap 原样显示，
+// 模型返回的“- 列表”“**加粗**”全是一坨纯文本，历史记录没法看。
+// 这里只支持最常用的四种：**加粗**、 `代码`、- 无序列表、1. 有序列表，
+// 再加空行分段。解析失败时 fallback 回纯文本，绝不白屏。
+// ---------------------------------------------------------------------------
+
+/** 行内解析：**加粗** 和 `代码`，其他原样返回。 */
+function renderInline(text: string, keyPrefix: string): ReactNode[] {
+  // 按 **...** 或 `...` 切段，奇数段是标记内容。
+  const parts = text.split(/(\*\*[^*]+\*\*|`[^`]+`)/g)
+  return parts.map((p, i) => {
+    if (p.startsWith('**') && p.endsWith('**') && p.length > 4) {
+      return <b key={`${keyPrefix}-${i}`}>{p.slice(2, -2)}</b>
+    }
+    if (p.startsWith('`') && p.endsWith('`') && p.length > 2) {
+      return <code key={`${keyPrefix}-${i}`}>{p.slice(1, -1)}</code>
+    }
+    return <span key={`${keyPrefix}-${i}`}>{p}</span>
+  })
+}
+
+/** 助手消息的 Markdown 渲染：分段落、无序列表、有序列表。 */
+export function MarkdownText({ text }: { text: string }) {
+  let nodes: ReactNode[]
+  try {
+    nodes = renderMarkdownBlocks(text ?? '')
+  } catch {
+    // 渲染失败时 fallback 回纯文本，不要白屏。
+    return <div className="msg-text">{text}</div>
+  }
+  return <div className="msg-text">{nodes}</div>
+}
+
+function renderMarkdownBlocks(text: string): ReactNode[] {
+  const lines = text.split('\n')
+  const out: ReactNode[] = []
+  let i = 0
+  let key = 0
+  while (i < lines.length) {
+    const line = lines[i]
+    if (line.trim() === '') {
+      i++
+      continue
+    }
+    // 无序列表：连续的 "- " / "* " / "• " 行成一组。
+    if (/^\s*[-*•]\s+/.test(line)) {
+      const items: string[] = []
+      while (i < lines.length && /^\s*[-*•]\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^\s*[-*•]\s+/, ''))
+        i++
+      }
+      out.push(
+        <ul key={key++} className="md-list">
+          {items.map((it, j) => (
+            <li key={j}>{renderInline(it, `ul-${key}-${j}`)}</li>
+          ))}
+        </ul>,
+      )
+      continue
+    }
+    // 有序列表：连续的 "1. " / "1) " 行成一组。
+    if (/^\s*\d+[.)]\s+/.test(line)) {
+      const items: string[] = []
+      while (i < lines.length && /^\s*\d+[.)]\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^\s*\d+[.)]\s+/, ''))
+        i++
+      }
+      out.push(
+        <ol key={key++} className="md-list">
+          {items.map((it, j) => (
+            <li key={j}>{renderInline(it, `ol-${key}-${j}`)}</li>
+          ))}
+        </ol>,
+      )
+      continue
+    }
+    // 普通段落。
+    out.push(<p key={key++}>{renderInline(line, `p-${key}`)}</p>)
+    i++
+  }
+  return out
 }
 
 function parseStepArgs(step: RunStep): Record<string, string> {
@@ -237,13 +354,15 @@ function SystemBadge() {
 }
 
 export function OverviewCards({ overview }: { overview: ClusterOverview }) {
+  // 防御：后端返回的总览缺字段时按 0 显示，不读 undefined 的属性。
+  const o = overview ?? {}
   const cards: Array<{ label: string; value: number | string }> = [
-    { label: '节点', value: overview.nodes },
-    { label: '命名空间', value: overview.namespaces },
-    { label: 'Deployment', value: overview.deployments },
-    { label: 'Pod', value: overview.pods },
-    { label: '有问题 Pod', value: overview.problemPods },
-    { label: '未就绪 Deployment', value: overview.notReadyDeployments },
+    { label: '节点', value: o.nodes ?? 0 },
+    { label: '命名空间', value: o.namespaces ?? 0 },
+    { label: 'Deployment', value: o.deployments ?? 0 },
+    { label: 'Pod', value: o.pods ?? 0 },
+    { label: '有问题 Pod', value: o.problemPods ?? 0 },
+    { label: '未就绪 Deployment', value: o.notReadyDeployments ?? 0 },
   ]
   return (
     <div className="cards">
@@ -253,11 +372,11 @@ export function OverviewCards({ overview }: { overview: ClusterOverview }) {
           <div className="stat-label">{c.label}</div>
         </div>
       ))}
-      {overview.systemNamespaces !== undefined && overview.systemNamespaces > 0 && (
+      {o.systemNamespaces !== undefined && o.systemNamespaces > 0 && (
         <div className="stat-note">
-          其中系统命名空间 {overview.systemNamespaces} 个
-          {overview.systemProblemPods !== undefined && overview.systemProblemPods > 0
-            ? `，系统 Pod 有问题 ${overview.systemProblemPods} 个`
+          其中系统命名空间 {o.systemNamespaces} 个
+          {o.systemProblemPods !== undefined && o.systemProblemPods > 0
+            ? `，系统 Pod 有问题 ${o.systemProblemPods} 个`
             : ''}
         </div>
       )}
@@ -268,8 +387,10 @@ export function OverviewCards({ overview }: { overview: ClusterOverview }) {
 export function PodTable({ rows }: { rows: PodRow[] }) {
   // 长列表默认只显示前 10 行，点开看全部：聊天里先给摘要，不把整张表一次性顶上去。
   const [showAll, setShowAll] = useState(false)
-  if (rows.length === 0) return <p className="muted">没有符合条件的 Pod。</p>
-  const shown = showAll ? rows : rows.slice(0, 10)
+  // 防御：rows 为 null / undefined 时当作空列表，不读 .length。
+  const list = rows ?? []
+  if (list.length === 0) return <p className="muted">没有符合条件的 Pod。</p>
+  const shown = showAll ? list : list.slice(0, 10)
   return (
     <>
       <table className="tbl">
@@ -301,9 +422,9 @@ export function PodTable({ rows }: { rows: PodRow[] }) {
           ))}
         </tbody>
       </table>
-      {rows.length > 10 && (
+      {list.length > 10 && (
         <button className="link-btn" onClick={() => setShowAll(!showAll)}>
-          {showAll ? '收起' : `展开全部 ${rows.length} 行 ▼`}
+          {showAll ? '收起' : `展开全部 ${list.length} 行 ▼`}
         </button>
       )}
     </>
@@ -311,7 +432,9 @@ export function PodTable({ rows }: { rows: PodRow[] }) {
 }
 
 export function DeploymentTable({ rows }: { rows: DeploymentRow[] }) {
-  if (rows.length === 0) return <p className="muted">没有符合条件的 Deployment。</p>
+  // 防御：rows 为 null / undefined 时当作空列表。
+  const list = rows ?? []
+  if (list.length === 0) return <p className="muted">没有符合条件的 Deployment。</p>
   return (
     <table className="tbl">
       <thead>
@@ -324,7 +447,7 @@ export function DeploymentTable({ rows }: { rows: DeploymentRow[] }) {
         </tr>
       </thead>
       <tbody>
-        {rows.map((r) => (
+        {list.map((r) => (
           <tr key={`${r.namespace}/${r.name}`}>
             <td>
               <code>{r.name}</code>
@@ -391,14 +514,35 @@ function ResultBlockView({ block, onConvert, converting }: { block: ResultBlock;
       )
       break
     }
-    case 'report':
-      body = <ReportView report={block.data as Report} />
-      summary = (block.data as Report).cause
+    case 'report': {
+      const rep = normalizeReport(block.data)
+      body = <ReportView report={rep} />
+      summary = rep.cause || '诊断报告'
       break
+    }
     case 'repairSuggestion': {
       const sr = block.data as SuggestedRepair
-      summary = `${sr.namespace}/${sr.deployment} ${sr.oldValue} → ${sr.newValue}`
+      if (!sr || !sr.namespace || !sr.deployment) return null
+      summary = `${sr.namespace}/${sr.deployment} ${sr.oldValue ?? ''} → ${sr.newValue ?? ''}`
       body = <RepairSuggestionCard sr={sr} onConvert={onConvert} converting={converting} />
+      break
+    }
+    case 'runbooks': {
+      // 参考了哪篇手册：每个片段带标题和关键句，点开看全文要点。
+      // runbooks 是 RAG 知识库（runbooks/*.md，FTS5 索引），不是为某个案例写的特例。
+      const snippets = (block.data ?? []) as RunbookSnippet[]
+      summary = `${snippets.length} 篇手册`
+      body = (
+        <ul className="ev-list">
+          {snippets.map((s, i) => (
+            <li key={i}>
+              <b>{s.title || '排障手册'}</b>
+              {s.source && <span className="muted">（{s.source}）</span>}
+              {s.content && <div className="muted small">{s.content}</div>}
+            </li>
+          ))}
+        </ul>
+      )
       break
     }
     case 'text':
@@ -421,7 +565,7 @@ function ResultBlockView({ block, onConvert, converting }: { block: ResultBlock;
 }
 
 /** 结构化结果渲染：先按类型包成结果块（types.buildBlocks），再按块渲染。
- * 审批卡、修复建议卡的“转成正式诊断”按钮只要有建议卡就一直显示，
+ * 审批卡、修复建议卡的“创建可审批的修复任务”按钮只在有建议卡时显示，
  * 不只在最新一条消息上才显示，翻历史、刷新后按钮还在。 */
 export function StructuredView({
   structured,
@@ -464,61 +608,69 @@ export function RepairSuggestionCard({
         理由：{sr.reason}
       </p>
       <p className="muted small">
-        这只是一张建议卡。想走正式流程，点“转成正式诊断”，生成提案后人工审批才会执行。
+        这只是一张建议卡，不会自动改集群。想走正式流程，点“创建可审批的修复任务”，
+        生成一份带提案的诊断任务，人工审批后才会执行。
       </p>
       {onConvert && (
         <button onClick={onConvert} disabled={converting}>
-          {converting ? '转换中…' : '转成正式诊断'}
+          {converting ? '创建中…' : '创建可审批的修复任务'}
         </button>
       )}
     </div>
   )
 }
 
-/** 诊断报告展示：原因、置信度、事实、建议、待确认。 */
+/** 诊断报告展示：原因、置信度、事实、建议、待确认。
+ * 防御：报告字段为 null 时（历史库里的旧报告）先归一化成空数组，
+ * 再读 .length，绝不因为一个 null 字段让整个页面白屏。 */
 export function ReportView({ report }: { report: Report }) {
+  const rep = normalizeReport(report)
+  const facts = rep.facts ?? []
+  const recommendations = rep.recommendations ?? []
+  const openQuestions = rep.openQuestions ?? []
+  const evidenceIds = rep.evidenceIds ?? []
   return (
     <div className="card">
       <h4>
         诊断报告{' '}
-        <span className={`conf conf-${report.confidence}`}>置信度 {report.confidence}</span>
+        <span className={`conf conf-${rep.confidence || 'medium'}`}>置信度 {rep.confidence || 'medium'}</span>
       </h4>
       <p>
         <b>原因：</b>
-        {report.cause}
+        {rep.cause || '暂无结论'}
       </p>
-      {report.facts.length > 0 && (
+      {facts.length > 0 && (
         <>
           <h5>事实依据</h5>
           <ul>
-            {report.facts.map((f, i) => (
+            {facts.map((f, i) => (
               <li key={i}>{f}</li>
             ))}
           </ul>
         </>
       )}
-      {report.recommendations.length > 0 && (
+      {recommendations.length > 0 && (
         <>
           <h5>建议</h5>
           <ul>
-            {report.recommendations.map((r, i) => (
+            {recommendations.map((r, i) => (
               <li key={i}>{r}</li>
             ))}
           </ul>
         </>
       )}
-      {report.openQuestions.length > 0 && (
+      {openQuestions.length > 0 && (
         <>
           <h5>还没确认</h5>
           <ul>
-            {report.openQuestions.map((q, i) => (
+            {openQuestions.map((q, i) => (
               <li key={i}>{q}</li>
             ))}
           </ul>
         </>
       )}
-      {report.evidenceIds.length > 0 && (
-        <p className="muted small">证据：{report.evidenceIds.join('、')}</p>
+      {evidenceIds.length > 0 && (
+        <p className="muted small">证据：{evidenceIds.join('、')}</p>
       )}
     </div>
   )

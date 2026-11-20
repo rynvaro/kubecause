@@ -350,7 +350,7 @@ type ConvertRequest struct {
 }
 
 // ConvertConversation 处理 POST /api/conversations/{id}/convert，
-// 把对话转成正式诊断任务，返回 runId。转换本身不执行修复，
+// 把对话创建可审批的修复任务任务，返回 runId。转换本身不执行修复，
 // 修复还是要走提案 + 人工审批 + 执行验证。
 func (h *Handler) ConvertConversation(w http.ResponseWriter, r *http.Request) {
 	if !h.requireChat(w) {

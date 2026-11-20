@@ -28,7 +28,7 @@ const chatSystemPrompt = `你是 Kubernetes 故障诊断助手，正在和用户
 3. 指代消解：用户说的“这个命名空间”、“刚才那个 Pod”、“它”、“那个一直重启的”要按会话历史里的最近提到的目标来理解。如果历史里没有明确的目标，或者有多个可能的目标，不要猜，直接问用户是哪个命名空间、哪个 Pod。
 4. 系统命名空间可以查、可以诊断，但不要把它当成用户业务下结论：如果查到的有问题 Pod 在 kube-system 等系统命名空间里，要明确说明这是系统组件，并且不要给它出修复建议——修复校验本来就会拒绝系统命名空间的修改。
 5. 证据不足时不要硬编结论，要说还需要补查什么。回答用中文，简明扼要，先给结论再给依据。
-6. 如果证据明确指向容器内存 limit 过低，可以在回答最后给出修复建议（目标、旧值、新值、理由），并提醒用户：这只是建议，要走正式诊断、人工审批后才会执行。
+6. 如果证据明确指向容器内存 limit 过低，可以在回答最后给出修复建议（目标、旧值、新值、理由），并提醒用户：这只是建议，要创建可审批的修复任务、人工审批后才会执行。
 7. 修复建议必须通过 submit_diagnosis 的 suggestedRepair 结构化字段返回，不要只在自由文本里提一句。用户如果明确说了增加量（例如“增加 128Mi”、“调到 256Mi”），按用户说的算新值：先查当前值，再按用户说的增量或目标值算，不要默认翻倍。没有用户明确要求时，也按证据算一个合理的新值，不要只会翻倍。
 8. 修复决策只能由你做：后端只做校验，不会替你合成建议。如果你给不出结构化建议，就老实说证据不足、还需要补查什么，不要编一个建议。`
 
@@ -74,6 +74,9 @@ func (s *Service) runReal(ctx context.Context, conversationID, text string, hist
 			replyText := st.Content
 			var sr *agent.SuggestedRepair
 			if st.Report != nil {
+				// 报告刚拿到就归一化：缺失的切片字段补成空数组，
+				// 否则落盘再序列化成 null，前端读 .length 会白屏。
+				st.Report.Normalize()
 				replyText = formatReportReply(st.Report)
 				structured["report"] = st.Report
 				sr = st.Report.SuggestedRepair
@@ -87,7 +90,7 @@ func (s *Service) runReal(ctx context.Context, conversationID, text string, hist
 			}
 			if sr != nil {
 				structured["suggestedRepair"] = sr
-				replyText += fmt.Sprintf("\n修复建议：%s/%s 容器 %s 的内存 limit 从 %s 调到 %s（%s）。这只是一张建议卡，不会自动执行——想走正式流程可以转成正式诊断，生成提案后人工审批再执行。",
+				replyText += fmt.Sprintf("\n修复建议：%s/%s 容器 %s 的内存 limit 从 %s 调到 %s（%s）。这只是一张建议卡，不会自动执行——想走正式流程可以点“创建可审批的修复任务”，生成提案后人工审批再执行。",
 					sr.Namespace, sr.Deployment, sr.Container, sr.OldValue, sr.NewValue, sr.Reason)
 			}
 			return &Reply{Reply: replyText, ToolCalls: recs, Structured: structured, SuggestedRepair: sr}, nil
@@ -129,6 +132,32 @@ func (s *Service) runReal(ctx context.Context, conversationID, text string, hist
 		recs = append(recs, rec)
 		outputs = append(outputs, out)
 		structured[tc.Name] = out.Data
+		// 规范 key 映射（Slice 7 修的“后续追问只剩纯文本”）：
+		// 以前这里只存了 structured[工具名]，例如 structured["get_pod"]，
+		// 但前端 buildBlocks 只认规范 key（overview、problemPods、pod……），
+		// 工具名当 key 的结果会被过滤掉，结果就是聊天里只剩文字、没有卡片，
+		// 刷新后也一样。现在每个工具的结果同时写一份规范 key，
+		// 工具名那份留着做追溯，两份都落盘，刷新后卡片还在。
+		switch tc.Name {
+		case "get_cluster_overview":
+			structured["overview"] = out.Data
+		case "list_problem_pods":
+			structured["problemPods"] = out.Data
+		case "list_workload_pods":
+			structured["pods"] = out.Data
+		case "get_pod":
+			structured["pod"] = out.Data
+		case "get_deployment":
+			structured["deployment"] = out.Data
+		case "list_deployments":
+			structured["deployments"] = out.Data
+		case "get_events":
+			structured["events"] = out.Data
+		case "get_pod_logs":
+			structured["logs"] = out.Data
+		case "search_runbooks":
+			structured["runbooks"] = out.Data
+		}
 		s.recordTool(ctx, conversationID, rec, out)
 		msgs = append(msgs,
 			model.ChatMessage{Role: "assistant", Content: "", ToolCalls: []model.ChatToolCall{{ID: tc.ID, Name: tc.Name, Arguments: mustJSON(tc.Args)}}},

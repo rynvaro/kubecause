@@ -7,7 +7,7 @@
 //   - 对话（/api/conversations）：一问一答，Agent 记得上文，
 //     默认只读，只能调只读工具，不能直接 Patch。
 //     模型判断需要修复时，只返回一张结构化的修复建议卡，
-//     不自动执行；用户点“转成正式诊断”后，才走 /api/runs 流程，
+//     不自动执行；用户点“创建可审批的修复任务”后，才走 /api/runs 流程，
 //     生成提案、走人工审批、再执行和验证。对话里没有捷径能绕过审批。
 //
 // 多轮上下文：每次调用模型时带上本会话最近 10 条消息，
@@ -269,7 +269,7 @@ func (s *Service) resolveNamespace(ctx context.Context, text string, history []s
 
 var nsJSONRe = regexp.MustCompile(`"namespace"\s*:\s*"([^"]+)"`)
 
-// ConvertToRun 把一次对话转成正式诊断任务：
+// ConvertToRun 把一次对话转成正式诊断任务（前端按钮叫“创建可审批的修复任务”）：
 // 按参数或会话历史解析出目标（namespace / kind / name / 问题），
 // 创建 /api/runs 的任务并返回 runId。转换本身不执行修复，
 // 修复还是要走提案 + 人工审批 + 执行验证那条线。

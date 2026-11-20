@@ -1,10 +1,48 @@
-# KubeCause — Kubernetes 故障诊断 Agent（Slice 6）
+# KubeCause — Kubernetes 故障诊断 Agent（Slice 7）
 
 KubeCause 是一个 Kubernetes 故障诊断 Agent。用户选定 namespace 和 Pod 或 Deployment，描述故障现象，Agent 自主选择只读工具收集证据，检索排障手册，输出诊断结论和建议。演示环境支持一类人工审批后的变更，即调整指定 Deployment 的容器内存限制，并验证变更后的运行状态。
 
-Slice 6 在 Slice 5 的基础上做了两件事：**前端布局打磨**和**修复决策只走模型单一路**。工具执行过程从聊天区移到右侧“Agent 活动”面板，每一步一张卡片、带耗时；详情结果全部回聊天区，按类型渲染成结果块，默认折叠；修复决策不再有规则合成兜底，真模型跑的时候只认模型给的结构化建议，后端只做校验。用户明确说了增加量（例如“增加 128Mi”）时，模型按用户说的算新值，不再默认翻倍。
+Slice 7 修的是用户在 Mac 真机（kind + 真模型）上反馈的 6 个问题，外加一个全新的故障案例 ImagePullBackOff，供用户测试 Agent 的通用发现能力。核心是三件事：**白屏不再发生**（后端报告空数组归一化 + 前端判空 + 错误边界）、**聊天不再是纯文本**（后端真模型路径存规范 key + 前端轻量 Markdown 渲染）、**正式诊断的按钮和位置说清楚**（只在有建议卡时显示，按时间顺序插进消息流）。
 
-Slice 1/2/3/4/5 已有的东西没有重写：SQLite 表、HTTP 接口、Worker 状态机、Agent 循环的校验和恢复、fake 客户端、桩模型、真模型适配器、FTS5 检索、条件 Patch 与 rollout 验证、对话会话、发现工具、React 前端，全部保留并做了回归。
+Slice 1/2/3/4/5/6 已有的东西没有重写：SQLite 表、HTTP 接口、Worker 状态机、Agent 循环的校验和恢复、fake 客户端、桩模型、真模型适配器、FTS5 检索、条件 Patch 与 rollout 验证、对话会话、发现工具、React 前端，全部保留并做了回归。
+
+## Slice 7 改了什么
+
+- **修白屏（最优先）**（`internal/agent/agent.go`、`internal/model/model.go`、`internal/chat/real.go`、`frontend/src/components.tsx`、`frontend/src/types.ts`）：根因是真模型返回的 JSON 缺字段时，Go 解出来是 nil，再序列化成 JSON 就是 null，前端读 `report.facts.length` 直接抛错，整个 React 应用白屏。修法三层：后端 `Report.Normalize()` 把 facts、evidenceIds、recommendations、openQuestions 缺失时补成空数组，`ValidateReport` 和 `parseDiagnosisArgs` 都会调它，序列化出来是 `[]` 而不是 null；前端 `normalizeReport` 再兜一层，历史库里旧的 null 报告也能渲染，`ReportView`、`OverviewCards`、`PodTable`、`DeploymentTable`、`buildBlocks` 里所有 `.length`、`.map` 的地方都先判空；再加一个 React `ErrorBoundary` 包住聊天消息区和正式诊断卡片，某个卡片渲染出错时只显示“这个卡片渲染失败了，请刷新重试”，不让整个页面白屏。新增测试 `TestReportNormalizeEmptyArrays` 和 `TestValidateReportNormalizes`。
+- **正式诊断按钮说清楚 + 只在有建议时显示 + 快照按时间顺序**（`frontend/src/App.tsx`、`frontend/src/components.tsx`）：按钮文案从“转成正式诊断”改成“创建可审批的修复任务”，下面加一句小字解释：“生成一份带提案的诊断任务，人工审批后才会执行，不会直接改集群。”输入框旁边的按钮删掉了——没有建议卡时点它没有意义，入口只在修复建议卡上。快照卡片不再固定在聊天底部：转换时记下最后一条消息的 id 作为锚点，审批卡插在那条消息后面按时间顺序出现，之后再发的新问题会出现在它下面。**聊天和正式诊断的区别**：聊天是探索，只读不改，没有审批，没有执行记录；正式诊断是一个任务，有 runId、有状态、有步骤、有报告、有提案、有审批、有执行和验证，全都存在数据库里，能审计，能重启后恢复。按钮存在是因为聊天不能直接动手改集群，必须先生成一个正式任务走人工审批——这是安全边界，不是多余的一步。
+- **runbooks 不是特例**（不用改代码，界面和文档写清）：`runbooks/*.md` 是 RAG 知识库，8 篇 Markdown，SQLite FTS5 索引，模型通过 `search_runbooks` 工具自己搜，不是代码里 `if OOM 就返回某篇`。评估的 3 个用例是测试夹具，不是产品逻辑。界面上现在能看到引用了哪篇手册：`search_runbooks` 返回的片段带标题、来源文件和关键句，前端按 `runbooks` 结果块渲染成“参考手册”，不再只显示 ev-1、ev-2 这种编号。加一篇新的 `.md` 文件重启就进索引，模型就能搜到。
+- **后续追问不再纯文本 + 聊天记录 Markdown 渲染**（`internal/chat/real.go`、`frontend/src/components.tsx`、`frontend/src/types.ts`）：根因是真模型路径只把工具结果存进 `structured[工具名]`（例如 `structured["get_pod"]`），前端 `buildBlocks` 只认规范 key，工具名当 key 的结果会被过滤掉，聊天里就只剩文字、没有卡片，刷新后也一样。现在每个工具的结果同时写一份规范 key：`get_cluster_overview` → `overview`、`list_problem_pods` → `problemPods`、`get_pod` → `pod`、`get_deployment` → `deployment`、`list_deployments` → `deployments`、`get_events` → `events`、`search_runbooks` → `runbooks`，工具名那份留着做追溯，两份都落盘，刷新后卡片还在。前端加了一个手写的轻量 Markdown 渲染（不引入重型库，100 行以内）：助手消息支持 `**加粗**`、`` `代码` ``、`- 无序列表`、`1. 有序列表`和分段，渲染失败时 fallback 回纯文本。新增测试 `TestRealCanonicalKeys`（mock 模型服务按顺序返回两个工具调用再给纯文本，验证 Structured 里有 overview 和 problemPods，刷新后还在）。
+- **输入框固定底部**（`frontend/src/App.tsx`、`frontend/src/index.css`）：以前输入框在能滚动的 `.main` 里面，消息一长就被顶出去了。现在 `.main` 本身不再滚动，里面分两块：上面 `.chat-scroll`（聊天）/ `.run-scroll`（单次诊断）自己滚动，下面 `.composer` 固定在底部不跟着滚。只改聊天模式，单次诊断的表单不动。
+- **新案例：ImagePullBackOff**（`scripts/kind/demo-bad-image.yaml`、`scripts/kind/setup-bad-image.sh`，见下文“新案例”一节）：namespace demo，Deployment demo-bad-image，镜像 `nginx:9.9.9-nonexistent`，Pod 卡在 ImagePullBackOff。代码里没有任何针对这个案例的特殊处理：Go 代码里没有 `demo-bad-image` 这个字符串，没有为它加 runbook（已有的 `runbooks/imagepull.md` 已够用），fake 客户端里也没有预置它。这个案例只在真集群上测，用来验证 Agent 能不能靠通用工具自己发现问题。
+- **回归**：`go test ./...` 全部通过（含新增的报告归一化、真模型规范 key 两个测试），`go run ./cmd/eval` 仍 3/3 通过；对话两轮能接上文、转正式诊断后审批执行验证全部回归通过。
+
+## 新案例：ImagePullBackOff（demo-bad-image）
+
+这是 Slice 7 新增的第二个故障案例，用来测试 Agent 的通用发现能力——它能不能发现一个代码里完全没特殊处理过的问题。
+
+```bash
+# 部署（Mac 上，kind 集群已建好）
+kubectl apply -f scripts/kind/demo-bad-image.yaml
+# 或一键脚本（会等 Pod 进入 ImagePullBackOff 再提示就绪）
+bash scripts/kind/setup-bad-image.sh
+
+# 手动验证
+kubectl get pods -n demo
+kubectl describe pod -n demo -l app=demo-bad-image
+
+# 清理
+kubectl delete -f scripts/kind/demo-bad-image.yaml
+```
+
+案例内容：namespace demo，Deployment demo-bad-image，1 个副本，镜像 `nginx:9.9.9-nonexistent`（不存在的 tag），容器名 demo-bad-image，资源 requests 64Mi/100m、limits 128Mi/500m（和 demo-api 一样，不搞特殊值）。没有内存泄漏逻辑，不是 OOM 场景。
+
+预期现象：Pod 卡在 ImagePullBackOff 或 ErrImagePull，事件里有 `Failed to pull image`，日志为空。
+
+Agent 应该发现什么：在对话里问“demo 那个一直拉不到镜像的是怎么回事”，Agent 应该通过 `list_problem_pods`、`get_pod`、`get_events`、`search_runbooks`（搜 ImagePullBackOff）自己发现镜像 tag 不存在，给出文字建议“镜像 tag 不存在，改成存在的 tag，例如 nginx:1.25”。
+
+Agent 不应该给什么：**不应该给出一张内存修复卡**——不是 OOM，调内存 limit 对拉不到镜像没有任何帮助。如果 Agent 给了内存修复卡，就是 bug，请把当时的对话截图发回来。
+
+代码里没有任何针对这个案例的特殊处理：Go 代码里搜不到 `demo-bad-image`，没有为它加 runbook，没有为它加 fake 数据。`demo-api` 的 OOM 案例仍在，两个案例可以并存（都在 demo 命名空间，Pod 名不同）。
 
 ## Slice 6 改了什么
 
@@ -290,7 +328,7 @@ curl -s "http://localhost:8080/api/runs/$RUN_ID"
 | `testdata/cases/` | 评估用例：OOM、镜像拉取失败、探针失败 |
 | `frontend/` | React 前端源码（Vite + TypeScript）：聊天、单次诊断、工具时间线、卡片和表格渲染 |
 | `web/` | 前端构建产物（`web/dist/`，go:embed 打进二进制）+ 旧静态页 `web/index.html`（保留参考，不再托管） |
-| `scripts/kind/` | kind 演示：demo-api.yaml 和 setup-demo.sh |
+| `scripts/kind/` | kind 演示：demo-api.yaml 和 setup-demo.sh（OOM 案例）、demo-bad-image.yaml 和 setup-bad-image.sh（ImagePullBackOff 新案例，Slice 7） |
 
 ## Slice 2 已实现
 

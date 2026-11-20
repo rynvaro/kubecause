@@ -269,6 +269,72 @@ func TestRealNoSyntheticRepair(t *testing.T) {
 	}
 }
 
+// TestRealCanonicalKeys 覆盖 Slice 7 修的“后续追问只剩纯文本”：
+// 真模型路径以前只把工具结果存进 structured[工具名]（例如 structured["get_pod"]），
+// 前端 buildBlocks 只认规范 key（overview、problemPods、pod……），
+// 工具名当 key 的结果会被过滤掉，聊天里就只剩文字、没有卡片，刷新后也一样。
+// 现在每个工具的结果要同时写一份规范 key，刷新后结构化块还在。
+func TestRealCanonicalKeys(t *testing.T) {
+	// mock 模型按顺序返回：先调 get_cluster_overview，再调 list_problem_pods，
+	// 然后给一段纯文本最终回答（触发一次追问），追问后仍给纯文本，结束本轮。
+	// 注意：追问后模型仍无结构化建议是允许的，本测试只验规范 key，不验建议卡。
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		switch calls {
+		case 1:
+			_, _ = fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call-1","type":"function","function":{"name":"get_cluster_overview","arguments":"{}"}}]}}]}`)
+		case 2:
+			_, _ = fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call-2","type":"function","function":{"name":"list_problem_pods","arguments":"{}"}}]}}]}`)
+		default:
+			_, _ = fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"集群里 demo-api 有问题，正在重启。"}}]}`)
+		}
+	}))
+	defer srv.Close()
+	ctx := context.Background()
+	s, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("打开内存库失败: %v", err)
+	}
+	defer s.Close()
+	real := model.NewRealWithConfig(model.RealConfig{
+		APIKey: "test-key", BaseURL: srv.URL, ModelName: "mock",
+		HTTPClient: srv.Client(), MaxRetries: 0,
+	})
+	svc := NewService(s, &run.ToolsAdapter{Kube: kube.NewFake()}, real)
+	conv := newConversation(t, svc)
+	reply, err := svc.RunMessage(ctx, conv, "当前状态怎么样")
+	if err != nil {
+		t.Fatalf("对话失败: %v", err)
+	}
+	if reply.Structured["overview"] == nil {
+		t.Fatalf("真模型调 get_cluster_overview 后 Structured 里应有规范 key overview，得到 %+v", reply.Structured)
+	}
+	if reply.Structured["problemPods"] == nil {
+		t.Fatalf("真模型调 list_problem_pods 后 Structured 里应有规范 key problemPods，得到 %+v", reply.Structured)
+	}
+	// 刷新后（重新读库里的助手消息）规范 key 还在，前端才能渲染结构化块。
+	msgs, _ := s.ListMessages(ctx, conv)
+	var lastAssistant *store.ConversationMessage
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "assistant" {
+			lastAssistant = &msgs[i]
+			break
+		}
+	}
+	if lastAssistant == nil {
+		t.Fatalf("历史里应有助手消息")
+	}
+	var structured map[string]any
+	if err := json.Unmarshal([]byte(lastAssistant.Structured), &structured); err != nil {
+		t.Fatalf("助手消息的 Structured 应是合法 JSON: %v", err)
+	}
+	if structured["overview"] == nil || structured["problemPods"] == nil {
+		t.Fatalf("刷新后 Structured 里仍应有 overview 和 problemPods，得到 %v", structured)
+	}
+}
+
 // TestChatConvertToRun 覆盖“转成正式诊断”：
 // 对话两轮后不给参数直接转，应按历史解析出 demo/demo-api，创建任务。
 func TestChatConvertToRun(t *testing.T) {

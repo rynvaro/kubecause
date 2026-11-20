@@ -752,6 +752,9 @@ func parseDiagnosisArgs(raw string) (*agent.Report, error) {
 		Recommendations: v.Recommendations, OpenQuestions: v.OpenQuestions,
 		Confidence: v.Confidence,
 	}
+	// 模型 JSON 缺字段时解出来是 nil，归一化成空数组再返回，
+	// 否则序列化成 null，前端读 .length 会白屏（见 agent.Report.Normalize）。
+	rep.Normalize()
 	if v.SuggestedRepair != nil {
 		rep.SuggestedRepair = &agent.SuggestedRepair{
 			Namespace: v.SuggestedRepair.Namespace, Deployment: v.SuggestedRepair.Deployment,

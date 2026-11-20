@@ -12,13 +12,21 @@ export interface SuggestedRepair {
 }
 
 export interface Report {
-  facts: string[]
+  facts: string[] | null
   cause: string
-  evidenceIds: string[]
-  recommendations: string[]
-  openQuestions: string[]
+  evidenceIds: string[] | null
+  recommendations: string[] | null
+  openQuestions: string[] | null
   confidence: string
   suggestedRepair?: SuggestedRepair | null
+}
+
+// 排障手册片段：search_runbooks 返回的 Data 是 {query, snippets}，
+// 每个片段带标题、来源文件和关键句，前端按这个渲染“参考了哪篇手册”。
+export interface RunbookSnippet {
+  title: string
+  source: string
+  content: string
 }
 
 export interface ChangeRequest {
@@ -191,6 +199,7 @@ export type ResultBlockKind =
   | 'events'
   | 'report'
   | 'repairSuggestion'
+  | 'runbooks'
   | 'text'
 
 export interface ResultBlock {
@@ -213,9 +222,27 @@ function asDeployments(v: unknown): DeploymentRow[] | null {
   return o.deployments as DeploymentRow[]
 }
 
+/** 把可能为 null 的报告字段补成空数组再渲染。
+ * 后端 Slice 7 起保证序列化出来是 [] 而不是 null，
+ * 但历史数据库里还可能躺着旧的 null 报告，前端这里再兜一层，
+ * 读 .length 永远不会抛错，白屏的根因就被两头堵住了。 */
+export function normalizeReport(v: unknown): Report {
+  const r = (v ?? {}) as Partial<Report>
+  return {
+    facts: Array.isArray(r.facts) ? r.facts : [],
+    cause: r.cause ?? '',
+    evidenceIds: Array.isArray(r.evidenceIds) ? r.evidenceIds : [],
+    recommendations: Array.isArray(r.recommendations) ? r.recommendations : [],
+    openQuestions: Array.isArray(r.openQuestions) ? r.openQuestions : [],
+    confidence: r.confidence ?? 'medium',
+    suggestedRepair: r.suggestedRepair ?? null,
+  }
+}
+
 /** 把后端 Structured 的 key 映射成带类型的结果块列表。 */
-export function buildBlocks(structured: Record<string, unknown>): ResultBlock[] {
+export function buildBlocks(structured: Record<string, unknown> | null | undefined): ResultBlock[] {
   const blocks: ResultBlock[] = []
+  if (!structured || typeof structured !== 'object') return blocks
   if (structured.overview && typeof structured.overview === 'object') {
     blocks.push({ kind: 'overview', title: '集群总览', data: structured.overview })
   }
@@ -243,10 +270,18 @@ export function buildBlocks(structured: Record<string, unknown>): ResultBlock[] 
     blocks.push({ kind: 'events', title: '相关事件', data: evData })
   }
   if (structured.report && typeof structured.report === 'object') {
-    blocks.push({ kind: 'report', title: '诊断报告', data: structured.report })
+    blocks.push({ kind: 'report', title: '诊断报告', data: normalizeReport(structured.report) })
   }
   if (structured.suggestedRepair && typeof structured.suggestedRepair === 'object') {
     blocks.push({ kind: 'repairSuggestion', title: '修复建议', data: structured.suggestedRepair })
+  }
+  // 排障手册引用：search_runbooks 的 Data 是 {query, snippets}，
+  // 每个片段带标题和关键句，渲染成“参考了哪篇手册”，
+  // 不再只显示 ev-1、ev-2 这种编号。runbooks 不是为某个案例写的特例，
+  // 是 RAG 知识库：加一篇 .md 重启就进索引，模型自己搜。
+  const rbData = structured.runbooks as { snippets?: unknown } | undefined
+  if (rbData && Array.isArray(rbData.snippets) && rbData.snippets.length > 0) {
+    blocks.push({ kind: 'runbooks', title: '参考手册', data: rbData.snippets as RunbookSnippet[] })
   }
   return blocks
 }

@@ -1,16 +1,16 @@
-// KubeCause 前端主界面（Slice 6）。
+// KubeCause 前端主界面（Slice 7，在 Slice 6 基础上修白屏、输入框固定底部、快照按时间顺序、Markdown 渲染）。
 //
 // 布局：左侧会话列表，中间聊天 / 单次诊断，右侧“Agent 活动”面板。
 // 两种模式共用同一套后端：对话模式是一问一答（只读），
 // 单次诊断是填表单、等报告、可审批、可执行、可验证。
 //
-// Slice 6 的布局原则：
+// Slice 6 的布局原则（Slice 7 补充在下面）：
 //   - 详情结果属于结果，回聊天区：回答文字下面直接跟按类型渲染的结果块
 //     （总览卡片、Pod 表格、事件、诊断报告、修复建议卡、审批卡），
 //     默认折叠一部分，不把整张表一次性顶上去；
 //   - 右侧不再放详情，只放工具执行过程（活动面板），每一步一张卡片，
 //     带耗时；聊天里只留一行工具摘要，点开看完整时间线；
-//   - 修复建议卡上的“转成正式诊断”按钮只要有建议卡就一直显示，
+//   - 修复建议卡上的“创建可审批的修复任务”按钮只在有建议卡时显示，
 //     翻历史、刷新后还在；点了之后审批卡直接出现在聊天里，
 //     不绕过审批，聊天里永远不给直接“执行”按钮。
 //
@@ -37,6 +37,8 @@ import {
 import {
   ActivityPanel,
   ApprovalCard,
+  ErrorBoundary,
+  MarkdownText,
   RepairStatusCard,
   ReportView,
   RunTimeline,
@@ -126,6 +128,10 @@ export default function App() {
   const [question, setQuestion] = useState('demo-api 为什么一直重启')
   const [runId, setRunId] = useState('')
   const [snapshot, setSnapshot] = useState<RunSnapshot | null>(null)
+  // 快照在消息流里的锚点（Slice 7）：正式诊断的审批卡不再固定在聊天底部，
+  // 而是插在转换那一刻的最后一条消息后面，按时间顺序出现，
+  // 之后再发的新问题会出现在它下面。刷新后快照清空，锚点也清空。
+  const [snapshotAnchorId, setSnapshotAnchorId] = useState<number | null>(null)
   const [events, setEvents] = useState<RunStep[]>([])
   const [runBusy, setRunBusy] = useState(false)
   const [deciding, setDeciding] = useState(false)
@@ -192,6 +198,7 @@ export default function App() {
     setActiveConvId(id)
     setChatError('')
     setSnapshot(null)
+    setSnapshotAnchorId(null)
     try {
       const d = await getConversation(id)
       setMessages(d.messages)
@@ -207,6 +214,7 @@ export default function App() {
       setActiveConvId(c.id)
       setMessages([])
       setSnapshot(null)
+      setSnapshotAnchorId(null)
       await refreshConversations()
     } catch (e) {
       setChatError(e instanceof Error ? e.message : '创建会话失败')
@@ -258,8 +266,11 @@ export default function App() {
     setChatError('')
     try {
       const r = await convertConversation(activeConvId)
-      setNotice(`已转成正式诊断，runId：${r.runId}。审批卡在下面聊天里，批准后 Worker 会自动执行并验证。`)
+      setNotice(`已创建可审批的修复任务，runId：${r.runId}。审批卡在下面聊天里，批准后 Worker 会自动执行并验证。`)
       setRunId(r.runId)
+      // 锚定在转换那一刻的最后一条消息后面，审批卡按时间顺序插进消息流，
+      // 不再固定在聊天底部，新问题发出去后会出现在它下面。
+      setSnapshotAnchorId(messages.length > 0 ? messages[messages.length - 1].id : null)
       // 转换后留在对话模式：审批卡和修复验证直接出现在聊天里，不切走。
       await loadRun(r.runId, true)
       startRunPolling(r.runId)
@@ -363,6 +374,25 @@ export default function App() {
   const activityRunning = mode === 'chat' ? chatBusy : snapshot ? runStillActive(snapshot) : false
   const runTotalMs = events.reduce((s, e) => s + (e.durationMs > 0 ? e.durationMs : 0), 0)
 
+  // 正式诊断卡（Slice 7）：不固定在聊天底部，按锚点插进消息流。
+  // App.tsx 下面的消息渲染里，锚点那条消息后面会插这张卡，
+  // 锚点为空（例如消息为空时转换）则由下面的兜底渲染在消息流末尾。
+  const runResultCard = snapshot ? (
+    <div className="card run-result" key={`run-${snapshot.id}`}>
+      <h3>正式诊断 · {snapshot.id}</h3>
+      <p>
+        任务 {snapshot.namespace}/{snapshot.kind}/{snapshot.name} 状态：
+        <b>{snapshot.status}</b>
+        {snapshot.error && <span className="error-text">　{snapshot.error}</span>}
+      </p>
+      {snapshot.report && <ReportView report={snapshot.report} />}
+      {snapshot.proposal && (
+        <ApprovalCard proposal={snapshot.proposal} onDecide={decide} deciding={deciding} />
+      )}
+      <RepairStatusCard snapshot={snapshot} />
+    </div>
+  ) : null
+
   return (
     <div className="app">
       <header className="header">
@@ -411,7 +441,7 @@ export default function App() {
           <div className="side-note">
             <h3>说明</h3>
             <p className="small">
-              对话只读：Agent 只查不改，觉得要修就给一张建议卡，点“转成正式诊断”后才走人工审批和执行。
+              对话只读：Agent 只查不改，觉得要修就给一张建议卡，点卡上的“创建可审批的修复任务”后才走人工审批和执行。
             </p>
             <p className="small">
               系统命名空间可以查（行上有“系统”标记），但不能改——修复校验会直接拒绝。
@@ -419,9 +449,12 @@ export default function App() {
           </div>
         </aside>
 
-        <main className="main" ref={messagesWrapRef} onScroll={onMessagesScroll}>
+        <main className="main">
           {mode === 'chat' ? (
             <>
+              {/* 聊天滚动区（Slice 7）：只有这个区域自己滚动，输入框固定在底部不跟着滚。
+                  以前输入框在 .main 里面，消息一长就被顶出去了。 */}
+              <div className="chat-scroll" ref={messagesWrapRef} onScroll={onMessagesScroll}>
               {messages.length === 0 ? (
                 <div className="empty">
                   <h2>先问一句“当前状态怎么样”</h2>
@@ -439,53 +472,44 @@ export default function App() {
                 </div>
               ) : (
                 <div className="messages">
-                  {messages.map((m) => {
-                    // tool 消息不单独占一楼：它的调用已经汇总到右侧活动面板，
-                    // 聊天里只在助手消息下留一行工具摘要。
-                    if (m.role === 'tool') return null
-                    if (m.role === 'user') {
-                      return (
-                        <div key={m.id} className="msg msg-user">
-                          {m.content}
+                  <ErrorBoundary>
+                    {messages.flatMap((m) => {
+                      // tool 消息不单独占一楼：它的调用已经汇总到右侧活动面板，
+                      // 聊天里只在助手消息下留一行工具摘要。
+                      if (m.role === 'tool') return []
+                      const el =
+                        m.role === 'user' ? (
+                          <div key={m.id} className="msg msg-user">
+                            {m.content}
+                          </div>
+                        ) : (
+                          <div key={m.id} className="msg msg-assistant">
+                            {/* 助手消息用轻量 Markdown 渲染，不再是纯文本。 */}
+                            <MarkdownText text={m.content} />
+                            <ToolSummary calls={parseToolCalls(m)} running={chatBusy} />
+                            <StructuredView
+                              structured={parseStructured(m)}
+                              onConvert={convertCurrent}
+                              converting={converting}
+                            />
+                          </div>
+                        )
+                      // 正式诊断卡插在锚点消息后面，按时间顺序出现，
+                      // 之后的新消息会出现在它下面，不再固定在底部。
+                      return snapshotAnchorId !== null && m.id === snapshotAnchorId && runResultCard
+                        ? [el, runResultCard]
+                        : [el]
+                    })}
+                    {chatBusy && (
+                      <div className="msg msg-assistant">
+                        <div className="msg-text">
+                          <span className="spin">◌</span> Agent 正在执行工具，右侧活动面板实时显示…
                         </div>
-                      )
-                    }
-                    const calls = parseToolCalls(m)
-                    const structured = parseStructured(m)
-                    return (
-                      <div key={m.id} className="msg msg-assistant">
-                        <div className="msg-text">{m.content}</div>
-                        <ToolSummary calls={calls} running={chatBusy} />
-                        <StructuredView
-                          structured={structured}
-                          onConvert={convertCurrent}
-                          converting={converting}
-                        />
                       </div>
-                    )
-                  })}
-                  {chatBusy && (
-                    <div className="msg msg-assistant">
-                      <div className="msg-text">
-                        <span className="spin">◌</span> Agent 正在执行工具，右侧活动面板实时显示…
-                      </div>
-                    </div>
-                  )}
-                  {snapshot && (
-                    <div className="card run-result">
-                      <h3>正式诊断 · {snapshot.id}</h3>
-                      <p>
-                        任务 {snapshot.namespace}/{snapshot.kind}/{snapshot.name} 状态：
-                        <b>{snapshot.status}</b>
-                        {snapshot.error && <span className="error-text">　{snapshot.error}</span>}
-                      </p>
-                      {snapshot.report && <ReportView report={snapshot.report} />}
-                      {snapshot.proposal && (
-                        <ApprovalCard proposal={snapshot.proposal} onDecide={decide} deciding={deciding} />
-                      )}
-                      <RepairStatusCard snapshot={snapshot} />
-                    </div>
-                  )}
+                    )}
+                    {/* 锚点为空（转换时消息为空）时，卡片兜底放在消息流末尾。 */}
+                    {snapshot && snapshotAnchorId === null && runResultCard}
+                  </ErrorBoundary>
                 </div>
               )}
               {hasNewBelow && (
@@ -494,6 +518,10 @@ export default function App() {
                 </button>
               )}
               {chatError && <div className="error">{chatError}</div>}
+              </div>
+              {/* 输入框固定在底部（Slice 7）：在滚动区外面，不跟着消息一起滚走。
+                  正式诊断的入口只在修复建议卡上，不再在输入框旁边放一个
+                  随时都能点的旧按钮——没有建议卡时点它没有意义。 */}
               <div className="composer">
                 <input
                   value={chatInput}
@@ -510,12 +538,10 @@ export default function App() {
                 <button className="primary" onClick={() => void sendChat()} disabled={chatBusy || !chatInput.trim()}>
                   {chatBusy ? '执行中…' : '发送'}
                 </button>
-                <button onClick={convertCurrent} disabled={!activeConvId || converting}>
-                  转成正式诊断
-                </button>
               </div>
             </>
           ) : (
+            <div className="run-scroll">
             <div className="run-mode">
               <div className="card">
                 <h3>单次诊断</h3>
@@ -568,6 +594,7 @@ export default function App() {
                   <RepairStatusCard snapshot={snapshot} />
                 </>
               )}
+            </div>
             </div>
           )}
         </main>

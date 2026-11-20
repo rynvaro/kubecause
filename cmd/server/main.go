@@ -2,14 +2,18 @@
 // 单个 Go 进程同时跑 HTTP API 和后台 Worker。
 //
 // 切换开关（环境变量，不改代码就能切）：
-//   KUBE_MODE=fake（默认）  用 client-go fake clientset，预置 demo-api 数据
-//   KUBE_MODE=kind          用真 client-go 读 ~/.kube/config 或 KUBECONFIG
-//   MODEL_MODE=stub（默认） 用桩模型，确定性走完工具调用
-//   MODEL_MODE=real         Slice 2 真模型，Key 从 MODEL_API_KEY 读，
-//                           缺失时启动报错；BaseURL 默认 DeepSeek，
-//                           可用 MODEL_BASE_URL / MODEL_NAME 切换厂商
-//   DB_PATH                 SQLite 文件路径，默认 ./kubecause.db
-//   ADDR                    监听地址，默认 :8080
+//
+//	KUBE_MODE=fake（默认）  用 client-go fake clientset，预置 demo-api 数据
+//	KUBE_MODE=kubeconfig   用真 client-go 读 KUBECONFIG 或 ~/.kube/config，
+//	                        kind、k3s、云厂商集群都走这个模式，
+//	                        不再为每种集群写一套客户端；
+//	                        kind 是 kubeconfig 的别名，做兼容保留
+//	MODEL_MODE=stub（默认） 用桩模型，确定性走完工具调用
+//	MODEL_MODE=real         Slice 2 真模型，Key 从 MODEL_API_KEY 读，
+//	                        缺失时启动报错；BaseURL 默认 DeepSeek，
+//	                        可用 MODEL_BASE_URL / MODEL_NAME 切换厂商
+//	DB_PATH                 SQLite 文件路径，默认 ./kubecause.db
+//	ADDR                    监听地址，默认 :8080
 package main
 
 import (
@@ -25,6 +29,7 @@ import (
 
 	"kubecause/internal/agent"
 	"kubecause/internal/api"
+	"kubecause/internal/chat"
 	"kubecause/internal/knowledge"
 	"kubecause/internal/kube"
 	"kubecause/internal/model"
@@ -46,7 +51,7 @@ func main() {
 	kubeMode := strings.ToLower(env("KUBE_MODE", "fake"))
 	modelMode := strings.ToLower(env("MODEL_MODE", "stub"))
 
-	log.Printf("KubeCause Slice 3 启动：KUBE_MODE=%s MODEL_MODE=%s DB_PATH=%s ADDR=%s", kubeMode, modelMode, dbPath, addr)
+	log.Printf("KubeCause Slice 4 启动：KUBE_MODE=%s MODEL_MODE=%s DB_PATH=%s ADDR=%s", kubeMode, modelMode, dbPath, addr)
 
 	// 1. 打开 SQLite，启动时自动执行迁移。
 	st, err := store.Open(dbPath)
@@ -84,10 +89,14 @@ func main() {
 		kc = f
 		rc = f
 		log.Printf("使用 fake K8s 客户端，预置 demo/demo-api 演示数据（读写接口分开，同一 fake 对象）")
-	case "kind":
+	case "kubeconfig", "kind":
+		// kind 是 kubeconfig 的别名：kind、k3s、云厂商集群
+		// 都是读 kubeconfig，客户端是同一套，不用按集群类型分叉。
+		// k3s 的 kubeconfig 在 /etc/rancher/k3s/k3s.yaml，
+		// 用 KUBECONFIG 指过去即可。
 		real, err := kube.NewReal(os.Getenv("KUBECONFIG"))
 		if err != nil {
-			log.Fatalf("KUBE_MODE=kind 但无法连接集群: %v", err)
+			log.Fatalf("KUBE_MODE=%s 但无法连接集群: %v", kubeMode, err)
 		}
 		kc = real
 		repairKubeconfig := os.Getenv("REPAIR_KUBECONFIG")
@@ -99,9 +108,9 @@ func main() {
 			log.Fatalf("无法创建写客户端: %v", err)
 		}
 		rc = realRepair
-		log.Printf("使用真 K8s 客户端（kind），读取 kubeconfig；写客户端独立创建，生产上应换成写身份专用的 kubeconfig")
+		log.Printf("使用真 K8s 客户端（kubeconfig 模式，兼容 kind/k3s），读取 kubeconfig；写客户端独立创建，生产上应换成写身份专用的 kubeconfig")
 	default:
-		log.Fatalf("KUBE_MODE 非法: %q，只能是 fake 或 kind", kubeMode)
+		log.Fatalf("KUBE_MODE 非法: %q，只能是 fake 或 kubeconfig（kind 是 kubeconfig 的别名）", kubeMode)
 	}
 
 	// 4. 按 MODEL_MODE 组装模型。
@@ -145,7 +154,11 @@ func main() {
 	worker.SetRepair(repair.NewExecutor(st, rc))
 	go worker.RunLoop(ctx)
 
-	handler := &api.Handler{Store: st}
+	// 对话服务（Slice 4）：和单次诊断共用同一套工具和模型，
+	// 但只读，不生成提案、不执行修复。
+	chatSvc := chat.NewService(st, tools, m)
+
+	handler := &api.Handler{Store: st, Chat: chatSvc}
 	mux := http.NewServeMux()
 	handler.Register(mux)
 	// 极简静态演示页由 Go 服务同源托管，从仓库根目录运行时读 web/ 目录。

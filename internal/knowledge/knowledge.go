@@ -56,6 +56,36 @@ var entries = []entry{
 		content: "Liveness 探针失败会导致容器被重启，Readiness 失败会让 Pod 脱离 Service。先看探针的路径、端口和超时，再看应用启动耗时是否超过 initialDelaySeconds，日志里是否有启动失败。",
 		keywords: []string{"probe", "liveness", "readiness", "探针", "健康检查", "unhealthy"},
 	},
+	{
+		title:   "CrashLoopBackOff / 容器反复崩溃重启",
+		source:  "runbooks/crashloop.md",
+		content: "Pod 处于 CrashLoopBackOff，容器启动后很快退出又被拉起。先看上次终止的原因和退出码：OOMKilled 是内存问题，Error 退出码 1 常是应用启动失败。再看日志最后几行，应用 panic、配置报错都会让容器一启动就退出。",
+		keywords: []string{"crashloopbackoff", "crashloop", "崩溃", "反复重启", "backoff", "退出码"},
+	},
+	{
+		title:   "Pending / Pod 调度失败",
+		source:  "runbooks/pending.md",
+		content: "Pod 长时间处于 Pending，Events 里出现 FailedScheduling。先看原因：节点资源不足、节点选择器没有节点满足、污点没有对应容忍、PersistentVolumeClaim 没绑定。",
+		keywords: []string{"pending", "failedscheduling", "调度", "调度失败", "资源不足", "taint", "污点"},
+	},
+	{
+		title:   "Service 无 Endpoints / 服务访问不到",
+		source:  "runbooks/service-endpoints.md",
+		content: "Service 存在但 Endpoints 为空，访问没有后端响应。先核对 Service 的 selector 和 Pod 的 labels 是否对得上，再看 Pod 的 Readiness 探针是否通过，最后看 Service 端口和容器端口是否一致。",
+		keywords: []string{"endpoints", "service", "访问不到", "selector", "标签", "无后端"},
+	},
+	{
+		title:   "ConfigMap / Secret 缺失",
+		source:  "runbooks/configmap-secret.md",
+		content: "Pod 启动失败，Events 里出现 FailedMount 或 CreateContainerConfigError，日志报 config file not found。先看 Deployment 挂载的 ConfigMap / Secret 在 namespace 里存不存在，再看 key 名有没有写错。",
+		keywords: []string{"configmap", "secret", "failedmount", "createcontainerconfigerror", "配置", "缺失"},
+	},
+	{
+		title:   "资源配额不足 / ResourceQuota",
+		source:  "runbooks/quota.md",
+		content: "Deployment 扩容或新建 Pod 时被拒绝，Events 里出现 exceeded quota。先看 namespace 的 ResourceQuota 和 LimitRange，再看是 CPU、内存、Pod 数量还是其他资源超了。",
+		keywords: []string{"quota", "resourcequota", "配额", "exceeded quota", "超限"},
+	},
 }
 
 // Search 按关键词和别名返回最多 3 条相关片段。

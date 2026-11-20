@@ -29,14 +29,15 @@ import (
 // Stub 是确定性桩模型。
 //
 // 它按 StepIndex 决定下一步：
-//   0: list_workload_pods（Deployment 任务）或 get_pod（Pod 任务）
-//   1: get_pod
-//   2: get_events
-//   3: get_pod_logs（当前日志）
-//   4: get_deployment
-//   5: search_runbooks，关键词取自已看到的证据（优先 OOMKilled，
-//      其次 ImagePullBackOff，再次探针失败）
-//   6: 交最终报告
+//
+//	0: list_workload_pods（Deployment 任务）或 get_pod（Pod 任务）
+//	1: get_pod
+//	2: get_events
+//	3: get_pod_logs（当前日志）
+//	4: get_deployment
+//	5: search_runbooks，关键词取自已看到的证据（优先 OOMKilled，
+//	   其次 ImagePullBackOff，再次探针失败）
+//	6: 交最终报告
 //
 // 如果是重启恢复，StepIndex 会从已用步数继续，不会从头重走。
 // Slice 2 把 Stub 扩展到三类场景（OOM / 镜像拉取 / 探针），
@@ -54,7 +55,9 @@ func (s *Stub) Next(ctx context.Context, in agent.ModelInput) (agent.ModelStep, 
 	deployName := in.Name
 	if in.Kind == "Pod" {
 		podName = in.Name
-		deployName = "demo-api"
+		// Pod 任务的目标 Deployment 从已查到的 Pod 归属里读，
+		// 读不到才用 fake 固定数据的默认值。
+		deployName = discoverDeploymentName(in)
 	}
 	call := func(name string, args map[string]string) agent.ModelStep {
 		if args == nil {
@@ -76,7 +79,9 @@ func (s *Stub) Next(ctx context.Context, in agent.ModelInput) (agent.ModelStep, 
 	case 2:
 		return call("get_events", map[string]string{"name": podName}), nil
 	case 3:
-		return call("get_pod_logs", map[string]string{"pod": podName, "container": "demo-api", "previous": "false"}), nil
+		// 容器名不要写死：从已查到的 Deployment 里读第一个容器，
+		// 读不到才用 fake 固定数据的默认值（见 discoverContainerName）。
+		return call("get_pod_logs", map[string]string{"pod": podName, "container": discoverContainerName(in), "previous": "false"}), nil
 	case 4:
 		return call("get_deployment", map[string]string{"deployment": deployName}), nil
 	case 5:
@@ -107,16 +112,108 @@ func keywordFromHistory(in agent.ModelInput) string {
 }
 
 func discoverPodName(in agent.ModelInput) string {
+	// 先按结构化结果解析：list_workload_pods 的 ResultJSON 里有 pods 列表，
+	// 取第一个，不认具体名字，这样换一个 Deployment 也能工作。
 	for _, h := range in.History {
 		if h.ToolName == "list_workload_pods" && h.ResultJSON != "" {
-			for _, part := range strings.FieldsFunc(h.ResultJSON, func(r rune) bool { return r == '"' || r == ',' || r == '[' || r == ']' || r == '{' || r == '}' }) {
-				if strings.HasPrefix(part, "demo-api-") {
-					return part
-				}
+			var v struct {
+				Pods []string `json:"pods"`
+			}
+			if err := json.Unmarshal([]byte(h.ResultJSON), &v); err == nil && len(v.Pods) > 0 {
+				return v.Pods[0]
 			}
 		}
 	}
+	// 兜底：fake 固定数据的 Pod 名。Stub 只在 fake/stub 回归里用，
+	// 真集群上 Pod 名一定来自上一步 list 的结果，不会走到这里。
 	return "demo-api-7d9f6c4b5-xk2v9"
+}
+
+// discoverDeploymentName 从已查到的 Pod 结果里读归属 Deployment。
+// deployNameForReport 返回报告里修复建议的目标 Deployment：
+// Deployment 任务就是任务名，Pod 任务从 Pod 归属里读。
+func deployNameForReport(in agent.ModelInput) string {
+	if in.Kind == "Deployment" {
+		return in.Name
+	}
+	return discoverDeploymentName(in)
+}
+
+func discoverDeploymentName(in agent.ModelInput) string {
+	for _, h := range in.History {
+		if h.ToolName == "get_pod" && h.ResultJSON != "" {
+			var v struct {
+				Deployment string `json:"deployment"`
+			}
+			if err := json.Unmarshal([]byte(h.ResultJSON), &v); err == nil && v.Deployment != "" {
+				return v.Deployment
+			}
+		}
+	}
+	return "demo-api"
+}
+
+func discoverContainerName(in agent.ModelInput) string {
+	for _, h := range in.History {
+		if h.ToolName == "get_deployment" && h.ResultJSON != "" {
+			var v struct {
+				Containers []struct {
+					Name string `json:"name"`
+				} `json:"containers"`
+			}
+			if err := json.Unmarshal([]byte(h.ResultJSON), &v); err == nil && len(v.Containers) > 0 {
+				return v.Containers[0].Name
+			}
+		}
+	}
+	return "demo-api"
+}
+
+// discoverMemoryLimit 从已查到的 Deployment 结果里读第一个容器的内存 limit。
+func discoverMemoryLimit(in agent.ModelInput) string {
+	for _, h := range in.History {
+		if h.ToolName == "get_deployment" && h.ResultJSON != "" {
+			var v struct {
+				Containers []struct {
+					MemoryLimit string `json:"memoryLimit"`
+				} `json:"containers"`
+			}
+			if err := json.Unmarshal([]byte(h.ResultJSON), &v); err == nil && len(v.Containers) > 0 {
+				return v.Containers[0].MemoryLimit
+			}
+		}
+	}
+	return ""
+}
+
+// doubleMemoryValue 把 "128Mi" 翻倍成 "256Mi"，"2Gi" 翻倍封顶 "4Gi"，
+// 供 Stub 的修复建议用；解析失败返回 ""，表示给不出具体新值。
+func doubleMemoryValue(old string) string {
+	if len(old) < 3 {
+		return ""
+	}
+	suffix := old[len(old)-2:]
+	num := 0
+	for _, c := range old[:len(old)-2] {
+		if c < '0' || c > '9' {
+			return ""
+		}
+		num = num*10 + int(c-'0')
+	}
+	next := num * 2
+	if suffix == "Gi" {
+		if next > 4 {
+			next = 4
+		}
+		return fmt.Sprintf("%dGi", next)
+	}
+	if suffix != "Mi" {
+		return ""
+	}
+	if next > 4096 {
+		next = 4096
+	}
+	return fmt.Sprintf("%dMi", next)
 }
 
 // buildReport 根据已收集的证据拼最终报告。
@@ -158,17 +255,36 @@ func (s *Stub) buildReport(in agent.ModelInput) *agent.Report {
 	}
 	switch {
 	case seenOOM:
+		// 修复建议从证据里算出来，不写死目标和数值：
+		// 容器和旧值来自已查到的 Deployment，新值是旧值翻倍（封顶 4Gi）。
+		// 算不出来时只给文字建议、不给结构化建议，Worker 不会生成提案。
+		container := discoverContainerName(in)
+		oldLimit := discoverMemoryLimit(in)
+		newLimit := doubleMemoryValue(oldLimit)
+		recs := []string{
+			"检查应用是否存在内存泄漏，确认调高后的 limit 是否足够",
+			"观察调高后的重启次数是否停止增长",
+		}
+		var sr *agent.SuggestedRepair
+		if oldLimit != "" && newLimit != "" {
+			recs = append([]string{fmt.Sprintf("将 %s 容器的内存 limit 从 %s 调高到 %s（需人工审批后执行）", container, oldLimit, newLimit)}, recs...)
+			sr = &agent.SuggestedRepair{
+				Namespace: in.Namespace, Deployment: deployNameForReport(in),
+				Container: container, Field: "memoryLimit",
+				OldValue: oldLimit, NewValue: newLimit,
+				Reason: "容器内存限制过低，触发 OOMKilled 导致反复重启",
+			}
+		} else {
+			recs = append([]string{"将容器的内存 limit 适当调高（需人工审批后执行）"}, recs...)
+		}
 		return &agent.Report{
-			Facts:       facts,
-			Cause:       "容器内存限制过低，触发 OOMKilled 导致反复重启",
-			EvidenceIDs: ids,
-			Recommendations: []string{
-				"将 demo-api 容器的内存 limit 从 128Mi 调高到 256Mi（需人工审批后执行，Slice 3）",
-				"检查应用是否存在内存泄漏，确认 256Mi 是否足够",
-				"观察调高后的重启次数是否停止增长",
-			},
-			OpenQuestions: []string{"应用本身是否存在内存泄漏，仍需进一步确认"},
-			Confidence:    "high",
+			Facts:           facts,
+			Cause:           "容器内存限制过低，触发 OOMKilled 导致反复重启",
+			EvidenceIDs:     ids,
+			Recommendations: recs,
+			OpenQuestions:   []string{"应用本身是否存在内存泄漏，仍需进一步确认"},
+			Confidence:      "high",
+			SuggestedRepair: sr,
 		}
 	case seenImagePull:
 		return &agent.Report{
@@ -278,10 +394,10 @@ func NewRealFromEnv() (*Real, error) {
 
 // chatMessage / chat 请求与响应，只按 OpenAI 兼容协议的最小字段定义。
 type chatMessage struct {
-	Role       string          `json:"role"`
-	Content    string          `json:"content,omitempty"`
-	ToolCalls  []chatToolCall  `json:"tool_calls,omitempty"`
-	ToolCallID string          `json:"tool_call_id,omitempty"`
+	Role       string         `json:"role"`
+	Content    string         `json:"content,omitempty"`
+	ToolCalls  []chatToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string         `json:"tool_call_id,omitempty"`
 }
 
 type chatToolCall struct {
@@ -294,11 +410,11 @@ type chatToolCall struct {
 }
 
 type chatRequest struct {
-	Model       string         `json:"model"`
-	Messages    []chatMessage  `json:"messages"`
-	Tools       []chatToolDef  `json:"tools,omitempty"`
-	ToolChoice  string         `json:"tool_choice,omitempty"`
-	Temperature float64        `json:"temperature"`
+	Model       string        `json:"model"`
+	Messages    []chatMessage `json:"messages"`
+	Tools       []chatToolDef `json:"tools,omitempty"`
+	ToolChoice  string        `json:"tool_choice,omitempty"`
+	Temperature float64       `json:"temperature"`
 }
 
 type chatToolDef struct {
@@ -345,6 +461,12 @@ func toolDefs() []chatToolDef {
 		def("get_pod_logs", "读取指定容器的日志", merge(ns, map[string]any{"pod": strParam("Pod 名称"), "container": strParam("容器名"), "previous": map[string]any{"type": "boolean", "description": "是否读上一次容器的日志"}}), []string{"namespace", "pod"}),
 		def("get_deployment", "查询 Deployment 的副本数和容器资源配置", merge(ns, map[string]any{"deployment": strParam("Deployment 名称")}), []string{"namespace", "deployment"}),
 		def("search_runbooks", "检索排障手册", map[string]any{"query": strParam("检索关键词，例如 OOMKilled、ImagePullBackOff、Liveness probe failed")}, []string{"query"}),
+		// 发现工具（只读）：对话模式里先看全貌、找问题，再用定向工具深挖。
+		// namespace 为空表示查全部命名空间，系统命名空间会被后端过滤。
+		def("list_namespaces", "列出集群的全部命名空间", map[string]any{}, []string{}),
+		def("list_deployments", "列出 Deployment，namespace 为空时查全部命名空间", map[string]any{"namespace": strParam("命名空间，为空表示全部")}, []string{}),
+		def("list_problem_pods", "列出有问题的 Pod（非 Running、未 Ready、重启过、有等待原因），namespace 为空时查全部命名空间", map[string]any{"namespace": strParam("命名空间，为空表示全部")}, []string{}),
+		def("get_cluster_overview", "返回集群总览：节点数、命名空间数、Deployment 数、Pod 数、有问题 Pod 数", map[string]any{}, []string{}),
 		def("submit_diagnosis", "提交最终诊断报告，证据 ID 只能引用已返回的工具结果里的 ID", map[string]any{
 			"facts":           map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "观测事实，每条来自工具结果"},
 			"cause":           strParam("原因判断"),
@@ -352,6 +474,19 @@ func toolDefs() []chatToolDef {
 			"recommendations": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
 			"openQuestions":   map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
 			"confidence":      map[string]any{"type": "string", "enum": []string{"high", "medium", "low"}},
+			// 修复建议是可选的：只有证据明确指向内存 limit 过低时才给，
+			// field 目前只支持 memoryLimit，旧值必须和查到的现状一致，
+			// 新值要合理（一般是旧值翻倍）。没把握时不要给这个字段，
+			// 后端不会凭空生成修复提案。
+			"suggestedRepair": map[string]any{"type": "object", "description": "可选的修复建议，只有内存 limit 过低这一种情况才给", "properties": map[string]any{
+				"namespace":  map[string]any{"type": "string"},
+				"deployment": map[string]any{"type": "string"},
+				"container":  map[string]any{"type": "string"},
+				"field":      map[string]any{"type": "string", "enum": []string{"memoryLimit"}},
+				"oldValue":   map[string]any{"type": "string", "description": "当前内存 limit，例如 128Mi"},
+				"newValue":   map[string]any{"type": "string", "description": "建议的新内存 limit，例如 256Mi"},
+				"reason":     map[string]any{"type": "string"},
+			}},
 		}, []string{"facts", "cause", "evidenceIds", "confidence"}),
 	}
 }
@@ -371,9 +506,11 @@ const realSystemPrompt = `你是 Kubernetes 故障诊断助手。任务是根据
 
 规则：
 1. 只能调用提供的工具，工具参数里的 namespace 必须和任务一致，不要查其他 namespace，不要查 kube-system。
-2. 一次只调一个工具，先查 Pod 状态、事件和日志，再查 Deployment 和手册，不要凭空猜测。
+2. 一次只调一个工具，先查 Pod 状态、事件和日志，再查 Deployment 和手册，不要凭空猜测。不知道目标在哪时，先用发现工具（list_namespaces、list_problem_pods、get_cluster_overview）看全貌、找问题，再用定向工具深挖。
 3. 证据不足时不要硬编结论，调用 submit_diagnosis 时把 confidence 写成 low，并写清还需要补查什么。
-4. 提交诊断必须调用 submit_diagnosis，evidenceIds 只能引用工具结果里已经出现过的 ID。`
+4. 提交诊断必须调用 submit_diagnosis，evidenceIds 只能引用工具结果里已经出现过的 ID。
+5. 不要预设故障类型：原因要按证据自己判断，不要默认是内存、镜像或探针问题。只有证据明确指向容器内存 limit 过低时，才可以在 submit_diagnosis 的 suggestedRepair 里给一个修复建议（field 只能是 memoryLimit，oldValue 必须和查到的现状一致）；其他原因不要给修复建议。
+6. 你只能诊断、不能执行任何修改：修复建议只是建议，是否执行由人工审批决定。`
 
 // Next 问一次真模型，返回一步工具调用或最终报告。
 func (r *Real) Next(ctx context.Context, in agent.ModelInput) (agent.ModelStep, error) {
@@ -381,7 +518,7 @@ func (r *Real) Next(ctx context.Context, in agent.ModelInput) (agent.ModelStep, 
 		return agent.ModelStep{}, fmt.Errorf("真模型缺少 API Key，请设置 MODEL_API_KEY")
 	}
 	msgs := buildRealMessages(in)
-	resp, err := r.callWithRetry(ctx, msgs)
+	resp, err := r.callWithRetry(ctx, msgs, toolDefs())
 	if err != nil {
 		return agent.ModelStep{}, err
 	}
@@ -487,9 +624,9 @@ func truncateRunes(s string, n int) string {
 
 // callWithRetry 调一次 chat completions，429 / 5xx / 网络错误才重试，
 // 400 这类请求错误不重试。退避是指数退避，最多 3 次。
-func (r *Real) callWithRetry(ctx context.Context, msgs []chatMessage) (*chatResponse, error) {
+func (r *Real) callWithRetry(ctx context.Context, msgs []chatMessage, tools []chatToolDef) (*chatResponse, error) {
 	body, err := json.Marshal(chatRequest{
-		Model: r.cfg.ModelName, Messages: msgs, Tools: toolDefs(),
+		Model: r.cfg.ModelName, Messages: msgs, Tools: tools,
 		ToolChoice: "auto", Temperature: 0,
 	})
 	if err != nil {
@@ -588,6 +725,15 @@ func parseDiagnosisArgs(raw string) (*agent.Report, error) {
 		Recommendations []string `json:"recommendations"`
 		OpenQuestions   []string `json:"openQuestions"`
 		Confidence      string   `json:"confidence"`
+		SuggestedRepair *struct {
+			Namespace  string `json:"namespace"`
+			Deployment string `json:"deployment"`
+			Container  string `json:"container"`
+			Field      string `json:"field"`
+			OldValue   string `json:"oldValue"`
+			NewValue   string `json:"newValue"`
+			Reason     string `json:"reason"`
+		} `json:"suggestedRepair"`
 	}
 	if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &v); err != nil {
 		return nil, err
@@ -598,11 +744,20 @@ func parseDiagnosisArgs(raw string) (*agent.Report, error) {
 	if v.Confidence == "" {
 		v.Confidence = "medium"
 	}
-	return &agent.Report{
+	rep := &agent.Report{
 		Facts: v.Facts, Cause: v.Cause, EvidenceIDs: v.EvidenceIDs,
 		Recommendations: v.Recommendations, OpenQuestions: v.OpenQuestions,
 		Confidence: v.Confidence,
-	}, nil
+	}
+	if v.SuggestedRepair != nil {
+		rep.SuggestedRepair = &agent.SuggestedRepair{
+			Namespace: v.SuggestedRepair.Namespace, Deployment: v.SuggestedRepair.Deployment,
+			Container: v.SuggestedRepair.Container, Field: v.SuggestedRepair.Field,
+			OldValue: v.SuggestedRepair.OldValue, NewValue: v.SuggestedRepair.NewValue,
+			Reason: v.SuggestedRepair.Reason,
+		}
+	}
+	return rep, nil
 }
 
 func tryParseReportJSON(content string) (*agent.Report, error) {
@@ -613,4 +768,91 @@ func tryParseReportJSON(content string) (*agent.Report, error) {
 		return nil, fmt.Errorf("不是 JSON")
 	}
 	return parseDiagnosisArgs(content[start : end+1])
+}
+
+// ---------------------------------------------------------------------------
+// 对话模式用的单步调用（Slice 4）
+// ---------------------------------------------------------------------------
+
+// ChatMessage 是对话模式发给模型的一条消息，
+// 和 OpenAI 兼容协议的 chat message 一一对应，
+// 只是字段导出，internal/chat 包才能组装历史。
+type ChatMessage struct {
+	Role       string         `json:"role"`
+	Content    string         `json:"content,omitempty"`
+	ToolCalls  []ChatToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string         `json:"tool_call_id,omitempty"`
+}
+
+// ChatToolCall 是模型在对话里返回的一次工具调用。
+type ChatToolCall struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+// ChatStep 是 Real.Chat 一次调用的返回：
+// 要么是一个工具调用（循环继续），要么是一段最终文本 / 一份诊断报告。
+type ChatStep struct {
+	Content  string
+	ToolCall *agent.ToolCall
+	Report   *agent.Report
+	IsFinal  bool
+}
+
+// Chat 问一次真模型，专供对话循环用：
+// 调用方把本会话的历史（最近 10 条）拼成 msgs 传进来，
+// 模型返回一步工具调用或最终回答，调用方执行工具、
+// 把结果以 tool 角色追加进历史，再调下一次。
+// 工具表和单次诊断是同一套（含 4 个发现工具），
+// 所以对话里模型能先看全貌再深挖；submit_diagnosis 在对话里
+// 被当作一份结构化诊断结论返回，不会自动执行任何修改。
+func (r *Real) Chat(ctx context.Context, msgs []ChatMessage) (ChatStep, error) {
+	if strings.TrimSpace(r.cfg.APIKey) == "" {
+		return ChatStep{}, fmt.Errorf("真模型缺少 API Key，请设置 MODEL_API_KEY")
+	}
+	internal := make([]chatMessage, 0, len(msgs))
+	for _, m := range msgs {
+		cm := chatMessage{Role: m.Role, Content: m.Content, ToolCallID: m.ToolCallID}
+		for _, tc := range m.ToolCalls {
+			cm.ToolCalls = append(cm.ToolCalls, chatToolCall{ID: tc.ID, Type: "function",
+				Function: struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				}{Name: tc.Name, Arguments: tc.Arguments}})
+		}
+		internal = append(internal, cm)
+	}
+	resp, err := r.callWithRetry(ctx, internal, toolDefs())
+	if err != nil {
+		return ChatStep{}, err
+	}
+	if len(resp.Choices) == 0 {
+		return ChatStep{}, fmt.Errorf("模型返回为空，没有 choices")
+	}
+	msg := resp.Choices[0].Message
+	if len(msg.ToolCalls) > 0 {
+		tc := msg.ToolCalls[0]
+		if tc.Function.Name == "submit_diagnosis" {
+			rep, err := parseDiagnosisArgs(tc.Function.Arguments)
+			if err != nil {
+				return ChatStep{}, fmt.Errorf("模型提交的诊断报告解析失败: %w", err)
+			}
+			return ChatStep{IsFinal: true, Report: rep}, nil
+		}
+		args, err := parseToolArgs(tc.Function.Arguments)
+		if err != nil {
+			return ChatStep{}, fmt.Errorf("模型返回的工具参数解析失败: %w", err)
+		}
+		id := tc.ID
+		if id == "" {
+			id = "call-chat"
+		}
+		return ChatStep{ToolCall: &agent.ToolCall{ID: id, Name: tc.Function.Name, Args: args}}, nil
+	}
+	content := strings.TrimSpace(msg.Content)
+	if content == "" {
+		return ChatStep{}, fmt.Errorf("模型既没有调工具也没有返回文本")
+	}
+	return ChatStep{IsFinal: true, Content: content}, nil
 }

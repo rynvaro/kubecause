@@ -1,12 +1,15 @@
 // Package repair 负责审批后的修复：条件 Patch 与 rollout 验证。
 //
-// Slice 3 才真正执行修复。安全边界分三层，缺一不可：
-//  1. 白名单：只允许演示 namespace、指定 Deployment、指定容器的内存 limit
-//     这一个字段，值只允许是提案里的新值，其他字段、其他资源一律拒绝；
+// Slice 4 起白名单是通用的，不再只认 demo/demo-api 这一组：
+// 任意 namespace / Deployment / 容器都可以提修复建议，
+// 但只允许改内存 limit 这一个字段，且新值必须大于旧值、
+// 不超过旧值的 4 倍、不超过 4Gi。安全边界分三层，缺一不可：
+//  1. 白名单：只允许改内存 limit，值必须合法，见 ValidatePatchSpec；
 //  2. 执行前校验：重新读取目标，核对 UID、容器名、变更前旧值，
 //     再用本次读取的 resourceVersion 做条件 Patch，防并发覆盖；
 //  3. 执行和验证分开：写入成功不等于修复成功，验证要独立检查 rollout、
 //     新 Pod 是否 Ready、重启次数是否继续增长，超时要明确标出来。
+//
 // 读和写用不同的客户端接口：诊断走 kube.KubeClient（只读），
 // 修复走 kube.RepairClient（写），生产上是两个不同的身份。
 package repair
@@ -15,10 +18,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 
 	"kubecause/internal/kube"
 	"kubecause/internal/store"
@@ -52,7 +57,13 @@ func CreateProposal(s *store.Store, p *Proposal) (*store.ChangeRequest, error) {
 }
 
 func isMemoryValue(v string) bool {
-	if len(v) < 3 || v[len(v)-2:] != "Mi" {
+	if len(v) < 3 {
+		return false
+	}
+	// 只接受 Mi / Gi 结尾的内存值：合法的 K8s 数量，且是人类可读的档位。
+	// "128"、"256M"、"1G"、"100m"（CPU 毫核）都不接受。
+	suffix := v[len(v)-2:]
+	if suffix != "Mi" && suffix != "Gi" {
 		return false
 	}
 	for _, c := range v[:len(v)-2] {
@@ -63,24 +74,81 @@ func isMemoryValue(v string) bool {
 	return true
 }
 
+var (
+	repairNsRe   = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
+	repairNameRe = regexp.MustCompile(`^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$`)
+)
+
+// parseMemoryMi 把 "128Mi"/"2Gi" 转成 MiB 数值，供倍数和上限比较用。
+func parseMemoryMi(v string) (int64, error) {
+	q, err := resource.ParseQuantity(v)
+	if err != nil {
+		return 0, err
+	}
+	return q.Value() / (1024 * 1024), nil
+}
+
+// DoubleMemory 将旧值翻倍，超过上限时封顶到上限，
+// 供模型没给新值时 Worker 兜底用。返回 "" 表示旧值本身已不合法。
+func DoubleMemory(oldValue string, maxMi int64) string {
+	oldMi, err := parseMemoryMi(oldValue)
+	if err != nil || oldMi <= 0 {
+		return ""
+	}
+	next := oldMi * 2
+	if next > maxMi {
+		next = maxMi
+	}
+	return fmt.Sprintf("%dMi", next)
+}
+
+// MaxMemoryMi 是单次修复允许的新值上限：4Gi。
+// ValidatePatchSpec 里同时检查“不超过旧值 4 倍”和“不超过 4Gi”，
+// 两个上限取更严的那一个，防止模型一次把 limit 提到天上去。
+const MaxMemoryMi = 4096
+
 // ValidatePatchSpec 是 Patch 的白名单校验，第一道防线。
-// 只允许 demo / demo-api / demo-api 这一组目标，只允许改内存 limit，
-// 值必须是 Mi 结尾的数量，且新旧值不能相同。任何不在白名单里的
-// 目标、字段或值都直接拒绝，不要用通用的 Patch 透传。
+// 通用规则（Slice 4）：任意 namespace / Deployment / 容器都可以，
+// 但只允许改内存 limit 这一个字段；值必须是 Mi / Gi 结尾；
+// 新值必须大于旧值、不超过旧值的 4 倍、不超过 4Gi；
+// 系统命名空间、空目标、非法格式一律拒绝。
+// 旧值和集群现状是否一致不在这里查，那是执行前校验（executePatch）
+// 重新读目标时核对的，两层分开，职责才清楚。
 func ValidatePatchSpec(namespace, deployment, container, oldValue, newValue string) error {
 	if namespace == "" || deployment == "" || container == "" {
 		return fmt.Errorf("提案缺少目标信息")
 	}
-	// 演示范围写死在白名单里：只改 demo 命名空间的 demo-api。
-	// 生产上把这里换成配置里的允许列表，不要放开成任意 namespace。
-	if namespace != "demo" || deployment != "demo-api" || container != "demo-api" {
-		return fmt.Errorf("不在白名单内：只允许 demo/demo-api/demo-api 的内存 limit 变更，得到 %s/%s/%s", namespace, deployment, container)
+	if namespace == "kube-system" || namespace == "kube-public" || namespace == "kube-node-lease" {
+		return fmt.Errorf("禁止修改系统命名空间 %q", namespace)
+	}
+	if !repairNsRe.MatchString(namespace) {
+		return fmt.Errorf("namespace 格式非法: %q", namespace)
+	}
+	if !repairNameRe.MatchString(deployment) || !repairNameRe.MatchString(container) {
+		return fmt.Errorf("目标名格式非法: %s/%s", deployment, container)
 	}
 	if oldValue == "" || newValue == "" || oldValue == newValue {
 		return fmt.Errorf("提案的新旧值非法")
 	}
 	if !isMemoryValue(oldValue) || !isMemoryValue(newValue) {
-		return fmt.Errorf("内存值必须是 Mi 结尾，例如 128Mi")
+		return fmt.Errorf("内存值必须是 Mi 或 Gi 结尾，例如 128Mi、2Gi")
+	}
+	oldMi, err := parseMemoryMi(oldValue)
+	if err != nil || oldMi <= 0 {
+		return fmt.Errorf("旧值解析失败: %q", oldValue)
+	}
+	newMi, err := parseMemoryMi(newValue)
+	if err != nil || newMi <= 0 {
+		return fmt.Errorf("新值解析失败: %q", newValue)
+	}
+	if newMi <= oldMi {
+		return fmt.Errorf("新值 %s 必须大于旧值 %s", newValue, oldValue)
+	}
+	if newMi > oldMi*4 {
+		return fmt.Errorf("新值 %s 超过旧值 %s 的 4 倍，拒绝执行", newValue, oldValue)
+	}
+	if newMi > MaxMemoryMi {
+		return fmt.Errorf("新值 %s 超过上限 4Gi，拒绝执行", newValue)
 	}
 	return nil
 }
@@ -91,18 +159,18 @@ func ValidatePatchSpec(namespace, deployment, container, oldValue, newValue stri
 // OldPodTemplateHash 是 Patch 前旧 Pod 的 pod-template-hash，
 // 验证阶段用它区分新旧 Pod。
 type ExecutionResult struct {
-	Status           string    `json:"status"`
-	DryRunOK         bool      `json:"dryRunOk"`
-	UID              string    `json:"uid,omitempty"`
-	ResourceVersion  string    `json:"resourceVersion,omitempty"`
-	BeforeValue      string    `json:"beforeValue,omitempty"`
-	AfterValue       string    `json:"afterValue,omitempty"`
-	Satisfied        bool      `json:"satisfied"`
-	Unknown          bool      `json:"unknown"`
-	AlreadyApplied   bool      `json:"alreadyApplied,omitempty"`
-	OldPodTemplateHash string  `json:"oldPodTemplateHash,omitempty"`
-	PatchTime        time.Time `json:"patchTime,omitempty"`
-	Error            string    `json:"error,omitempty"`
+	Status             string    `json:"status"`
+	DryRunOK           bool      `json:"dryRunOk"`
+	UID                string    `json:"uid,omitempty"`
+	ResourceVersion    string    `json:"resourceVersion,omitempty"`
+	BeforeValue        string    `json:"beforeValue,omitempty"`
+	AfterValue         string    `json:"afterValue,omitempty"`
+	Satisfied          bool      `json:"satisfied"`
+	Unknown            bool      `json:"unknown"`
+	AlreadyApplied     bool      `json:"alreadyApplied,omitempty"`
+	OldPodTemplateHash string    `json:"oldPodTemplateHash,omitempty"`
+	PatchTime          time.Time `json:"patchTime,omitempty"`
+	Error              string    `json:"error,omitempty"`
 }
 
 func (r ExecutionResult) toJSON() string {
@@ -114,7 +182,7 @@ func (r ExecutionResult) toJSON() string {
 // 写入成功但验证失败时，前端要能分别看到这两项，不能混成一个成功。
 type VerificationResult struct {
 	Status             string `json:"status"`
-	ObservedGeneration  int64  `json:"observedGeneration"`
+	ObservedGeneration int64  `json:"observedGeneration"`
 	DesiredGeneration  int64  `json:"desiredGeneration"`
 	UpdatedReplicas    int32  `json:"updatedReplicas"`
 	AvailableReplicas  int32  `json:"availableReplicas"`
@@ -236,9 +304,9 @@ func (e *Executor) execSummary(r *ExecutionResult) string {
 	switch r.Status {
 	case store.ExecExecuted:
 		if r.AlreadyApplied {
-			return fmt.Sprintf("修复已生效（之前已应用过）：demo-api 容器内存 limit 已是 %s", r.AfterValue)
+			return fmt.Sprintf("修复已生效（之前已应用过）：容器内存 limit 已是 %s", r.AfterValue)
 		}
-		return fmt.Sprintf("修复已写入：demo-api 容器内存 limit %s -> %s，读回确认已生效", r.BeforeValue, r.AfterValue)
+		return fmt.Sprintf("修复已写入：容器内存 limit %s -> %s，读回确认已生效", r.BeforeValue, r.AfterValue)
 	case store.ExecExpired:
 		return "修复过期未执行：" + r.Error
 	case store.ExecUnknown:

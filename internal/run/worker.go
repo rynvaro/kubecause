@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
 	"time"
 
 	"kubecause/internal/agent"
@@ -150,35 +149,105 @@ func (w *Worker) execute(ctx context.Context, run *store.Run) error {
 	// 4. 记一步 report，时间线里能看到最终结论。
 	seq, _ := w.Store.NextSeq(ctx, run.ID)
 	_ = w.Store.AppendStep(ctx, &store.RunStep{RunID: run.ID, Seq: seq, Kind: "report", Summary: report.Cause, ResultJSON: string(reportJSON)})
-	// 5. 诊断明确指向 OOM 且目标是 Deployment 时，生成一份
-	//    调内存 limit 的待审批提案。Slice 3 只生成、不在这里执行，
-	//    执行由 Worker 循环里的 ProcessOneRepair 在批准后做。
+	// 5. 模型在报告里给了修复建议时，生成一份待审批提案。
+	//    通用逻辑（Slice 4）：不再只认 OOM / demo-api / 128Mi->256Mi，
+	//    建议的目标、字段、新旧值都来自模型报告里的 SuggestedRepair，
+	//    Worker 只做三件事：补齐缺失项（容器名、旧值、新值）、
+	//    拿集群现状核对、交给 repair.ValidatePatchSpec 做白名单校验。
+	//    校验不通过就不生成提案，不会把一个非法建议变成可审批的东西。
 	//    置信度 high 或 medium 都生成：真模型在 kind 上跑 OOM 常常
 	//    只给 medium（日志为空、没有实时 metrics，它不敢说 high），
-	//    但 OOM 本身是直接原因，调高 limit 是低风险、可逆的操作，
-	//    而且还要经过人工审批这一关，medium 足够出提案。
+	//    但还要经过人工审批这一关，medium 足够出提案；
 	//    low（证据不足）仍不生成，避免模型瞎猜一个修复。
 	//    提案生成时把目标 Deployment 的 UID 一起绑上，执行前校验用。
-	if (report.Confidence == "high" || report.Confidence == "medium") && containsOOM(report.Cause) && run.Kind == "Deployment" {
-		uid := ""
-		// ToolsAdapter 的 Kube 字段是导出的，这里直接读目标 UID。
-		// 读不到也不致命，提案的 UID 为空时执行前只校验旧值，不校验 UID。
-		if ta, ok := w.Tools.(*ToolsAdapter); ok && ta.Kube != nil {
-			if dep, err := ta.Kube.GetDeployment(ctx, run.Namespace, run.Name); err == nil {
-				uid = string(dep.UID)
-			}
-		}
-		_, _ = repair.CreateProposal(w.Store, &repair.Proposal{
-			RunID: run.ID, Namespace: run.Namespace, Deployment: run.Name,
-			Container: "demo-api", OldValue: "128Mi", NewValue: "256Mi",
-			DeploymentUID: uid,
-		})
+	//    执行本身不在这里，批准后由 Worker 循环里的 ProcessOneRepair 做。
+	if report.Confidence == "high" || report.Confidence == "medium" {
+		_ = w.maybeCreateProposal(ctx, run, report)
 	}
 	return nil
 }
 
-func containsOOM(s string) bool {
-	return strings.Contains(s, "OOM") || strings.Contains(s, "内存")
+// maybeCreateProposal 把模型报告里的修复建议转成一份待审批提案。
+// 建议不完整时尽量从集群现状补齐，补不齐就放弃，不生成提案：
+//   - 目标 Deployment：建议里的 deployment 为空时用本次任务的目标
+//     （Kind 为 Deployment 时才有意义，Pod 任务不生成修复提案）；
+//   - 容器名：建议里没给时读 Deployment 的第一个容器；
+//   - 旧值：以集群现状为准，建议里给的旧值和现状不一致时放弃
+//     （说明建议的前提已经变了）；
+//   - 新值：建议里没给时按旧值翻倍（封顶 4Gi）。
+//
+// 最后统一过 ValidatePatchSpec（CreateProposal 内部会再校验一次），
+// 任何一关不过都不生成提案，也不报错让任务失败——
+// 没有提案的诊断本身仍然是完整的，报告已经落盘了。
+func (w *Worker) maybeCreateProposal(ctx context.Context, run *store.Run, report *agent.Report) error {
+	sr := report.SuggestedRepair
+	if sr == nil {
+		return nil
+	}
+	if sr.Field != "" && sr.Field != "memoryLimit" {
+		return nil
+	}
+	if run.Kind != "Deployment" {
+		return nil
+	}
+	namespace := sr.Namespace
+	if namespace == "" {
+		namespace = run.Namespace
+	}
+	deployment := sr.Deployment
+	if deployment == "" {
+		deployment = run.Name
+	}
+	// 读集群现状：拿 UID、容器列表和当前 limit。
+	// ToolsAdapter 的 Kube 字段是导出的，这里直接读目标。
+	ta, ok := w.Tools.(*ToolsAdapter)
+	if !ok || ta.Kube == nil {
+		return nil
+	}
+	dep, err := ta.Kube.GetDeployment(ctx, namespace, deployment)
+	if err != nil {
+		return nil
+	}
+	uid := string(dep.UID)
+	if len(dep.Spec.Template.Spec.Containers) == 0 {
+		return nil
+	}
+	container := sr.Container
+	if container == "" {
+		// 容器名不要写死：建议里没给就用 Deployment 的第一个容器，
+		// 这是单容器 Deployment 的常规情况；多容器时模型必须指明容器。
+		container = dep.Spec.Template.Spec.Containers[0].Name
+	}
+	current := ""
+	found := false
+	for _, c := range dep.Spec.Template.Spec.Containers {
+		if c.Name == container {
+			current = c.Resources.Limits.Memory().String()
+			found = true
+			break
+		}
+	}
+	if !found {
+		return nil
+	}
+	// 旧值以集群现状为准：建议里的旧值和现状不一致，
+	// 说明建议是按过期快照提的，不能用。
+	if sr.OldValue != "" && sr.OldValue != current {
+		return nil
+	}
+	newValue := sr.NewValue
+	if newValue == "" {
+		newValue = repair.DoubleMemory(current, repair.MaxMemoryMi)
+		if newValue == "" {
+			return nil
+		}
+	}
+	_, _ = repair.CreateProposal(w.Store, &repair.Proposal{
+		RunID: run.ID, Namespace: namespace, Deployment: deployment,
+		Container: container, OldValue: current, NewValue: newValue,
+		DeploymentUID: uid,
+	})
+	return nil
 }
 
 // 确保 model 包被引用，避免以后换模型时漏掉导入（Slice 1 用 stub）。

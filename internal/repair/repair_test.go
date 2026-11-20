@@ -60,27 +60,74 @@ func deploymentLimit(t *testing.T, f *kube.Fake) string {
 }
 
 func TestValidatePatchSpecWhitelist(t *testing.T) {
-	// 合法的只有 demo/demo-api/demo-api 这一组。
+	// 通用规则（Slice 4）：任意 namespace / Deployment / 容器都合法，
+	// 只认字段和值。demo 这一组当然合法。
 	if err := ValidatePatchSpec("demo", "demo-api", "demo-api", "128Mi", "256Mi"); err != nil {
 		t.Fatalf("合法提案应通过白名单: %v", err)
 	}
-	// 非法目标一律拒绝：系统 namespace、别的 Deployment、别的容器。
+	// 别的 namespace / Deployment 也合法，不再只认 demo 这一组。
+	if err := ValidatePatchSpec("prod", "web-api", "web", "512Mi", "1Gi"); err != nil {
+		t.Fatalf("通用目标应通过白名单: %v", err)
+	}
+	if err := ValidatePatchSpec("staging", "api", "api", "2Gi", "3Gi"); err != nil {
+		t.Fatalf("Gi 值应通过白名单: %v", err)
+	}
+	// 非法目标一律拒绝：系统 namespace、空目标、非法格式。
 	for _, tc := range []struct{ ns, dep, ct string }{
 		{"kube-system", "demo-api", "demo-api"},
-		{"demo", "other-api", "demo-api"},
-		{"demo", "demo-api", "sidecar"},
+		{"kube-public", "demo-api", "demo-api"},
 		{"", "demo-api", "demo-api"},
+		{"demo", "", "demo-api"},
+		{"demo", "demo-api", ""},
 	} {
 		if err := ValidatePatchSpec(tc.ns, tc.dep, tc.ct, "128Mi", "256Mi"); err == nil {
 			t.Fatalf("非法目标应被白名单拒绝: %+v", tc)
 		}
 	}
-	// 非法值也拒绝：不是 Mi 结尾、新旧值相同。
+	// 非法值也拒绝：不是 Mi/Gi 结尾、新旧值相同、新值不大于旧值。
 	if err := ValidatePatchSpec("demo", "demo-api", "demo-api", "128", "256Mi"); err == nil {
-		t.Fatalf("非 Mi 值应被拒绝")
+		t.Fatalf("非 Mi/Gi 值应被拒绝")
 	}
 	if err := ValidatePatchSpec("demo", "demo-api", "demo-api", "256Mi", "256Mi"); err == nil {
 		t.Fatalf("新旧值相同应被拒绝")
+	}
+	if err := ValidatePatchSpec("demo", "demo-api", "demo-api", "512Mi", "256Mi"); err == nil {
+		t.Fatalf("新值小于旧值应被拒绝")
+	}
+	// 超过旧值 4 倍拒绝：128Mi -> 1Gi 是 8 倍。
+	if err := ValidatePatchSpec("demo", "demo-api", "demo-api", "128Mi", "1Gi"); err == nil {
+		t.Fatalf("新值超过旧值 4 倍应被拒绝")
+	}
+	// 超过 4Gi 上限拒绝：2Gi -> 8Gi。
+	if err := ValidatePatchSpec("demo", "demo-api", "demo-api", "2Gi", "8Gi"); err == nil {
+		t.Fatalf("新值超过 4Gi 应被拒绝")
+	}
+	// 边界：恰好 4 倍、恰好 4Gi 应通过。
+	if err := ValidatePatchSpec("demo", "demo-api", "demo-api", "128Mi", "512Mi"); err != nil {
+		t.Fatalf("恰好 4 倍应通过: %v", err)
+	}
+	if err := ValidatePatchSpec("demo", "demo-api", "demo-api", "1Gi", "4Gi"); err != nil {
+		t.Fatalf("恰好 4Gi 应通过: %v", err)
+	}
+}
+
+// TestExecuteOldValueMismatchExpires 覆盖“旧值不匹配拒绝”：
+// 提案旧值是 64Mi，但集群现状是 128Mi，执行前校验应标为过期，不 Patch。
+func TestExecuteOldValueMismatchExpires(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	f := kube.NewFake()
+	e := newExecutor(t, s, f)
+	p := makeApproved(t, ctx, s, "uid-demo-api-deploy", "64Mi")
+	if _, _, err := e.Execute(ctx, p.ID); err != nil {
+		t.Fatalf("旧值不匹配时 Execute 不应报错返回，应标为过期: %v", err)
+	}
+	got, _ := s.GetChangeRequest(ctx, p.ID)
+	if got.ExecutionStatus != store.ExecExpired {
+		t.Fatalf("旧值不匹配时执行状态应为 expired，得到 %s，详情 %s", got.ExecutionStatus, got.ExecutionDetail)
+	}
+	if v := deploymentLimit(t, f); v != "128Mi" {
+		t.Fatalf("过期提案不应 Patch，limit 应仍是 128Mi，得到 %s", v)
 	}
 }
 

@@ -1,10 +1,21 @@
-# KubeCause — Kubernetes 故障诊断 Agent（Slice 3）
+# KubeCause — Kubernetes 故障诊断 Agent（Slice 4）
 
 KubeCause 是一个 Kubernetes 故障诊断 Agent。用户选定 namespace 和 Pod 或 Deployment，描述故障现象，Agent 自主选择只读工具收集证据，检索排障手册，输出诊断结论和建议。演示环境支持一类人工审批后的变更，即调整指定 Deployment 的容器内存限制，并验证变更后的运行状态。
 
-Slice 3 在 Slice 2 的基础上，把修复真正做出来了：**审批后执行条件 Patch、rollout 验证、静态页审批卡和修复展示、RBAC 参考清单**。完整 React 前端仍未做，仍是静态页。
+Slice 4 在 Slice 3 的基础上做了两件事：**后端通用化**和**对话模式**。通用化是把写死的 demo 逻辑全部去掉——提案不再只认 OOM / demo-api / 128Mi→256Mi，模型在报告里给修复建议，Worker 拿集群现状核对、白名单校验，通过了才生成提案；`KUBE_MODE` 不再分 kind/k3s，统一走 kubeconfig 模式。对话模式是新增的：先问“当前状态怎么样”，再追问某个 namespace 是怎么回事，Agent 记得上文，只读不改，修复只给一张建议卡，转成正式诊断后才走审批和执行。单次诊断（表单模式）保留不变，两者共用同一套 Agent 核心、同一套工具、同一套安全规则。完整 React 前端仍未做，仍是静态页（静态页上只加了一个最小的对话入口）。
 
-Slice 1/2 已有的东西没有重写：SQLite 三张表、四个 HTTP 接口、Worker 状态机、Agent 循环的校验和恢复、fake 客户端、桩模型、真模型适配器、FTS5 检索，全部保留并做了回归。
+Slice 1/2/3 已有的东西没有重写：SQLite 表、HTTP 接口、Worker 状态机、Agent 循环的校验和恢复、fake 客户端、桩模型、真模型适配器、FTS5 检索、条件 Patch 与 rollout 验证，全部保留并做了回归。
+
+## Slice 4 改了什么
+
+- **通用 Agent**（`internal/agent/`、`internal/model/`、`internal/run/worker.go`）：报告里新增可选的 `suggestedRepair` 字段（目标 namespace / Deployment / 容器、字段、旧值、新值、理由），字段目前只支持 `memoryLimit`，别的字段会被校验层清掉。Stub 的修复建议从已查到的 Deployment 结果里算出来（容器名、旧值来自证据，新值是旧值翻倍封顶 4Gi），不再写死 demo-api / 128Mi；真模型的 `submit_diagnosis` 也加了 `suggestedRepair` 字段，系统提示词里明确“不要预设故障类型，按证据自己判断”。
+- **通用修复白名单**（`internal/repair.ValidatePatchSpec`）：任意 namespace / Deployment / 容器都可以提修复建议，但只允许改内存 limit，值必须是 Mi / Gi 结尾，新值必须大于旧值、不超过旧值的 4 倍、不超过 4Gi，系统命名空间一律拒绝。旧值和集群现状是否一致仍由执行前校验重新读目标时核对（旧值不匹配标为过期，不 Patch）。
+- **通用提案生成**（`internal/run/worker.go`）：Worker 不再看原因里有没有 OOM，而是看报告里有没有 `suggestedRepair`；容器名没给时读 Deployment 的第一个容器，旧值以集群现状为准（建议里的旧值和现状不一致就放弃），新值没给时按旧值翻倍。校验不通过就不生成提案，诊断报告本身仍然完整。
+- **KUBE_MODE 通用化**（`cmd/server/main.go`）：`fake | kubeconfig`，`kind` 是 `kubeconfig` 的别名，做兼容保留。kind、k3s、云厂商集群都读 kubeconfig，不再为每种集群写一套客户端；k3s 的 kubeconfig 在 `/etc/rancher/k3s/k3s.yaml`，用 `KUBECONFIG` 指过去即可。
+- **发现工具**（`internal/run/tools.go`、`internal/kube/client.go`）：新增 4 个只读工具，注册进 Agent 工具表，模型在对话里能自主调用：`list_namespaces`、`list_deployments`（namespace 为空查全部）、`list_problem_pods`（非 Running、未 Ready、重启过、有等待原因）、`get_cluster_overview`（节点数、namespace 数、Deployment 数、Pod 数、有问题 Pod 数）。返回的都是结构化 JSON，前端以后能渲染成表格和卡片；系统命名空间的结果会被过滤掉。
+- **对话会话**（`internal/chat/`、`internal/store/`）：SQLite 新增 `conversations` 和 `messages` 两张表（role 分 user / assistant / tool）。新 API：`POST /api/conversations`、`GET /api/conversations`、`GET /api/conversations/{id}`、`POST /api/conversations/{id}/messages`、`POST /api/conversations/{id}/convert`。每次调用模型带最近 10 条消息，超出截断，数据库里全量保留；TODO 是以后对 10 条之前的历史做摘要，现在不做假的摘要。指代消解靠历史实现：系统提示词写清“这个 ns / 刚才那个 Pod 要按最近提到的目标理解，理解不了就主动问，不要猜”。
+- **对话只读**：对话里模型只能调只读工具，不能直接 Patch；需要修复时返回结构化修复建议卡，不生成 `change_requests`。用户点“转成正式诊断”后，才走现有的 `/api/runs` 流程，生成提案、走人工审批、再执行和验证。
+- **Runbook 扩到 8 篇**：新增 CrashLoopBackOff、Pending 调度失败、Service 无 Endpoints、ConfigMap/Secret 缺失、资源配额不足 5 篇，每篇都有中文关键词和别名，FTS5 索引能命中；原有 3 篇没删，`go run ./cmd/eval` 仍 3/3 通过。
 
 ## Slice 3 改了什么
 
@@ -73,7 +84,7 @@ make eval-real  # 真模型评估，无 Key 时明确跳过，不报错
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `KUBE_MODE` | `fake` | `fake` 用 client-go fake clientset，预置 demo-api 数据；`kind` 用真 client-go 读 kubeconfig |
+| `KUBE_MODE` | `fake` | `fake` 用 client-go fake clientset，预置 demo-api 数据；`kubeconfig` 用真 client-go 读 kubeconfig（kind、k3s、云厂商集群都走这个，`kind` 是别名） |
 | `MODEL_MODE` | `stub` | `stub` 用桩模型，确定性走完工具调用；`real` 用真模型，Key 缺失时启动明确报错 |
 | `MODEL_API_KEY` | 空 | 真模型 Key，`MODEL_MODE=real` 时必填，只从环境变量读 |
 | `MODEL_BASE_URL` | `https://api.deepseek.com/v1` | 真模型地址；换 OpenAI 时改成 `https://api.openai.com/v1` |
@@ -93,7 +104,7 @@ KUBE_MODE=fake MODEL_MODE=stub DB_PATH=./kubecause.db ADDR=:8080 go run ./cmd/se
 
 打开 http://localhost:8080 ，提交 `demo / Deployment / demo-api / demo-api 为什么一直重启`，就能看到工具步骤、时间线和诊断报告。
 
-### kind + stub（Mac 上跑真集群，桩模型）
+### kubeconfig + stub（Mac 上跑真集群，桩模型）
 
 先在 Mac 上装 kind：
 
@@ -109,27 +120,29 @@ kind create cluster --name kubecause
 kubectl get nodes
 ```
 
-然后启动服务：
+然后启动服务（`kind` 是 `kubeconfig` 的别名，两种写法都行）：
 
 ```bash
-KUBE_MODE=kind MODEL_MODE=stub DB_PATH=./kubecause.db ADDR=:8080 go run ./cmd/server
+KUBE_MODE=kubeconfig MODEL_MODE=stub DB_PATH=./kubecause.db ADDR=:8080 go run ./cmd/server
 ```
 
 找不到 kubeconfig 时启动会明确报错，请确认已执行 `kind create cluster`，且 `~/.kube/config` 存在，或用 `KUBECONFIG` 指定。
 
-### kind + 真模型（Mac 上，DeepSeek 示例）
+云上跑 k3s 时也一样：k3s 的 kubeconfig 在 `/etc/rancher/k3s/k3s.yaml`，用 `KUBECONFIG` 指过去即可，不用换模式。
+
+### kubeconfig + 真模型（Mac 上，DeepSeek 示例）
 
 ```bash
 # Key 只从环境变量读，不要写进文件、不要提交
 export MODEL_API_KEY="sk-..."
-KUBE_MODE=kind MODEL_MODE=real MODEL_BASE_URL=https://api.deepseek.com/v1 MODEL_NAME=deepseek-chat DB_PATH=./kubecause.db ADDR=:8080 go run ./cmd/server
+KUBE_MODE=kubeconfig MODEL_MODE=real MODEL_BASE_URL=https://api.deepseek.com/v1 MODEL_NAME=deepseek-chat DB_PATH=./kubecause.db ADDR=:8080 go run ./cmd/server
 ```
 
 换 OpenAI 时只改两个变量：
 
 ```bash
 export MODEL_API_KEY="sk-..."
-KUBE_MODE=kind MODEL_MODE=real MODEL_BASE_URL=https://api.openai.com/v1 MODEL_NAME=gpt-4o-mini DB_PATH=./kubecause.db ADDR=:8080 go run ./cmd/server
+KUBE_MODE=kubeconfig MODEL_MODE=real MODEL_BASE_URL=https://api.openai.com/v1 MODEL_NAME=gpt-4o-mini DB_PATH=./kubecause.db ADDR=:8080 go run ./cmd/server
 ```
 
 ## kind 演示脚本
@@ -151,7 +164,38 @@ kubectl logs -n demo -l app=demo-api --previous
 
 清理演示：`kubectl delete -f scripts/kind/demo-api.yaml`
 
-注意：本机（Muse 的 Linux VM）没有 Docker / kind，无法做 kind 端到端验证，脚本和上面的步骤就是给 Mac 上手动验证准备的。`KUBE_MODE=kind` 的 client-go 读 kubeconfig 逻辑已在 Slice 1 实现，Slice 2 没有改坏它。
+注意：本机（Muse 的 Linux VM）没有 Docker / kind，无法做 kind 端到端验证，脚本和上面的步骤就是给 Mac 上手动验证准备的。`KUBE_MODE=kubeconfig` 的 client-go 读 kubeconfig 逻辑已在 Slice 1 实现，Slice 2 没有改坏它，Slice 4 只是把 `kind` 改成了别名。
+
+## 对话模式 curl 演示流程
+
+服务启动后（fake + stub），在另一个终端跑：
+
+```bash
+# 1. 创建会话，返回会话 ID
+curl -s -X POST http://localhost:8080/api/conversations \
+  -H 'Content-Type: application/json' -d '{}'
+# 记下返回的 id，例如 conv_xxxxxxxxxxxxxxxx，下面用 $CONV 代替
+
+# 2. 第一轮：问当前状态，Agent 先看总览、再列有问题的 Pod
+curl -s -X POST http://localhost:8080/api/conversations/$CONV/messages \
+  -H 'Content-Type: application/json' \
+  -d '{"content":"当前状态怎么样"}'
+# 预期：reply 里有集群总览（节点数、命名空间数、有问题 Pod 数），
+# structured 里有 overview 和 problemPods 的结构化结果
+
+# 3. 第二轮：只说“demo 那个一直重启的是怎么回事”，不重新给 namespace，
+# Agent 应接上文查 demo，返回结构化 Pod 列表和修复建议卡（128Mi -> 256Mi），
+# 但不自动 Patch、不生成提案
+curl -s -X POST http://localhost:8080/api/conversations/$CONV/messages \
+  -H 'Content-Type: application/json' \
+  -d '{"content":"demo 那个一直重启的是怎么回事"}'
+
+# 4. 转成正式诊断：按会话历史解析出 demo/demo-api，创建任务，返回 runId
+curl -s -X POST http://localhost:8080/api/conversations/$CONV/convert \
+  -H 'Content-Type: application/json' -d '{}'
+# 之后走老的 /api/runs 流程：等诊断完成、审批提案、Worker 执行并验证，
+# 见下面“curl 演示流程”。
+```
 
 ## 离线评估
 
@@ -209,7 +253,8 @@ curl -s "http://localhost:8080/api/runs/$RUN_ID"
 | `internal/api/` | HTTP API：创建任务、查询快照、时间线轮询、审批决定 |
 | `internal/run/` | Worker：领取任务、推进状态、重启恢复；工具适配器（FTS5 优先，关键词回退） |
 | `internal/store/` | SQLite：迁移、任务、步骤、提案，步骤和进度同一事务提交 |
-| `internal/agent/` | Agent 循环：步数上限、时限、工具校验、证据引用校验 |
+| `internal/chat/` | 对话模式：会话服务、Stub 确定性规则、真模型对话循环、修复建议卡合成、转正式诊断 |
+| `internal/agent/` | Agent 循环：步数上限、时限、工具校验、证据引用校验、修复建议字段校验 |
 | `internal/model/` | 模型适配器：stub 桩模型（三类场景确定性剧本），real 是 OpenAI 兼容协议的真模型 |
 | `internal/kube/` | client-go 只读访问：fake 预置三类场景数据，kind 读 kubeconfig |
 | `internal/knowledge/` | 排障手册检索：FTS5 索引（keywords 列解决中文短词查询）+ 关键词回退 |
@@ -237,10 +282,18 @@ curl -s "http://localhost:8080/api/runs/$RUN_ID"
 - 前端审批卡和修复展示（静态页），RBAC 参考清单
 - 提案生成放宽到 high 或 medium，真模型 medium 也能出提案
 
-## Slice 3 未实现
+## Slice 4 已实现
 
-- 完整 React + TypeScript 前端（目前是静态页，审批卡和修复展示已做）
-- 多集群、多 namespace 演示、鉴权、监控
+- 后端通用化：报告里的 `suggestedRepair`、通用白名单（任意目标、只改内存 limit、新值大于旧值、不超过 4 倍、不超过 4Gi）、通用提案生成（容器名、旧值、新值从集群现状补齐）、`KUBE_MODE=kubeconfig`（`kind` 是别名）
+- 发现工具：`list_namespaces`、`list_deployments`、`list_problem_pods`、`get_cluster_overview`，全部只读，结构化返回
+- 对话模式：会话 + 消息持久化、最近 10 条历史截断、指代消解、对话只读、修复建议卡、转正式诊断
+- Runbook 扩到 8 篇，评估仍 3/3 通过；单次诊断、审批执行、rollout 验证全部回归通过
+
+## Slice 4 未实现
+
+- 完整 React + TypeScript 前端（目前是静态页，对话只加了最小入口）
+- 对话历史摘要（现在是截断，TODO 在代码和 README 里写清了）
+- 云端部署、鉴权、监控
 
 ## 架构文档
 

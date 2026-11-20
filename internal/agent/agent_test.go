@@ -35,6 +35,18 @@ func (s *stubTools) GetDeployment(ctx context.Context, ns, name string) (ToolOut
 func (s *stubTools) SearchRunbooks(ctx context.Context, q string) (ToolOutput, error) {
 	return ToolOutput{Summary: "runbook", Data: map[string]any{}}, nil
 }
+func (s *stubTools) ListNamespaces(ctx context.Context) (ToolOutput, error) {
+	return ToolOutput{Summary: "namespaces", Data: map[string]any{"namespaces": []string{"demo"}}}, nil
+}
+func (s *stubTools) ListDeployments(ctx context.Context, ns string) (ToolOutput, error) {
+	return ToolOutput{Summary: "deployments", Data: map[string]any{}}, nil
+}
+func (s *stubTools) ListProblemPods(ctx context.Context, ns string) (ToolOutput, error) {
+	return ToolOutput{Summary: "problem pods", Data: map[string]any{}}, nil
+}
+func (s *stubTools) GetClusterOverview(ctx context.Context) (ToolOutput, error) {
+	return ToolOutput{Summary: "overview", Data: map[string]any{}}, nil
+}
 
 func TestStepLimit(t *testing.T) {
 	tools := &stubTools{}

@@ -118,6 +118,29 @@ type ChangeRequest struct {
 	UpdatedAt          time.Time `json:"updatedAt"`
 }
 
+// Conversation 对应 conversations 表，一次对话会话。
+// 对话和单次诊断是两条线：对话只读、不直接改集群，
+// 需要修复时转成 /api/runs 的正式诊断再走审批。
+type Conversation struct {
+	ID        string    `json:"id"`
+	Title     string    `json:"title"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+// ConversationMessage 对应 messages 表，一条会话消息。
+// Role 是 user / assistant / tool；ToolCalls 存本轮调过的工具
+// （JSON），Structured 存结构化结果（JSON，前端渲染表格/卡片用）。
+type ConversationMessage struct {
+	ID             int64     `json:"id"`
+	ConversationID string    `json:"conversationId"`
+	Role           string    `json:"role"`
+	Content        string    `json:"content"`
+	ToolCalls      string    `json:"toolCalls,omitempty"`
+	Structured     string    `json:"structured,omitempty"`
+	CreatedAt      time.Time `json:"createdAt"`
+}
+
 // Store 是 SQLite 的唯一入口。
 type Store struct {
 	db *sql.DB
@@ -211,6 +234,26 @@ func (s *Store) migrate(ctx context.Context) error {
 			updated_at DATETIME NOT NULL,
 			decided_at DATETIME
 		)`,
+		// 对话会话（Slice 4）：conversations 是一次会话，
+		// messages 是会话里的消息，role 分 user / assistant / tool。
+		// 历史只保留最近的消息给模型（见 chat 包的截断策略），
+		// 数据库里全量保留，前端翻历史时能看到完整上下文。
+		`CREATE TABLE IF NOT EXISTS conversations (
+			id TEXT PRIMARY KEY,
+			title TEXT NOT NULL DEFAULT '',
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS messages (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			conversation_id TEXT NOT NULL REFERENCES conversations(id),
+			role TEXT NOT NULL,
+			content TEXT NOT NULL DEFAULT '',
+			tool_calls TEXT NOT NULL DEFAULT '',
+			structured TEXT NOT NULL DEFAULT '',
+			created_at DATETIME NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, id)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
@@ -575,4 +618,105 @@ func (s *Store) ResetExecutingChanges(ctx context.Context) (int64, error) {
 func quoteJSON(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)
+}
+
+// ---------------------------------------------------------------------------
+// 对话会话（Slice 4）
+// ---------------------------------------------------------------------------
+
+// CreateConversation 创建一个会话，标题默认取第一条用户消息的前 20 个字，
+// 创建时还没有消息，标题先为空，首条消息写入时再补。
+func (s *Store) CreateConversation(ctx context.Context, title string) (*Conversation, error) {
+	c := &Conversation{ID: NewID("conv_"), Title: title, CreatedAt: now(), UpdatedAt: now()}
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO conversations(id, title, created_at, updated_at) VALUES(?,?,?,?)`,
+		c.ID, c.Title, c.CreatedAt, c.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// GetConversation 按 ID 取会话。
+func (s *Store) GetConversation(ctx context.Context, id string) (*Conversation, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT id, title, created_at, updated_at FROM conversations WHERE id=?`, id)
+	c := &Conversation{}
+	if err := row.Scan(&c.ID, &c.Title, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// ListConversations 按更新时间倒序列出会话。
+func (s *Store) ListConversations(ctx context.Context) ([]Conversation, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, title, created_at, updated_at FROM conversations ORDER BY updated_at DESC LIMIT 50`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Conversation{}
+	for rows.Next() {
+		var c Conversation
+		if err := rows.Scan(&c.ID, &c.Title, &c.CreatedAt, &c.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// AppendMessage 往会话里追加一条消息，并更新会话的 updated_at。
+// 首条用户消息写入时，若会话标题为空，用它做标题（截断到 20 个字）。
+func (s *Store) AppendMessage(ctx context.Context, m *ConversationMessage) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	m.CreatedAt = now()
+	res, err := tx.ExecContext(ctx,
+		`INSERT INTO messages(conversation_id, role, content, tool_calls, structured, created_at) VALUES(?,?,?,?,?,?)`,
+		m.ConversationID, m.Role, m.Content, m.ToolCalls, m.Structured, m.CreatedAt)
+	if err != nil {
+		return err
+	}
+	id, _ := res.LastInsertId()
+	m.ID = id
+	if m.Role == "user" {
+		_, _ = tx.ExecContext(ctx,
+			`UPDATE conversations SET title=COALESCE(NULLIF(title,''),?), updated_at=? WHERE id=?`,
+			truncateTitle(m.Content), now(), m.ConversationID)
+	} else {
+		_, _ = tx.ExecContext(ctx, `UPDATE conversations SET updated_at=? WHERE id=?`, now(), m.ConversationID)
+	}
+	return tx.Commit()
+}
+
+// ListMessages 按时间顺序返回一个会话的全部消息。
+// 调用方负责截断：给模型时只取最近 10 条（见 chat 包），
+// 给前端时全量返回，前端能看到完整历史。
+func (s *Store) ListMessages(ctx context.Context, conversationID string) ([]ConversationMessage, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, conversation_id, role, content, tool_calls, structured, created_at FROM messages WHERE conversation_id=? ORDER BY id ASC`, conversationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []ConversationMessage{}
+	for rows.Next() {
+		var m ConversationMessage
+		if err := rows.Scan(&m.ID, &m.ConversationID, &m.Role, &m.Content, &m.ToolCalls, &m.Structured, &m.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+func truncateTitle(s string) string {
+	r := []rune(s)
+	if len(r) <= 20 {
+		return s
+	}
+	return string(r[:20])
 }

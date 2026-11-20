@@ -19,12 +19,17 @@ run-fake:
 	KUBE_MODE=fake MODEL_MODE=stub DB_PATH=./kubecause.db ADDR=:8080 $(GO) run ./cmd/server
 
 # kind 模式：真集群 + 桩模型（先在 Mac 上 kind create cluster）
+# KUBE_MODE=kubeconfig 是通用模式，kind 是它的别名
 run-kind:
-	KUBE_MODE=kind MODEL_MODE=stub DB_PATH=./kubecause.db ADDR=:8080 $(GO) run ./cmd/server
+	KUBE_MODE=kubeconfig MODEL_MODE=stub DB_PATH=./kubecause.db ADDR=:8080 $(GO) run ./cmd/server
+
+# k3s 模式：云服务器上的 k3s 也是读 kubeconfig，KUBECONFIG 指到 /etc/rancher/k3s/k3s.yaml
+run-k3s:
+	KUBE_MODE=kubeconfig MODEL_MODE=stub DB_PATH=./kubecause.db ADDR=:8080 $(GO) run ./cmd/server
 
 # kind + 真模型：MODEL_API_KEY 必须从环境变量传，不要写进 Makefile
 run-real:
-	KUBE_MODE=kind MODEL_MODE=real DB_PATH=./kubecause.db ADDR=:8080 $(GO) run ./cmd/server
+	KUBE_MODE=kubeconfig MODEL_MODE=real DB_PATH=./kubecause.db ADDR=:8080 $(GO) run ./cmd/server
 
 eval:
 	$(GO) run ./cmd/eval

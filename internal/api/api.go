@@ -14,12 +14,16 @@ import (
 	"strings"
 
 	"kubecause/internal/agent"
+	"kubecause/internal/chat"
 	"kubecause/internal/store"
 )
 
 // Handler 持有 Store。
+// Chat 是对话服务（Slice 4），为 nil 时会话接口返回 503，
+// 单次诊断接口不受影响。
 type Handler struct {
 	Store *store.Store
+	Chat  *chat.Service
 }
 
 // CreateRunRequest 是 POST /api/runs 的请求体。
@@ -242,9 +246,125 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/runs/{id}", h.GetRun)
 	mux.HandleFunc("GET /api/runs/{id}/events", h.ListEvents)
 	mux.HandleFunc("POST /api/runs/{id}/approvals/{approvalId}/decision", h.DecideApproval)
+	// 对话模式（Slice 4）：只读多轮对话，转正式诊断才走 /api/runs。
+	mux.HandleFunc("POST /api/conversations", h.CreateConversation)
+	mux.HandleFunc("GET /api/conversations", h.ListConversations)
+	mux.HandleFunc("GET /api/conversations/{id}", h.GetConversation)
+	mux.HandleFunc("POST /api/conversations/{id}/messages", h.PostConversationMessage)
+	mux.HandleFunc("POST /api/conversations/{id}/convert", h.ConvertConversation)
 	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
+}
+
+// ---------------------------------------------------------------------------
+// 对话模式（Slice 4）
+// ---------------------------------------------------------------------------
+
+func (h *Handler) requireChat(w http.ResponseWriter) bool {
+	if h.Chat == nil {
+		writeError(w, http.StatusServiceUnavailable, "对话服务未配置")
+		return false
+	}
+	return true
+}
+
+// CreateConversation 处理 POST /api/conversations，创建一个空会话。
+func (h *Handler) CreateConversation(w http.ResponseWriter, r *http.Request) {
+	if !h.requireChat(w) {
+		return
+	}
+	c, err := h.Store.CreateConversation(r.Context(), "")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"id": c.ID, "title": c.Title, "createdAt": c.CreatedAt})
+}
+
+// ListConversations 处理 GET /api/conversations，列出会话。
+func (h *Handler) ListConversations(w http.ResponseWriter, r *http.Request) {
+	list, err := h.Store.ListConversations(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if list == nil {
+		list = []store.Conversation{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"conversations": list})
+}
+
+// GetConversation 处理 GET /api/conversations/{id}，读会话历史。
+func (h *Handler) GetConversation(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	c, err := h.Store.GetConversation(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "会话不存在")
+		return
+	}
+	msgs, _ := h.Store.ListMessages(r.Context(), id)
+	if msgs == nil {
+		msgs = []store.ConversationMessage{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"id": c.ID, "title": c.Title, "messages": msgs})
+}
+
+// PostMessageRequest 是 POST /api/conversations/{id}/messages 的请求体。
+type PostMessageRequest struct {
+	Content string `json:"content"`
+}
+
+// PostConversationMessage 处理 POST /api/conversations/{id}/messages，
+// 发一条用户消息，跑一轮 Agent，返回助手回复、本轮工具和结构化结果。
+// 对话只读：本接口不生成 change_requests、不执行任何修改。
+func (h *Handler) PostConversationMessage(w http.ResponseWriter, r *http.Request) {
+	if !h.requireChat(w) {
+		return
+	}
+	id := r.PathValue("id")
+	var req PostMessageRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "请求体不是合法 JSON")
+		return
+	}
+	if strings.TrimSpace(req.Content) == "" {
+		writeError(w, http.StatusBadRequest, "content 不能为空")
+		return
+	}
+	reply, err := h.Chat.RunMessage(r.Context(), id, req.Content)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, reply)
+}
+
+// ConvertRequest 是 POST /api/conversations/{id}/convert 的请求体，
+// 全部字段可选：不填时按会话历史解析目标，解析不到就报错请明确指定。
+type ConvertRequest struct {
+	Namespace string `json:"namespace,omitempty"`
+	Kind      string `json:"kind,omitempty"`
+	Name      string `json:"name,omitempty"`
+	Question  string `json:"question,omitempty"`
+}
+
+// ConvertConversation 处理 POST /api/conversations/{id}/convert，
+// 把对话转成正式诊断任务，返回 runId。转换本身不执行修复，
+// 修复还是要走提案 + 人工审批 + 执行验证。
+func (h *Handler) ConvertConversation(w http.ResponseWriter, r *http.Request) {
+	if !h.requireChat(w) {
+		return
+	}
+	id := r.PathValue("id")
+	var req ConvertRequest
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	runID, err := h.Chat.ConvertToRun(r.Context(), id, req.Namespace, req.Kind, req.Name, req.Question)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"runId": runID, "conversationId": id})
 }
 
 // 确保 context 被用到（以后接权限校验时用）。

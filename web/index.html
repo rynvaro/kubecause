@@ -2,12 +2,23 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<title>KubeCause — Kubernetes 故障诊断 Agent（Slice 3 演示页）</title>
+<title>KubeCause — Kubernetes 故障诊断 Agent（Slice 4）</title>
 <style>body{font-family:system-ui,sans-serif;max-width:760px;margin:40px auto;padding:0 16px}input,select,button{padding:8px;margin:4px 0}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.card{border:1px solid #ddd;padding:12px;margin:12px 0}.approve{border-color:#2a7a2a}.warn{color:#8a6d00}</style>
 </head>
 <body>
-<h1>KubeCause <small>Slice 3 演示</small></h1>
-<p>提交任务后 Worker 在后台跑诊断，关闭页面任务也会继续。刷新后在下面填 runId 可重新读取。诊断完成后出现审批卡，批准后 Worker 会执行 Patch 并验证 rollout，拒绝后不会对集群做任何写入。</p>
+<h1>KubeCause <small>Slice 4 通用 Agent + 对话模式</small></h1>
+<p>两种用法共用同一套 Agent 核心、同一套工具、同一套安全规则：<b>单次诊断</b>是填 namespace / 类型 / 名字 / 问题，点提交，等报告，可审批、可执行、可验证；<b>对话模式</b>是一问一答，先问“当前状态怎么样”，再追问某个 namespace 是怎么回事，Agent 记得上文，只读不改。想修复时，对话里只给一张建议卡，点“转成正式诊断”后才走审批和执行。</p>
+<h2>对话模式（Slice 4，只读）</h2>
+<div class="card">
+<button onclick="newConv()">新建会话</button>
+<span id="convId"></span><br>
+<input id="chatText" value="当前状态怎么样" style="width:300px">
+<button onclick="sendChat()">发送</button>
+<button onclick="convertChat()">转成正式诊断</button>
+<pre id="chatReply">尚未对话。对话只读，不会改集群；修复建议只是一张卡，转成正式诊断后才走审批和执行。</pre>
+<pre id="chatStructured"></pre>
+</div>
+<h2>单次诊断</h2>
 <div class="card">
 <label>Namespace <input id="ns" value="demo"></label><br>
 <label>类型 <select id="kind"><option>Deployment</option><option>Pod</option></select></label><br>
@@ -115,6 +126,30 @@ async function poll() {
     after = e.seq;
   });
   loadRun();
+}
+// 对话模式：静态页只做最小入口，完整聊天界面在下一个 Slice 用 React 做。
+let convId = '';
+async function newConv() {
+  const r = await fetch('/api/conversations', {method:'POST', headers:{'Content-Type':'application/json'}, body: '{}'});
+  const j = await r.json();
+  convId = j.id || '';
+  document.getElementById('convId').textContent = convId ? ('会话：' + convId) : JSON.stringify(j);
+  document.getElementById('chatReply').textContent = '会话已创建，可以提问了。';
+}
+async function sendChat() {
+  if (!convId) { await newConv(); }
+  const text = document.getElementById('chatText').value;
+  const r = await fetch('/api/conversations/' + convId + '/messages', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({content: text})});
+  const j = await r.json();
+  document.getElementById('chatReply').textContent = j.reply || JSON.stringify(j, null, 2);
+  document.getElementById('chatStructured').textContent = JSON.stringify({toolCalls: j.toolCalls, structured: j.structured, suggestedRepair: j.suggestedRepair}, null, 2);
+}
+async function convertChat() {
+  if (!convId) return;
+  const r = await fetch('/api/conversations/' + convId + '/convert', {method:'POST', headers:{'Content-Type':'application/json'}, body: '{}'});
+  const j = await r.json();
+  document.getElementById('chatReply').textContent = '已转成正式诊断，runId：' + (j.runId || JSON.stringify(j)) + '。下面填 runId 可读取任务、审批和执行。';
+  if (j.runId) { document.getElementById('runId').value = j.runId; after = 0; poll(); }
 }
 </script>
 </body>

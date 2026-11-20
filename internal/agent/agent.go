@@ -18,14 +18,29 @@ import (
 	"kubecause/internal/store"
 )
 
-// 允许的工具名，白名单，模型只能叫这 6 个，多一个都不行。
+// 允许的工具名，白名单，模型只能叫这些，多一个都不行。
+// 前 6 个是单次诊断的定向工具，后 4 个是发现工具：
+// 对话模式里模型不知道目标在哪时，先用它们看全貌、找问题，
+// 再用定向工具深挖。发现工具全部是只读的。
 var allowedTools = map[string]bool{
-	"get_pod":           true,
-	"list_workload_pods": true,
-	"get_events":        true,
-	"get_pod_logs":      true,
-	"get_deployment":    true,
-	"search_runbooks":   true,
+	"get_pod":              true,
+	"list_workload_pods":   true,
+	"get_events":           true,
+	"get_pod_logs":         true,
+	"get_deployment":       true,
+	"search_runbooks":      true,
+	"list_namespaces":      true,
+	"list_deployments":     true,
+	"list_problem_pods":    true,
+	"get_cluster_overview": true,
+}
+
+// 发现工具集合：namespace 为空表示查全部，不用和任务 namespace 一致。
+var discoveryTools = map[string]bool{
+	"list_namespaces":      true,
+	"list_deployments":     true,
+	"list_problem_pods":    true,
+	"get_cluster_overview": true,
 }
 
 // 日志上限：一次最多 100 行、64KB。Pod 日志可能很大，不截断会把
@@ -35,6 +50,21 @@ const (
 	MaxLogBytes = 64 * 1024
 )
 
+// SuggestedRepair 是模型在诊断报告里可选提出的修复建议。
+// 它只是一个建议，不是可直接执行的 Patch：Worker 收到后还要经过
+// repair.ValidatePatchSpec 白名单校验、读集群现状核对旧值、人工审批，
+// 三关都过了才生成提案。Field 目前只支持 "memoryLimit"，
+// 其他字段的建议会被 ValidateReport 清掉，不会进提案。
+type SuggestedRepair struct {
+	Namespace  string `json:"namespace"`
+	Deployment string `json:"deployment"`
+	Container  string `json:"container"`
+	Field      string `json:"field"` // 目前只支持 "memoryLimit"
+	OldValue   string `json:"oldValue"`
+	NewValue   string `json:"newValue"`
+	Reason     string `json:"reason"`
+}
+
 // Report 是诊断报告，字段和架构文档一致。
 type Report struct {
 	Facts           []string `json:"facts"`
@@ -43,6 +73,9 @@ type Report struct {
 	Recommendations []string `json:"recommendations"`
 	OpenQuestions   []string `json:"openQuestions"`
 	Confidence      string   `json:"confidence"` // high / medium / low
+	// SuggestedRepair 是可选的修复建议，模型觉得有把握才给，
+	// 没把握时留空，Worker 不会凭空生成提案。
+	SuggestedRepair *SuggestedRepair `json:"suggestedRepair,omitempty"`
 }
 
 // ToolCall 是模型返回的一次结构化工具调用。
@@ -69,6 +102,11 @@ type Tools interface {
 	GetPodLogs(ctx context.Context, namespace, pod, container string, previous bool) (ToolOutput, error)
 	GetDeployment(ctx context.Context, namespace, name string) (ToolOutput, error)
 	SearchRunbooks(ctx context.Context, query string) (ToolOutput, error)
+	// 发现工具（只读）：namespace 为空表示查全部命名空间。
+	ListNamespaces(ctx context.Context) (ToolOutput, error)
+	ListDeployments(ctx context.Context, namespace string) (ToolOutput, error)
+	ListProblemPods(ctx context.Context, namespace string) (ToolOutput, error)
+	GetClusterOverview(ctx context.Context) (ToolOutput, error)
 }
 
 // ModelStep 是模型一次决策的结果：要么调一个工具，要么交最终报告。
@@ -116,6 +154,25 @@ func ValidateToolCall(namespace string, call *ToolCall) error {
 	if call.Name == "search_runbooks" {
 		if strings.TrimSpace(call.Args["query"]) == "" {
 			return fmt.Errorf("search_runbooks 需要 query 参数")
+		}
+		return nil
+	}
+	// 发现工具：namespace 为空表示查全部，合法；
+	// 指定了 namespace 时必须和任务一致（单次诊断的范围约束），
+	// 且一律禁止系统命名空间。list_namespaces 不带 namespace 参数。
+	if discoveryTools[call.Name] {
+		ns := call.Args["namespace"]
+		if ns == "" {
+			return nil
+		}
+		if ns == "kube-system" || ns == "kube-public" || ns == "kube-node-lease" {
+			return fmt.Errorf("禁止查询系统命名空间 %q", ns)
+		}
+		if !nsRe.MatchString(ns) {
+			return fmt.Errorf("namespace 格式非法: %q", ns)
+		}
+		if namespace != "" && ns != namespace {
+			return fmt.Errorf("目标 namespace %q 与任务 %q 不一致，拒绝执行", ns, namespace)
 		}
 		return nil
 	}
@@ -179,6 +236,17 @@ func ValidateReport(rep *Report, validEvidence map[string]bool) {
 	}
 	if rep.Confidence == "" {
 		rep.Confidence = "medium"
+	}
+	// 修复建议只认内存 limit 这一个字段：模型想改别的字段
+	// （例如改镜像、改副本数）时直接清掉，不进提案，Worker 也不会执行。
+	// Field 为空时按 memoryLimit 理解，旧值/新值留给 Worker 再核对集群现状。
+	if sr := rep.SuggestedRepair; sr != nil {
+		if sr.Field == "" {
+			sr.Field = "memoryLimit"
+		}
+		if sr.Field != "memoryLimit" {
+			rep.SuggestedRepair = nil
+		}
 	}
 }
 
@@ -380,6 +448,14 @@ func (a *Agent) executeTool(ctx context.Context, call *ToolCall) (ToolOutput, er
 		return a.Tools.GetDeployment(ctx, ns, call.Args["deployment"])
 	case "search_runbooks":
 		return a.Tools.SearchRunbooks(ctx, call.Args["query"])
+	case "list_namespaces":
+		return a.Tools.ListNamespaces(ctx)
+	case "list_deployments":
+		return a.Tools.ListDeployments(ctx, call.Args["namespace"])
+	case "list_problem_pods":
+		return a.Tools.ListProblemPods(ctx, call.Args["namespace"])
+	case "get_cluster_overview":
+		return a.Tools.GetClusterOverview(ctx)
 	default:
 		return ToolOutput{}, fmt.Errorf("未知工具: %s", call.Name)
 	}

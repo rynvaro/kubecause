@@ -13,8 +13,8 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
@@ -32,6 +32,12 @@ type KubeClient interface {
 	ListEvents(ctx context.Context, namespace string) ([]corev1.Event, error)
 	// GetPodLogs 只读日志，调用方必须限制行数和字节数，见 agent.TruncateLog。
 	GetPodLogs(ctx context.Context, namespace, pod, container string, previous bool) (string, error)
+	// 发现接口（只读）：namespace 为空表示查全部命名空间。
+	// 对话模式里模型先用它们看全貌、找问题，再用定向工具深挖。
+	ListNamespaces(ctx context.Context) ([]string, error)
+	ListDeployments(ctx context.Context, namespace string) ([]appsv1.Deployment, error)
+	ListPods(ctx context.Context, namespace string) ([]corev1.Pod, error)
+	CountNodes(ctx context.Context) (int, error)
 }
 
 // 演示数据，fake 和文档里的验收场景一致：
@@ -99,7 +105,7 @@ func NewFakeWithScenario(scenario string) *Fake {
 			pod.Status.Phase = corev1.PodRunning
 			pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
 				Name: DemoContainer, Ready: false, RestartCount: 3,
-				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+				State:                corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
 				LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{Reason: "Error", ExitCode: 1, Message: "liveness probe failed"}},
 			}}
 			_, _ = f.client.CoreV1().Pods(DemoNamespace).UpdateStatus(ctx, pod, metav1.UpdateOptions{})
@@ -156,7 +162,7 @@ func NewFake() *Fake {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: DemoPod, Namespace: DemoNamespace,
-			Labels: map[string]string{"app": "demo-api", "pod-template-hash": "7d9f6c4b5"},
+			Labels:          map[string]string{"app": "demo-api", "pod-template-hash": "7d9f6c4b5"},
 			OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: DemoReplicaSet, UID: "uid-demo-api-rs"}},
 		},
 		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: DemoContainer, Image: "demo-api:latest"}}},
@@ -245,6 +251,51 @@ func (f *Fake) GetPodLogs(ctx context.Context, namespace, pod, container string,
 	return "", fmt.Errorf("找不到 Pod %s 的日志", pod)
 }
 
+// 发现接口的 Fake 实现：只返回预置的 demo 数据，
+// 真集群有多少 namespace / Deployment，Real 会如实返回。
+func (f *Fake) ListNamespaces(ctx context.Context) ([]string, error) {
+	f.inc("ListNamespaces")
+	list, err := f.client.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(list.Items))
+	for _, ns := range list.Items {
+		out = append(out, ns.Name)
+	}
+	if len(out) == 0 {
+		out = []string{DemoNamespace}
+	}
+	return out, nil
+}
+
+func (f *Fake) ListDeployments(ctx context.Context, namespace string) ([]appsv1.Deployment, error) {
+	f.inc("ListDeployments")
+	list, err := f.client.AppsV1().Deployments(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	return list.Items, nil
+}
+
+func (f *Fake) ListPods(ctx context.Context, namespace string) ([]corev1.Pod, error) {
+	f.inc("ListPods")
+	list, err := f.client.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	return list.Items, nil
+}
+
+func (f *Fake) CountNodes(ctx context.Context) (int, error) {
+	f.inc("CountNodes")
+	list, err := f.client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return 0, err
+	}
+	return len(list.Items), nil
+}
+
 // Real 是真 client-go 实现，读 ~/.kube/config 或 KUBECONFIG。
 type Real struct {
 	client kubernetes.Interface
@@ -309,6 +360,44 @@ func (r *Real) GetPodLogs(ctx context.Context, namespace, pod, container string,
 		return "", err
 	}
 	return string(b), nil
+}
+
+// 发现接口的 Real 实现：直接调 K8s API，
+// namespace 为空时 client-go 的 Pods("") / Deployments("") 就是查全部。
+func (r *Real) ListNamespaces(ctx context.Context) ([]string, error) {
+	list, err := r.client.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(list.Items))
+	for _, ns := range list.Items {
+		out = append(out, ns.Name)
+	}
+	return out, nil
+}
+
+func (r *Real) ListDeployments(ctx context.Context, namespace string) ([]appsv1.Deployment, error) {
+	list, err := r.client.AppsV1().Deployments(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	return list.Items, nil
+}
+
+func (r *Real) ListPods(ctx context.Context, namespace string) ([]corev1.Pod, error) {
+	list, err := r.client.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	return list.Items, nil
+}
+
+func (r *Real) CountNodes(ctx context.Context) (int, error) {
+	list, err := r.client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return 0, err
+	}
+	return len(list.Items), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -471,8 +560,8 @@ func (f *Fake) simulateRollout(ctx context.Context, dep *appsv1.Deployment, newV
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: podName, Namespace: dep.Namespace,
-				Labels: map[string]string{"app": dep.Name, "pod-template-hash": newHash},
-				OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: rsName, UID: types.UID("uid-" + rsName)}},
+				Labels:            map[string]string{"app": dep.Name, "pod-template-hash": newHash},
+				OwnerReferences:   []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: rsName, UID: types.UID("uid-" + rsName)}},
 				CreationTimestamp: metav1.Now(),
 			},
 			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: DemoContainer, Image: "demo-api:latest"}}},

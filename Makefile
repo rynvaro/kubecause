@@ -3,7 +3,19 @@
 GO ?= go
 export PATH := $(HOME)/workspace/tools/go/bin:$(PATH)
 
-.PHONY: test vet build run-fake run-kind run-real eval eval-real clean
+.PHONY: test vet build run-fake run-kind run-real eval eval-real clean frontend run
+
+# 前端：装依赖 + 构建，产物到 web/dist/，Go 用 go:embed 打进二进制。
+# 交付 zip 里自带构建好的 dist，不改前端时不用跑这一步。
+frontend:
+	cd frontend && npm install && npm run build
+
+# 直接跑：dist 已包含在仓库/zip 里时不用先构建前端。
+run:
+	KUBE_MODE=fake MODEL_MODE=stub DB_PATH=./kubecause.db ADDR=:8080 $(GO) run ./cmd/server
+
+# 改了前端后跑：先构建前端，再启动 Go 服务。
+run-frontend: frontend run
 
 test:
 	$(GO) test ./...

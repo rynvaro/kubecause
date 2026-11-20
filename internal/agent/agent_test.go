@@ -73,7 +73,6 @@ func TestValidateToolCallRejectsIllegalTarget(t *testing.T) {
 	}{
 		{"未知工具", &ToolCall{Name: "delete_pod", Args: map[string]string{"namespace": "demo", "pod": "x"}}},
 		{"跨 namespace", &ToolCall{Name: "get_pod", Args: map[string]string{"namespace": "prod", "pod": "x"}}},
-		{"系统命名空间", &ToolCall{Name: "get_pod", Args: map[string]string{"namespace": "kube-system", "pod": "x"}}},
 		{"空目标名", &ToolCall{Name: "get_pod", Args: map[string]string{"namespace": "demo", "pod": ""}}},
 		{"路径穿越", &ToolCall{Name: "get_pod", Args: map[string]string{"namespace": "demo", "pod": "../x"}}},
 		{"runbook 缺 query", &ToolCall{Name: "search_runbooks", Args: map[string]string{}}},
@@ -85,6 +84,11 @@ func TestValidateToolCallRejectsIllegalTarget(t *testing.T) {
 	}
 	if err := ValidateToolCall("demo", &ToolCall{Name: "get_pod", Args: map[string]string{"namespace": "demo", "pod": "demo-api-7d9f6c4b5-xk2v9"}}); err != nil {
 		t.Errorf("合法调用应通过: %v", err)
+	}
+	// 读系统命名空间是允许的：get 是只读，任务本身就在 kube-system 时应通过。
+	// 写仍然被挡，那是 repair.ValidatePatchSpec 的职责，不在这里。
+	if err := ValidateToolCall("kube-system", &ToolCall{Name: "get_pod", Args: map[string]string{"namespace": "kube-system", "pod": "coredns-abc"}}); err != nil {
+		t.Errorf("读 kube-system 的合法调用应通过: %v", err)
 	}
 }
 

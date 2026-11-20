@@ -1,10 +1,18 @@
-# KubeCause — Kubernetes 故障诊断 Agent（Slice 4）
+# KubeCause — Kubernetes 故障诊断 Agent（Slice 5）
 
 KubeCause 是一个 Kubernetes 故障诊断 Agent。用户选定 namespace 和 Pod 或 Deployment，描述故障现象，Agent 自主选择只读工具收集证据，检索排障手册，输出诊断结论和建议。演示环境支持一类人工审批后的变更，即调整指定 Deployment 的容器内存限制，并验证变更后的运行状态。
 
-Slice 4 在 Slice 3 的基础上做了两件事：**后端通用化**和**对话模式**。通用化是把写死的 demo 逻辑全部去掉——提案不再只认 OOM / demo-api / 128Mi→256Mi，模型在报告里给修复建议，Worker 拿集群现状核对、白名单校验，通过了才生成提案；`KUBE_MODE` 不再分 kind/k3s，统一走 kubeconfig 模式。对话模式是新增的：先问“当前状态怎么样”，再追问某个 namespace 是怎么回事，Agent 记得上文，只读不改，修复只给一张建议卡，转成正式诊断后才走审批和执行。单次诊断（表单模式）保留不变，两者共用同一套 Agent 核心、同一套工具、同一套安全规则。完整 React 前端仍未做，仍是静态页（静态页上只加了一个最小的对话入口）。
+Slice 5 在 Slice 4 的基础上做了两件事：**完整 React 前端**和**系统命名空间读放开**。前端用 Vite + React + TypeScript 重写，左边会话列表、中间聊天、右边详情，工具执行过程用轮询实时显示成时间线，结构化结果渲染成卡片和表格，不再贴 JSON；构建产物用 `go:embed` 打进 Go 二进制，部署还是一个进程。系统命名空间改成读放开、写挡住：发现工具和对话都能查 kube-system，行里打“系统”标记，修复校验仍然拒绝系统命名空间。
 
-Slice 1/2/3 已有的东西没有重写：SQLite 表、HTTP 接口、Worker 状态机、Agent 循环的校验和恢复、fake 客户端、桩模型、真模型适配器、FTS5 检索、条件 Patch 与 rollout 验证，全部保留并做了回归。
+Slice 1/2/3/4 已有的东西没有重写：SQLite 表、HTTP 接口、Worker 状态机、Agent 循环的校验和恢复、fake 客户端、桩模型、真模型适配器、FTS5 检索、条件 Patch 与 rollout 验证、对话会话、发现工具，全部保留并做了回归。
+
+## Slice 5 改了什么
+
+- **完整 React 前端**（`frontend/`，Vite + React + TypeScript，不引入 UI 框架）：左侧会话列表（新建会话、会话历史），中间聊天区和单次诊断，右侧详情区（当前任务的报告、审批卡、修复验证）。聊天区里助手消息内嵌工具执行时间线：每一步显示工具名、参数摘要、状态（成功 / 失败）、结果摘要，正在执行的工具带转圈和“正在执行”提示。结构化结果渲染成卡片和表格：集群总览是数字卡片，Pod 列表和 Deployment 列表是表格（系统行带“系统”徽章），事件是时间线，修复建议卡、审批卡、执行/验证结果分开显示。单次诊断页保留 Slice 3 的全部功能（提交、轮询时间线、报告、审批、执行验证），只是用 React 重写。空状态和错误状态都有文案，不会白屏。
+- **工具执行实时显示用轮询，不用 WebSocket**：对话的 POST 在服务端跑整轮，期间 tool 消息会陆续落盘，前端每 800ms 轮询一次会话，就能实时看到正在执行哪个工具；单次诊断每 900ms 轮询 `GET /api/runs/{id}/events?after=N` 追加时间线，同时刷新任务快照。轮询够用，后端不用为实时显示改协议。
+- **前后端同仓库、单二进制部署**：React 源码在 `frontend/`，构建产物输出到 `web/dist/`，Go 用 `go:embed` 把 dist 打进二进制。交付 zip 里自带构建好的 dist，解压后不用装 Node，直接 `go run ./cmd/server` 就能看到 React 页；想改前端时再按 `frontend/README.md` 装 Node 重建。`make frontend` 是装依赖 + 构建，`make run` 是直接启动（dist 已包含），`make run-frontend` 是先构建前端再启动。
+- **系统命名空间读放开、写挡住**：去掉发现工具（`internal/run/tools.go`）对 kube-system / kube-public / kube-node-lease 的过滤，`list_namespaces`、`list_deployments`、`list_problem_pods`、`get_cluster_overview` 都能返回系统命名空间的结果，行里带 `isSystem: true` 标记，总览里单独列出系统命名空间数和系统有问题 Pod 数；对话的系统提示词改成“可以查系统命名空间做诊断，但不要把它当成用户业务下结论，不要给系统组件出修复建议”；`internal/agent.ValidateToolCall` 和 `POST /api/runs` 的创建校验也不再拒绝系统命名空间（诊断是只读）。写操作继续严格挡住：`internal/repair.ValidatePatchSpec` 对系统命名空间的拒绝原样保留，RBAC 清单不动。
+- **回归**：`go test ./...` 全部通过，`go run ./cmd/eval` 仍 3/3 通过；对话两轮能接上文、修复建议卡 128Mi→256Mi、对话只读、转正式诊断后审批执行验证全部回归通过。
 
 ## Slice 4 改了什么
 
@@ -12,7 +20,7 @@ Slice 1/2/3 已有的东西没有重写：SQLite 表、HTTP 接口、Worker 状�
 - **通用修复白名单**（`internal/repair.ValidatePatchSpec`）：任意 namespace / Deployment / 容器都可以提修复建议，但只允许改内存 limit，值必须是 Mi / Gi 结尾，新值必须大于旧值、不超过旧值的 4 倍、不超过 4Gi，系统命名空间一律拒绝。旧值和集群现状是否一致仍由执行前校验重新读目标时核对（旧值不匹配标为过期，不 Patch）。
 - **通用提案生成**（`internal/run/worker.go`）：Worker 不再看原因里有没有 OOM，而是看报告里有没有 `suggestedRepair`；容器名没给时读 Deployment 的第一个容器，旧值以集群现状为准（建议里的旧值和现状不一致就放弃），新值没给时按旧值翻倍。校验不通过就不生成提案，诊断报告本身仍然完整。
 - **KUBE_MODE 通用化**（`cmd/server/main.go`）：`fake | kubeconfig`，`kind` 是 `kubeconfig` 的别名，做兼容保留。kind、k3s、云厂商集群都读 kubeconfig，不再为每种集群写一套客户端；k3s 的 kubeconfig 在 `/etc/rancher/k3s/k3s.yaml`，用 `KUBECONFIG` 指过去即可。
-- **发现工具**（`internal/run/tools.go`、`internal/kube/client.go`）：新增 4 个只读工具，注册进 Agent 工具表，模型在对话里能自主调用：`list_namespaces`、`list_deployments`（namespace 为空查全部）、`list_problem_pods`（非 Running、未 Ready、重启过、有等待原因）、`get_cluster_overview`（节点数、namespace 数、Deployment 数、Pod 数、有问题 Pod 数）。返回的都是结构化 JSON，前端以后能渲染成表格和卡片；系统命名空间的结果会被过滤掉。
+- **发现工具**（`internal/run/tools.go`、`internal/kube/client.go`）：新增 4 个只读工具，注册进 Agent 工具表，模型在对话里能自主调用：`list_namespaces`、`list_deployments`（namespace 为空查全部）、`list_problem_pods`（非 Running、未 Ready、重启过、有等待原因）、`get_cluster_overview`（节点数、namespace 数、Deployment 数、Pod 数、有问题 Pod 数）。返回的都是结构化 JSON，前端渲染成表格和卡片。注意：Slice 4 时系统命名空间的结果会被过滤掉，Slice 5 已改成读放开、写挡住，系统行带 `isSystem: true` 标记，见上文 Slice 5。
 - **对话会话**（`internal/chat/`、`internal/store/`）：SQLite 新增 `conversations` 和 `messages` 两张表（role 分 user / assistant / tool）。新 API：`POST /api/conversations`、`GET /api/conversations`、`GET /api/conversations/{id}`、`POST /api/conversations/{id}/messages`、`POST /api/conversations/{id}/convert`。每次调用模型带最近 10 条消息，超出截断，数据库里全量保留；TODO 是以后对 10 条之前的历史做摘要，现在不做假的摘要。指代消解靠历史实现：系统提示词写清“这个 ns / 刚才那个 Pod 要按最近提到的目标理解，理解不了就主动问，不要猜”。
 - **对话只读**：对话里模型只能调只读工具，不能直接 Patch；需要修复时返回结构化修复建议卡，不生成 `change_requests`。用户点“转成正式诊断”后，才走现有的 `/api/runs` 流程，生成提案、走人工审批、再执行和验证。
 - **Runbook 扩到 8 篇**：新增 CrashLoopBackOff、Pending 调度失败、Service 无 Endpoints、ConfigMap/Secret 缺失、资源配额不足 5 篇，每篇都有中文关键词和别名，FTS5 索引能命中；原有 3 篇没删，`go run ./cmd/eval` 仍 3/3 通过。
@@ -166,6 +174,14 @@ kubectl logs -n demo -l app=demo-api --previous
 
 注意：本机（Muse 的 Linux VM）没有 Docker / kind，无法做 kind 端到端验证，脚本和上面的步骤就是给 Mac 上手动验证准备的。`KUBE_MODE=kubeconfig` 的 client-go 读 kubeconfig 逻辑已在 Slice 1 实现，Slice 2 没有改坏它，Slice 4 只是把 `kind` 改成了别名。
 
+## 前端（Slice 5，React）
+
+打开 http://localhost:8080 就是 React 页，不用另外起 Node 服务：
+
+- **对话模式（主入口）**：左侧新建会话，中间问一句“当前状态怎么样”，再追问“demo 那个一直重启的是怎么回事”，工具执行过程会实时显示成时间线（正在执行的工具带转圈），总览、Pod 表、修复建议卡都渲染成卡片和表格；点“转成正式诊断”后右侧详情区出现任务、审批卡和修复验证。
+- **单次诊断**：顶部切换到“单次诊断”，填 namespace / 类型 / 名字 / 问题，点提交，时间线每秒刷新，报告、审批卡、执行和验证结果在右侧详情区。
+- **不用装 Node 直接跑**：交付 zip 里自带构建好的 `web/dist/`。要改前端时：`cd frontend && npm install && npm run build`（或 `make frontend`），再重启 Go 服务；开发模式用 `npm run dev`（Vite 在 :5173，/api 代理到 Go 服务 :8080）。
+
 ## 对话模式 curl 演示流程
 
 服务启动后（fake + stub），在另一个终端跑：
@@ -262,8 +278,9 @@ curl -s "http://localhost:8080/api/runs/$RUN_ID"
 | `scripts/kind/rbac.yaml` | RBAC 参考清单：只读身份和受写身份（写身份只能 patch demo-api） |
 | `runbooks/` | 排障手册 Markdown |
 | `testdata/cases/` | 评估用例：OOM、镜像拉取失败、探针失败 |
+| `frontend/` | React 前端源码（Vite + TypeScript）：聊天、单次诊断、工具时间线、卡片和表格渲染 |
+| `web/` | 前端构建产物（`web/dist/`，go:embed 打进二进制）+ 旧静态页 `web/index.html`（保留参考，不再托管） |
 | `scripts/kind/` | kind 演示：demo-api.yaml 和 setup-demo.sh |
-| `web/` | 极简静态演示页，由 Go 服务同源托管 |
 
 ## Slice 2 已实现
 
@@ -289,9 +306,10 @@ curl -s "http://localhost:8080/api/runs/$RUN_ID"
 - 对话模式：会话 + 消息持久化、最近 10 条历史截断、指代消解、对话只读、修复建议卡、转正式诊断
 - Runbook 扩到 8 篇，评估仍 3/3 通过；单次诊断、审批执行、rollout 验证全部回归通过
 
-## Slice 4 未实现
+## Slice 4 未实现（Slice 5 已实现）
 
-- 完整 React + TypeScript 前端（目前是静态页，对话只加了最小入口）
+- 完整 React + TypeScript 前端（Slice 5 已做，见上文）
+- 系统命名空间读放开（Slice 5 已做：读能查、写仍拒绝）
 - 对话历史摘要（现在是截断，TODO 在代码和 README 里写清了）
 - 云端部署、鉴权、监控
 

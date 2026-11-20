@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"kubecause/internal/agent"
 	"kubecause/internal/kube"
 	"kubecause/internal/model"
 	"kubecause/internal/run"
@@ -139,6 +140,31 @@ func TestChatHistoryTruncation(t *testing.T) {
 	}
 	if len(got) != 10 {
 		t.Fatalf("最近历史应截断到 10 条，得到 %d 条", len(got))
+	}
+}
+
+// TestChatSystemNamespaceReadable 覆盖 Slice 5 的“读放开、写挡住”：
+// 对话里查 kube-system 不再被“系统命名空间”拦住——fake 里没有
+// kube-system 的 Pod，工具会返回“找不到”而不是“禁止查询”；
+// 写仍然被挡，那是 repair.ValidatePatchSpec 的职责，这里不测。
+func TestChatSystemNamespaceReadable(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := newTestService(t)
+	_, err := svc.executeChatTool(ctx, &agent.ToolCall{
+		ID: "t1", Name: "list_problem_pods", Args: map[string]string{"namespace": "kube-system"},
+	})
+	if err != nil {
+		t.Fatalf("对话里 list_problem_pods(kube-system) 应能执行，得到错误: %v", err)
+	}
+	_, err = svc.executeChatTool(ctx, &agent.ToolCall{
+		ID: "t2", Name: "get_pod", Args: map[string]string{"namespace": "kube-system", "pod": "coredns-abc"},
+	})
+	if err != nil && strings.Contains(err.Error(), "系统命名空间") {
+		t.Fatalf("对话里查 kube-system 不应再被系统命名空间拦截，得到: %v", err)
+	}
+	// extractNamespace 也要能提出 kube-system，这样对话才能接上文。
+	if got := extractNamespace(`{"namespace":"kube-system"}`); got != "kube-system" {
+		t.Fatalf("extractNamespace 应提出 kube-system，得到 %q", got)
 	}
 }
 

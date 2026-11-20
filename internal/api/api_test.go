@@ -25,10 +25,19 @@ func TestCreateRunValidation(t *testing.T) {
 	h := newHandler(t)
 	mux := http.NewServeMux()
 	h.Register(mux)
-	// 非法 namespace 应 400。
-	body, _ := json.Marshal(map[string]string{"namespace": "kube-system", "kind": "Deployment", "name": "demo-api", "question": "x"})
+	// 系统命名空间的诊断任务也应接受：诊断是只读，查 kube-system 合法；
+	// 修操作仍会被 repair.ValidatePatchSpec 挡住，不会生成可执行提案。
+	body, _ := json.Marshal(map[string]string{"namespace": "kube-system", "kind": "Deployment", "name": "coredns", "question": "x"})
 	req := httptest.NewRequest("POST", "/api/runs", bytes.NewReader(body))
 	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("系统命名空间的诊断任务应 202，得到 %d: %s", rec.Code, rec.Body.String())
+	}
+	// 非法 namespace 格式仍应 400。
+	body, _ = json.Marshal(map[string]string{"namespace": "Bad_NS!", "kind": "Deployment", "name": "demo-api", "question": "x"})
+	req = httptest.NewRequest("POST", "/api/runs", bytes.NewReader(body))
+	rec = httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("非法 namespace 应 400，得到 %d", rec.Code)

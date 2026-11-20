@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -36,6 +37,7 @@ import (
 	"kubecause/internal/repair"
 	"kubecause/internal/run"
 	"kubecause/internal/store"
+	"kubecause/web"
 )
 
 func env(key, def string) string {
@@ -45,13 +47,31 @@ func env(key, def string) string {
 	return def
 }
 
+// spaHandler 托管 React 单页应用：
+//   - 已知文件（index.html、assets/*）直接返回；
+//   - 未知路径回退到 index.html，让前端路由接管。
+//
+// 用轮询做实时显示，不用 WebSocket，所以这里不需要特殊处理长连接。
+func spaHandler(fsys fs.FS) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := strings.TrimPrefix(r.URL.Path, "/")
+		if p != "" {
+			if st, err := fs.Stat(fsys, p); err == nil && !st.IsDir() {
+				http.ServeFileFS(w, r, fsys, p)
+				return
+			}
+		}
+		http.ServeFileFS(w, r, fsys, "index.html")
+	})
+}
+
 func main() {
 	addr := env("ADDR", ":8080")
 	dbPath := env("DB_PATH", "./kubecause.db")
 	kubeMode := strings.ToLower(env("KUBE_MODE", "fake"))
 	modelMode := strings.ToLower(env("MODEL_MODE", "stub"))
 
-	log.Printf("KubeCause Slice 4 启动：KUBE_MODE=%s MODEL_MODE=%s DB_PATH=%s ADDR=%s", kubeMode, modelMode, dbPath, addr)
+	log.Printf("KubeCause Slice 5 启动：KUBE_MODE=%s MODEL_MODE=%s DB_PATH=%s ADDR=%s", kubeMode, modelMode, dbPath, addr)
 
 	// 1. 打开 SQLite，启动时自动执行迁移。
 	st, err := store.Open(dbPath)
@@ -161,9 +181,14 @@ func main() {
 	handler := &api.Handler{Store: st, Chat: chatSvc}
 	mux := http.NewServeMux()
 	handler.Register(mux)
-	// 极简静态演示页由 Go 服务同源托管，从仓库根目录运行时读 web/ 目录。
-	// 刷新后用 runId 重新读任务。
-	mux.Handle("/", http.FileServer(http.Dir("web")))
+	// React 前端（Slice 5）：go:embed 把 web/dist 打进二进制，
+	// 同源托管。/api/* 已由上面 Register 先注册，不会走到 SPA 回退。
+	// 已知文件直接返回，未知路径回退到 index.html（SPA 入口）。
+	distFS, err := fs.Sub(web.Dist, "dist")
+	if err != nil {
+		log.Fatalf("前端构建产物缺失: %v（先跑 cd frontend && npm run build）", err)
+	}
+	mux.Handle("/", spaHandler(distFS))
 
 	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	go func() {

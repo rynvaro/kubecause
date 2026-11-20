@@ -59,12 +59,17 @@ func TestDiscoveryToolsFake(t *testing.T) {
 	if v.Namespaces != 1 || v.Deployments != 1 || v.ProblemPods != 1 {
 		t.Fatalf("总览应为 1 命名空间 / 1 Deployment / 1 有问题 Pod，得到 %+v", v)
 	}
-	// 系统命名空间必须被拒绝。
-	if _, err := tools.ListProblemPods(ctx, "kube-system"); err == nil {
-		t.Fatalf("kube-system 应被发现工具拒绝")
+	// 系统命名空间读得到：读是只读，fake 里没有系统对象所以是 0 个，
+	// 重点是接口不报错、不拒绝；写仍被 repair.ValidatePatchSpec 挡住。
+	if _, err := tools.ListProblemPods(ctx, "kube-system"); err != nil {
+		t.Fatalf("kube-system 应能被发现工具读取，得到错误: %v", err)
 	}
-	if _, err := tools.ListDeployments(ctx, "kube-system"); err == nil {
-		t.Fatalf("kube-system 应被发现工具拒绝")
+	if _, err := tools.ListDeployments(ctx, "kube-system"); err != nil {
+		t.Fatalf("kube-system 应能被发现工具读取，得到错误: %v", err)
+	}
+	// isSystem 标记：demo 不是系统命名空间，kube-system 是。
+	if isSystemNamespace("demo") || !isSystemNamespace("kube-system") || !isSystemNamespace("kube-public") {
+		t.Fatalf("isSystemNamespace 标记不对")
 	}
 }
 

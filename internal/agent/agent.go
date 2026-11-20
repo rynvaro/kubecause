@@ -2,9 +2,11 @@
 // 再把工具结果喂回模型，直到模型给出最终诊断或耗尽预算。
 //
 // 为什么要把校验放在模型外面：模型输出是不可信输入，它可能编一个
-// 不存在的工具、写错 namespace、或者要查 kube-system 这种不该查的
-// 地方。所有工具调用都必须先过 ValidateToolCall 这一关，
+// 不存在的工具、写错 namespace、或者跨 namespace 查别的任务的目标。
+// 所有工具调用都必须先过 ValidateToolCall 这一关，
 // 校验失败直接记一步错误，不执行，循环继续，不会让模型拿到不该拿的数据。
+// 注意：查系统命名空间不算“不该拿”——读是只读，kube-system 也能查，
+// 只是写操作被 repair 层挡住。
 package agent
 
 import (
@@ -141,9 +143,12 @@ var (
 // ValidateToolCall 校验一次工具调用。非法调用直接返回错误，不执行。
 // 规则：
 //   - 工具名必须在白名单里；
-//   - namespace 必须和任务一致，禁止跨 namespace 查，更禁止 kube-system
-//     这类系统命名空间；
+//   - namespace 必须和任务一致，禁止跨 namespace 查；
 //   - 资源名不能为空，不能含 / 和 ..，防止路径穿越式的滥用。
+//
+// 注意：读系统命名空间是允许的——get/list 都是只读，不改集群，
+// 查 kube-system 做诊断是合法需求，行里会打系统标记。
+// 写操作仍然被挡住，那是 repair.ValidatePatchSpec 的职责。
 func ValidateToolCall(namespace string, call *ToolCall) error {
 	if call == nil {
 		return fmt.Errorf("工具调用为空")
@@ -158,15 +163,12 @@ func ValidateToolCall(namespace string, call *ToolCall) error {
 		return nil
 	}
 	// 发现工具：namespace 为空表示查全部，合法；
-	// 指定了 namespace 时必须和任务一致（单次诊断的范围约束），
-	// 且一律禁止系统命名空间。list_namespaces 不带 namespace 参数。
+	// 指定了 namespace 时必须和任务一致（单次诊断的范围约束）。
+	// 系统命名空间不再拒绝：读是只读，查 kube-system 合法。
 	if discoveryTools[call.Name] {
 		ns := call.Args["namespace"]
 		if ns == "" {
 			return nil
-		}
-		if ns == "kube-system" || ns == "kube-public" || ns == "kube-node-lease" {
-			return fmt.Errorf("禁止查询系统命名空间 %q", ns)
 		}
 		if !nsRe.MatchString(ns) {
 			return fmt.Errorf("namespace 格式非法: %q", ns)
@@ -182,9 +184,6 @@ func ValidateToolCall(namespace string, call *ToolCall) error {
 	}
 	if ns != namespace {
 		return fmt.Errorf("目标 namespace %q 与任务 %q 不一致，拒绝执行", ns, namespace)
-	}
-	if ns == "kube-system" || ns == "kube-public" || ns == "kube-node-lease" {
-		return fmt.Errorf("禁止查询系统命名空间 %q", ns)
 	}
 	if !nsRe.MatchString(ns) {
 		return fmt.Errorf("namespace 格式非法: %q", ns)

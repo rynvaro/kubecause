@@ -141,8 +141,8 @@ func (s *Service) recordTool(ctx context.Context, conversationID string, rec Too
 // 先做对话专用的校验，再执行。校验规则：
 //   - 工具名必须在 agent 的白名单里（未知工具直接拒绝）；
 //   - 定向工具必须带 namespace，空时调用方要先填上上文解析到的 namespace；
-//   - 一律禁止系统命名空间；
-//   - 发现工具的 namespace 为空表示查全部，合法。
+//   - 读系统命名空间是允许的（只读），写操作本来就不在对话工具表里，
+//     修复建议还要过 repair.ValidatePatchSpec 才会生成提案。
 //
 // 工具失败不让整轮对话崩掉：返回错误给模型/规则层，
 // 由它决定换个工具重试，还是如实告诉用户查不到。
@@ -153,16 +153,13 @@ func (s *Service) executeChatTool(ctx context.Context, call *agent.ToolCall) (ag
 		// ValidateToolCall 用 namespace="" 做任务上下文时，
 		// 定向工具的“与任务不一致”检查会误伤（"" != "demo"），
 		// 所以这里只认三类硬错误，其他放行到下面的分发再核对。
-		if strings.Contains(err.Error(), "未知工具") || strings.Contains(err.Error(), "系统命名空间") || strings.Contains(err.Error(), "格式非法") {
+		if strings.Contains(err.Error(), "未知工具") || strings.Contains(err.Error(), "格式非法") {
 			return agent.ToolOutput{}, err
 		}
 		if call.Name != "search_runbooks" && !isDiscovery(call.Name) {
 			ns := call.Args["namespace"]
 			if ns == "" {
 				return agent.ToolOutput{}, fmt.Errorf("工具 %s 缺少 namespace 参数", call.Name)
-			}
-			if isSystemNS(ns) {
-				return agent.ToolOutput{}, fmt.Errorf("禁止查询系统命名空间 %q", ns)
 			}
 		}
 	}
@@ -200,8 +197,13 @@ func isDiscovery(name string) bool {
 	return false
 }
 
-func isSystemNS(ns string) bool {
-	return ns == "kube-system" || ns == "kube-public" || ns == "kube-node-lease"
+// extractNamespace 从一段 JSON 或文本里提取第一个 namespace 值。
+// 系统命名空间也照常提取：读是允许的，提取出来才能让对话接上文。
+func extractNamespace(s string) string {
+	if m := nsJSONRe.FindStringSubmatch(s); m != nil {
+		return m[1]
+	}
+	return ""
 }
 
 // resolveNamespace 从用户消息和会话历史里解析目标 namespace：
@@ -250,14 +252,6 @@ func (s *Service) resolveNamespace(ctx context.Context, text string, history []s
 }
 
 var nsJSONRe = regexp.MustCompile(`"namespace"\s*:\s*"([^"]+)"`)
-
-// extractNamespace 从一段 JSON 或文本里提取第一个 namespace 值。
-func extractNamespace(s string) string {
-	if m := nsJSONRe.FindStringSubmatch(s); m != nil && !isSystemNS(m[1]) {
-		return m[1]
-	}
-	return ""
-}
 
 // ConvertToRun 把一次对话转成正式诊断任务：
 // 按参数或会话历史解析出目标（namespace / kind / name / 问题），

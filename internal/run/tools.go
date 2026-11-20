@@ -207,21 +207,19 @@ func (t *ToolsAdapter) SearchRunbooks(ctx context.Context, query string) (agent.
 // 发现工具（Slice 4，只读）
 // ---------------------------------------------------------------------------
 
-// isSystemNamespace 是发现工具也要守的边界：
-// 模型可以查全部 namespace，但系统命名空间的结果要过滤掉，
-// 不让模型拿 kube-system 的 Pod 当成用户 workload 来诊断。
+// isSystemNamespace 只做标记用，不做过滤：
+// 读系统命名空间是被允许的（只读，不改集群），前端要靠它给系统行打“系统”徽章。
+// 写操作仍然被挡住——那是 internal/repair.ValidatePatchSpec 的职责，两层分开。
 func isSystemNamespace(ns string) bool {
 	return ns == "kube-system" || ns == "kube-public" || ns == "kube-node-lease"
 }
 
 // validateDiscoveryNamespace 校验发现工具的 namespace 参数：
-// 为空表示查全部，合法；指定时必须是合法格式且不是系统命名空间。
+// 为空表示查全部，合法；指定时只校验格式，不再拒绝系统命名空间——
+// 读系统命名空间是允许的，写才被挡（见 repair.ValidatePatchSpec）。
 func validateDiscoveryNamespace(ns string) error {
 	if ns == "" {
 		return nil
-	}
-	if isSystemNamespace(ns) {
-		return fmt.Errorf("禁止查询系统命名空间 %q", ns)
 	}
 	for _, c := range ns {
 		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-') {
@@ -237,6 +235,7 @@ func validateDiscoveryNamespace(ns string) error {
 type podRow struct {
 	Name          string `json:"name"`
 	Namespace     string `json:"namespace"`
+	IsSystem      bool   `json:"isSystem"`
 	Phase         string `json:"phase"`
 	Ready         string `json:"ready"`
 	Restarts      int32  `json:"restarts"`
@@ -245,25 +244,32 @@ type podRow struct {
 	WaitingReason string `json:"waitingReason,omitempty"`
 }
 
-// ListNamespaces 返回全部非系统命名空间。
+// ListNamespaces 返回全部命名空间（含系统命名空间）。
+// Data 里 namespaces 是全部名字，systemNamespaces 是其中系统命名空间的
+// 子集，前端据此给系统行打“系统”徽章；模型拿到完整列表才能解析
+// 用户说的“kube-system”到底指哪个。
 func (t *ToolsAdapter) ListNamespaces(ctx context.Context) (agent.ToolOutput, error) {
 	names, err := t.Kube.ListNamespaces(ctx)
 	if err != nil {
 		return agent.ToolOutput{}, err
 	}
 	kept := make([]string, 0, len(names))
+	system := make([]string, 0)
 	for _, n := range names {
-		if !isSystemNamespace(n) {
-			kept = append(kept, n)
+		kept = append(kept, n)
+		if isSystemNamespace(n) {
+			system = append(system, n)
 		}
 	}
 	return agent.ToolOutput{
 		Summary: fmt.Sprintf("集群有 %d 个命名空间：%s", len(kept), strings.Join(kept, ", ")),
-		Data:    map[string]any{"namespaces": kept, "count": len(kept)},
+		Data:    map[string]any{"namespaces": kept, "systemNamespaces": system, "count": len(kept)},
 	}, nil
 }
 
 // ListDeployments 列出 Deployment，namespace 为空时查全部。
+// 系统命名空间的 Deployment 也会返回，行里带 isSystem: true 标记，
+// 前端显示“系统”徽章，模型不要把它当成用户业务下结论。
 func (t *ToolsAdapter) ListDeployments(ctx context.Context, namespace string) (agent.ToolOutput, error) {
 	if err := validateDiscoveryNamespace(namespace); err != nil {
 		return agent.ToolOutput{}, err
@@ -274,11 +280,8 @@ func (t *ToolsAdapter) ListDeployments(ctx context.Context, namespace string) (a
 	}
 	rows := make([]map[string]any, 0, len(deps))
 	for _, d := range deps {
-		if isSystemNamespace(d.Namespace) {
-			continue
-		}
 		rows = append(rows, map[string]any{
-			"name": d.Name, "namespace": d.Namespace,
+			"name": d.Name, "namespace": d.Namespace, "isSystem": isSystemNamespace(d.Namespace),
 			"replicas": d.Status.Replicas, "readyReplicas": d.Status.ReadyReplicas,
 			"updatedReplicas": d.Status.UpdatedReplicas, "availableReplicas": d.Status.AvailableReplicas,
 		})
@@ -305,9 +308,6 @@ func (t *ToolsAdapter) ListProblemPods(ctx context.Context, namespace string) (a
 	}
 	rows := make([]map[string]any, 0)
 	for _, p := range pods {
-		if isSystemNamespace(p.Namespace) {
-			continue
-		}
 		restarts := int32(0)
 		ready := 0
 		total := 0
@@ -331,7 +331,8 @@ func (t *ToolsAdapter) ListProblemPods(ctx context.Context, namespace string) (a
 			continue
 		}
 		rows = append(rows, map[string]any{
-			"name": p.Name, "namespace": p.Namespace, "phase": string(p.Status.Phase),
+			"name": p.Name, "namespace": p.Namespace, "isSystem": isSystemNamespace(p.Namespace),
+			"phase": string(p.Status.Phase),
 			"ready": fmt.Sprintf("%d/%d", ready, total), "restarts": restarts,
 			"deployment": kube.PodDeploymentName(&p), "lastTerminationReason": lastReason,
 			"waitingReason": waitingReason,
@@ -366,18 +367,17 @@ func (t *ToolsAdapter) GetClusterOverview(ctx context.Context) (agent.ToolOutput
 	if err != nil {
 		return agent.ToolOutput{}, err
 	}
-	nsCount := 0
+	nsCount := len(namespaces)
+	systemNS := 0
 	for _, n := range namespaces {
-		if !isSystemNamespace(n) {
-			nsCount++
+		if isSystemNamespace(n) {
+			systemNS++
 		}
 	}
 	problem := 0
+	systemProblem := 0
 	notReadyDeps := 0
 	for _, p := range pods {
-		if isSystemNamespace(p.Namespace) {
-			continue
-		}
 		restarts := int32(0)
 		ready := 0
 		total := 0
@@ -394,12 +394,12 @@ func (t *ToolsAdapter) GetClusterOverview(ctx context.Context) (agent.ToolOutput
 		}
 		if p.Status.Phase != "Running" || ready < total || restarts > 0 || waiting != "" {
 			problem++
+			if isSystemNamespace(p.Namespace) {
+				systemProblem++
+			}
 		}
 	}
 	for _, d := range deps {
-		if isSystemNamespace(d.Namespace) {
-			continue
-		}
 		want := int32(1)
 		if d.Spec.Replicas != nil {
 			want = *d.Spec.Replicas
@@ -409,12 +409,12 @@ func (t *ToolsAdapter) GetClusterOverview(ctx context.Context) (agent.ToolOutput
 		}
 	}
 	data := map[string]any{
-		"nodes": nodes, "namespaces": nsCount, "deployments": len(deps),
-		"pods": len(pods), "problemPods": problem, "notReadyDeployments": notReadyDeps,
+		"nodes": nodes, "namespaces": nsCount, "systemNamespaces": systemNS, "deployments": len(deps),
+		"pods": len(pods), "problemPods": problem, "systemProblemPods": systemProblem, "notReadyDeployments": notReadyDeps,
 	}
 	return agent.ToolOutput{
-		Summary: fmt.Sprintf("集群总览：%d 个节点，%d 个命名空间，%d 个 Deployment，%d 个 Pod，其中 %d 个 Pod 有问题，%d 个 Deployment 未完全就绪",
-			nodes, nsCount, len(deps), len(pods), problem, notReadyDeps),
+		Summary: fmt.Sprintf("集群总览：%d 个节点，%d 个命名空间（其中系统命名空间 %d 个），%d 个 Deployment，%d 个 Pod，其中 %d 个 Pod 有问题（系统命名空间 %d 个），%d 个 Deployment 未完全就绪",
+			nodes, nsCount, systemNS, len(deps), len(pods), problem, systemProblem, notReadyDeps),
 		Data: data,
 	}, nil
 }

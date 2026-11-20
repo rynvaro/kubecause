@@ -45,12 +45,12 @@ var (
 // validateCreate 校验创建任务的请求。
 // namespace 必须和 K8s 命名规则一致，kind 只能是 Pod 或 Deployment，
 // 名字不能为空。校验放在 API 层，Worker 就不用再防一遍非法输入。
+// 系统命名空间不再拒绝：单次诊断是只读诊断，查 kube-system 合法；
+// 修操作仍然被挡住——提案生成时 repair.ValidatePatchSpec 会拒绝
+// 系统命名空间，所以系统目标的任务只会出诊断报告，不会生成可执行提案。
 func validateCreate(req *CreateRunRequest) error {
 	if !nsRe.MatchString(req.Namespace) {
 		return fmt.Errorf("namespace 格式非法: %q", req.Namespace)
-	}
-	if req.Namespace == "kube-system" || req.Namespace == "kube-public" {
-		return fmt.Errorf("禁止在系统命名空间 %q 创建任务", req.Namespace)
 	}
 	if req.Kind != "Pod" && req.Kind != "Deployment" {
 		return fmt.Errorf("kind 只能是 Pod 或 Deployment")

@@ -32,7 +32,8 @@ type Config struct {
 		// 只是允许模型在一轮里查得更多；步数用完时后端返回
 		// 已查到的半成品，而不是直接报错（见 internal/chat/real.go）。
 		MaxSteps int `yaml:"maxSteps" json:"maxSteps"`
-		// MaxHistoryMessages 是每次调用模型时带上的历史消息数，
+		// MaxHistoryMessages 是每次调用模型时带上的最近用户/助手消息数，
+		// 只算 user 和 assistant，tool 消息不占名额。
 		// 更早的消息数据库里全量保留，只是暂时不进模型上下文。
 		MaxHistoryMessages int `yaml:"maxHistoryMessages" json:"maxHistoryMessages"`
 	} `yaml:"chat" json:"chat"`

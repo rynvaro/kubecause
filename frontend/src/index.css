@@ -59,6 +59,9 @@ h5 { font-size: 13px; margin: 10px 0 4px; }
 .tool-summary { margin-top: 8px; }
 .tool-summary-btn { background: #f8f9fa; border: 1px solid #e0e0e0; color: #444; border-radius: 16px; font-size: 12px; padding: 4px 12px; }
 .new-below { align-self: center; margin: 8px 0; background: #1a6fd4; color: #fff; border-color: #1a6fd4; border-radius: 16px; }
+/* 活动面板里的“有新内容”按钮：aside 是块布局，align-self 不起作用，
+   用块级 + 自动边距居中。 */
+.activity .new-below { display: block; margin: 8px auto; }
 
 /* 结果块：标题栏永远可见，正文可折叠；长列表内部再折叠行数。 */
 .result-block { border: 1px solid #eee; border-radius: 8px; margin: 10px 0; overflow: hidden; }

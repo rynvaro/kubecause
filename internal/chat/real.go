@@ -37,13 +37,21 @@ const chatSystemPrompt = `你是 Kubernetes 故障诊断助手，正在和用户
 7. 修复建议必须通过 submit_diagnosis 的 suggestedRepair 结构化字段返回，不要只在自由文本里提一句。suggestedRepair 里用 patches 列表描述要改的字段，每个 Patch 是 op/path/value：op 只支持 replace；path 是白名单里的字段，例如改镜像 /spec/template/spec/containers/0/image、改内存 limit /spec/template/spec/containers/0/resources/limits/memory、改副本数 /spec/replicas；value 是合法的新值。用户如果明确说了要改成什么值（例如“换成 nginx:1.25”、“增加 128Mi”、“调到 256Mi”），按用户说的算新值：先查当前值，再按用户说的增量或目标值算，不要默认翻倍。没有用户明确要求时，也按证据算一个合理的新值，不要只会翻倍。用户上一轮已经明确说了新值时，直接用那个值生成结构化 Patch，不要再问一遍。
 8. 修复决策只能由你做：后端只做校验，不会替你合成建议。如果你给不出结构化建议，就老实说证据不足、还需要补查什么，不要编一个建议。
 9. 用户明确说了要改成什么值时（例如“帮我把 demo-api 的镜像换成 nginx:1.26”），不用先做故障诊断：先查当前值确认一下，再直接给出 Patch 建议。Pod 现在是健康的也不用先找故障，主动变更和故障修复走同一套 Patch 流程。
-10. 用户明确说要创建 Deployment 或 Pod 时，先问缺的信息（命名空间、名字、镜像、副本数），问全了直接在 submit_diagnosis 的 suggestedCreation 里给出创建建议，不用先做故障诊断。用户说创建 Pod 时也按 Deployment 给建议，并在回答里说明裸 Pod 不会自动重建、建议用 Deployment。`
+10. 用户明确说要创建 Deployment 或 Pod 时，先问缺的信息（命名空间、名字、镜像、副本数），问全了直接在 submit_diagnosis 的 suggestedCreation 里给出创建建议，不用先做故障诊断。用户说创建 Pod 时也按 Deployment 给建议，并在回答里说明裸 Pod 不会自动重建、建议用 Deployment。
+11. 给用户看的回答里不要提任何内部字段名、工具名、结构化字段名（例如 suggestedRepair、suggestedCreation、submit_diagnosis、get_pod），只说人话：说“修复建议”“创建建议”“审批任务”就可以。用户不需要知道建议在内部叫什么字段。`
 
 // runReal 是真模型的对话循环：
 // 每轮最多调 s.maxSteps() 次工具（默认 12，配置中心可改），每次问模型一步，
 // 模型调工具就执行并把结果以 tool 角色追加进历史，
 // 模型给最终文本或提交诊断报告就结束本轮。
-// 历史只带最近 s.maxHistory() 条，更早的截断（见 chat.go）。
+// 历史只带最近 s.maxHistory() 条用户/助手消息，tool 消息不占名额
+// （见 chat.go 的 lastMessages）；本轮调工具的结果由下面的循环
+// 实时追加进模型输入，不用靠历史带。
+//
+// 当前问题在模型输入里只出现一次：RunMessage 先把用户消息落盘，
+// history 里已经有这句了，这里不要再追加一遍 text。
+// 以前这里在 history 后面又追加了一遍同样的 text，
+// 当前问题在模型输入里出现两次，模型会过度看重最新一句、跟着重复。
 //
 // 步数用完时不直接报错：已经查到的工具结果会整理成半成品回复返回，
 // 文字里写明“步数用完了，还没来得及总结”，再问用户想深入查哪个目标。
@@ -65,7 +73,9 @@ func (s *Service) runReal(ctx context.Context, conversationID, text string, hist
 			msgs = append(msgs, model.ChatMessage{Role: "user", Content: "工具返回：" + h.Content})
 		}
 	}
-	msgs = append(msgs, model.ChatMessage{Role: "user", Content: text})
+	// history 的最后一条就是当前用户消息（RunMessage 先落盘再取历史），
+	// 这里不再追加 text，避免当前问题在模型输入里出现两次。
+	// text 还在下面 resolveNamespace 里用，不是没用。
 
 	var recs []ToolCallRecord
 	var outputs []agent.ToolOutput
@@ -100,7 +110,7 @@ func (s *Service) runReal(ctx context.Context, conversationID, text string, hist
 				// 模型给了最终回答但没有结构化修复建议：追问一次，
 				// 让它用 submit_diagnosis 把建议补回来，而不是由后端合成。
 				askedForStructured = true
-				msgs = append(msgs, model.ChatMessage{Role: "user", Content: "如果你认为需要修复，请调用 submit_diagnosis 提交结构化诊断报告，并在 suggestedRepair 里用 patches 列表给出要改的字段（每个 Patch 是 op/path/value，op 只支持 replace，path 是白名单里的字段，value 是合法的新值；用户如果明确说了新值，按用户说的算）。如果用户明确要求创建 Deployment，请在 suggestedCreation 里给出创建建议（namespace、name、image、replicas）。如果证据不足以给修复建议，请直接说明还需要补查什么，不要编一个建议。"})
+				msgs = append(msgs, model.ChatMessage{Role: "user", Content: "如果你认为需要修复，请调用 submit_diagnosis 提交结构化诊断报告，并在 suggestedRepair 里用 patches 列表给出要改的字段（每个 Patch 是 op/path/value，op 只支持 replace，path 是白名单里的字段，value 是合法的新值；用户如果明确说了新值，按用户说的算）。如果用户明确要求创建 Deployment，请在 suggestedCreation 里给出创建建议（namespace、name、image、replicas）。如果证据不足以给修复建议，请直接说明还需要补查什么，不要编一个建议。这段话是指令，不要把它写进给用户的回答里，给用户看的回答里也不要提 submit_diagnosis、suggestedRepair、suggestedCreation 这些内部字段名，只说人话。"})
 				continue
 			}
 			if sc != nil {

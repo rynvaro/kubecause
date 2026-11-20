@@ -910,10 +910,18 @@ export function ApprovalCard({
   )
 }
 
-/** 修复执行与验证：执行结果和验证结果分开显示，写入成功不等于验证通过。 */
+/** 修复执行与验证：执行结果和验证结果分开显示，写入成功不等于验证通过。
+ * 批完后执行状态还是 not_started 时也不返回 null：那段时间
+ * （Worker 每 500ms 轮询才来领）正是最需要反馈的时候，
+ * 显示“已批准，等待 Worker 执行…”加一条进度线，
+ * 不然用户只看到审批卡上的“已决定”，不知道在干嘛。
+ * 审批还没决定时（pending）没有进度可显示，仍返回 null，
+ * 拒绝后也不会执行，同样不显示。 */
 export function RepairStatusCard({ snapshot }: { snapshot: RunSnapshot }) {
   const p = snapshot.proposal
-  if (!p || (p.executionStatus === 'not_started' && p.verificationStatus === 'not_started')) {
+  if (!p) return null
+  const waiting = p.executionStatus === 'not_started' && p.verificationStatus === 'not_started'
+  if (waiting && p.status !== 'approved') {
     return null
   }
   const exec = snapshot.executionDetail as Record<string, unknown> | undefined
@@ -921,6 +929,12 @@ export function RepairStatusCard({ snapshot }: { snapshot: RunSnapshot }) {
   return (
     <div className="card">
       <h4>修复执行 / 验证</h4>
+      <p className="small">{progressLine(p)}</p>
+      {waiting && (
+        <p className="small">
+          <span className="spin">◌</span> 已批准，等待 Worker 执行…不用刷新，执行状态会自己刷出来。
+        </p>
+      )}
       <p>
         执行：<b>{p.executionStatus}</b>　验证：<b>{p.verificationStatus}</b>
       </p>
@@ -944,4 +958,21 @@ export function RepairStatusCard({ snapshot }: { snapshot: RunSnapshot }) {
       )}
     </div>
   )
+}
+
+// 进度线：已批准 → 执行 → 验证 → 完成。✓ 已完成，◌ 进行中，✕ 失败，· 未开始。
+// 执行失败/过期时验证根本不跑，完成一步直接标失败，不等验证。
+function progressLine(p: ChangeRequest): string {
+  type Mark = 'done' | 'current' | 'todo' | 'failed'
+  const mark = (s: Mark) => (s === 'done' ? '✓' : s === 'current' ? '◌' : s === 'failed' ? '✕' : '·')
+  const execDone = p.executionStatus === 'executed'
+  const execFailed =
+    p.executionStatus === 'failed' || p.executionStatus === 'unknown' || p.executionStatus === 'expired'
+  const verDone = p.verificationStatus === 'passed'
+  const verFailed = p.verificationStatus === 'failed' || p.verificationStatus === 'timeout'
+  const s1: Mark = p.status === 'approved' ? 'done' : 'todo'
+  const s2: Mark = execDone ? 'done' : execFailed ? 'failed' : p.status === 'approved' ? 'current' : 'todo'
+  const s3: Mark = verDone ? 'done' : verFailed ? 'failed' : execDone ? 'current' : 'todo'
+  const s4: Mark = verDone ? 'done' : verFailed || execFailed ? 'failed' : 'todo'
+  return `进度：${mark(s1)} 已批准 → ${mark(s2)} 执行 → ${mark(s3)} 验证 → ${mark(s4)} 完成`
 }

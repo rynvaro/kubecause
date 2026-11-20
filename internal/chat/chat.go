@@ -10,9 +10,15 @@
 //     不自动执行；用户点“创建可审批的修复任务”后，才走 /api/runs 流程，
 //     生成提案、走人工审批、再执行和验证。对话里没有捷径能绕过审批。
 //
-// 多轮上下文：每次调用模型时带上本会话最近 10 条消息，
-// 超出时只保留系统提示 + 最近 10 条。10 条以后更早的消息
-// 不会再进模型上下文，但数据库里全量保留，前端翻历史能看到。
+// 多轮上下文：每次调用模型时带上本会话最近 10 条用户/助手消息，
+// 只算 user 和 assistant，不算 tool。每次工具调用都会单独存一条
+// tool 消息，一轮对话 = 1 条用户 + 6~8 条 tool + 1 条助手，
+// 按全量行数算时“最近 10 条”实际只够覆盖一轮，问两三轮后最早那轮
+// 的目标就被截掉了，模型只能按上一轮猜。tool 消息不占历史名额：
+// 本轮调工具的结果由真模型循环实时追加进模型输入；上一轮的工具
+// 细节丢掉，但助手消息里的结论和事实摘要还在，能接上文。
+// 超出时只保留系统提示 + 最近 10 条用户/助手消息。10 条以后更早的
+// 消息不会再进模型上下文，但数据库里全量保留，前端翻历史能看到。
 // TODO：以后可把 10 条之前的历史做一次摘要，再把摘要放进系统提示，
 // 现在不做假的摘要——没有摘要就直接截断，并在 README 里写清这一点。
 package chat
@@ -39,7 +45,8 @@ import (
 // 两条线不要混成一个数。
 const DefaultMaxChatSteps = 12
 
-// DefaultMaxHistoryMessages 是每次调用模型时默认带上的历史消息数：10。
+// DefaultMaxHistoryMessages 是每次调用模型时默认带上的历史消息数：10，
+// 只算用户和助手消息，tool 消息不占名额（见 lastMessages）。
 const DefaultMaxHistoryMessages = 10
 
 // ToolCallRecord 是一轮对话里调过的一个工具，
@@ -108,7 +115,8 @@ func (s *Service) maxSteps() int {
 	return s.MaxSteps
 }
 
-// maxHistory 返回每次调用模型带上的历史消息数，<=0 时回落默认值。
+// maxHistory 返回每次调用模型带上的历史消息数（只算用户/助手消息），
+// <=0 时回落默认值。
 func (s *Service) maxHistory() int {
 	if s.MaxHistoryMessages <= 0 {
 		return DefaultMaxHistoryMessages
@@ -116,16 +124,30 @@ func (s *Service) maxHistory() int {
 	return s.MaxHistoryMessages
 }
 
-// lastMessages 取一个会话最近 N 条消息，给模型做上下文。
+// lastMessages 取一个会话最近 N 条用户/助手消息，给模型做上下文。
+// 只算 user 和 assistant，不算 tool：每次工具调用都会单独存一条
+// tool 消息，一轮对话 = 1 条用户 + 6~8 条 tool + 1 条助手，
+// 按全量行数算时“最近 10 条”实际只够覆盖一轮，问两三轮后最早那轮
+// 的目标就被截掉了。tool 消息的工具结果不占历史名额：本轮调工具的
+// 结果由真模型循环实时追加进模型输入；上一轮的工具细节丢掉，
+// 但助手消息里的结论和事实摘要还在，能接上文。
+// resolveNamespace 用的也是这份历史（RunMessage 里传进去的那份），
+// 同样按这个口径走，不会被 tool 消息挤掉。
 func (s *Service) lastMessages(ctx context.Context, conversationID string, n int) ([]store.ConversationMessage, error) {
 	all, err := s.Store.ListMessages(ctx, conversationID)
 	if err != nil {
 		return nil, err
 	}
-	if len(all) > n {
-		all = all[len(all)-n:]
+	kept := make([]store.ConversationMessage, 0, len(all))
+	for _, m := range all {
+		if m.Role == "user" || m.Role == "assistant" {
+			kept = append(kept, m)
+		}
 	}
-	return all, nil
+	if len(kept) > n {
+		kept = kept[len(kept)-n:]
+	}
+	return kept, nil
 }
 
 // RunMessage 处理一条用户消息：先把用户消息落盘，

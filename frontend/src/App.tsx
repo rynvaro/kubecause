@@ -49,7 +49,7 @@ import {
 } from './components'
 import type { ActivityItem } from './components'
 import { parseStructured, parseToolCalls } from './types'
-import type { AppConfig, Conversation, ConversationMessage, ConvertPayload, RunSnapshot, RunStep } from './types'
+import type { AppConfig, ChangeRequest, Conversation, ConversationMessage, ConvertPayload, RunSnapshot, RunStep } from './types'
 
 type Mode = 'chat' | 'run'
 
@@ -61,6 +61,27 @@ function runStillActive(snap: RunSnapshot | null): boolean {
   const p = snap.proposal
   if (p && (p.executionStatus === 'executing' || p.verificationStatus === 'verifying')) return true
   return false
+}
+
+const EXEC_TERMINAL = ['executed', 'failed', 'unknown', 'expired']
+const VERIFY_TERMINAL = ['passed', 'failed', 'timeout']
+
+// 提案是否还没到终态：批完后 Worker 还没来领时执行状态是 not_started，
+// runStillActive 会判 false，轮询就起不来。批完后的轮询要看这个——
+// 只要提案已批准、还没走到终态，就继续轮。执行失败/过期时验证根本
+// 不跑，算完；执行成功了则要等验证终态。
+function proposalUnsettled(p: ChangeRequest | null | undefined): boolean {
+  if (!p || p.status !== 'approved') return false
+  if (!EXEC_TERMINAL.includes(p.executionStatus)) return true
+  if (p.executionStatus === 'executed') return !VERIFY_TERMINAL.includes(p.verificationStatus)
+  return false
+}
+
+// 是否应继续轮询任务：诊断还在跑，或者提案已批准还没到终态。
+function shouldKeepPolling(snap: RunSnapshot | null): boolean {
+  if (!snap) return false
+  if (snap.status === 'queued' || snap.status === 'running') return true
+  return proposalUnsettled(snap.proposal)
 }
 
 /** 从会话消息里汇总本轮调过的工具：tool 消息和助手消息里都存了同一份调用，
@@ -155,6 +176,15 @@ export default function App() {
   const runPollRef = useRef<number | null>(null)
   const messagesWrapRef = useRef<HTMLDivElement>(null)
   const nearBottomRef = useRef(true)
+  // 审批卡元素的引用（问题 5）：点转换是用户主动操作，点完强制把
+  // 审批卡滚进视野，不走“只有在最底下才跟滚”的逻辑。
+  const runCardRef = useRef<HTMLDivElement | null>(null)
+  const scrollToRunCardRef = useRef(false)
+  // 右侧活动面板的滚动（问题 2）：复用聊天那套“在最底下才跟滚，
+  // 往上翻了只提示”的模式，引用和状态见下面活动面板一节。
+  const activityRef = useRef<HTMLElement | null>(null)
+  const activityNearBottomRef = useRef(true)
+  const [activityHasNew, setActivityHasNew] = useState(false)
 
   const refreshConversations = useCallback(async () => {
     try {
@@ -196,6 +226,24 @@ export default function App() {
       setHasNewBelow(true)
     }
   }, [messages, chatBusy, snapshot, mode])
+
+  // 点转换后强制把审批卡滚进视野（问题 5）：转换是用户主动操作，
+  // 点完就应该看到结果。建议卡经常不在最底下（往上翻找到卡点的，
+  // 或拿卡后又追问了几句），这时 nearBottom 是 false，上面那个
+  // effect 不会滚，审批卡插在锚点消息后面、在可视区外。
+  // 这个 effect 在上面那个之后执行，所以最终停在卡片上。
+  // flag 只在 convertCurrent 里置一次，第一次快照变化时消费掉，
+  // 之后轮询的快照更新不会再滚。
+  useEffect(() => {
+    if (!scrollToRunCardRef.current) return
+    scrollToRunCardRef.current = false
+    const el = runCardRef.current
+    if (el) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      nearBottomRef.current = false
+      setHasNewBelow(false)
+    }
+  }, [snapshot])
 
   function scrollToBottom() {
     const el = messagesWrapRef.current
@@ -322,6 +370,10 @@ export default function App() {
       // 锚定在转换那一刻的最后一条消息后面，审批卡按时间顺序插进消息流，
       // 不再固定在聊天底部，新问题发出去后会出现在它下面。
       setSnapshotAnchorId(messages.length > 0 ? messages[messages.length - 1].id : null)
+      // 转换是用户主动操作：点完强制把审批卡滚进视野（见上面的 effect），
+      // 不管当时在不在最底下。flag 要在 loadRun 改快照之前置好，
+      // 快照变化时 effect 才会消费它。
+      scrollToRunCardRef.current = true
       // 转换后留在对话模式：审批卡和修复验证直接出现在聊天里，不切走。
       await loadRun(r.runId, true)
       startRunPolling(r.runId)
@@ -350,7 +402,19 @@ export default function App() {
 
   function startRunPolling(id: string) {
     if (runPollRef.current) window.clearInterval(runPollRef.current)
+    // 上限 400 次（约 6 分钟）：终态到了会提前停，上限只是兜底，
+    // 防止后端一直不给终态时无限轮询。验证本身最长 120 秒，
+    // 加上 Worker 领任务和执行的耗时，400 次留足了余量。
+    let polls = 0
     runPollRef.current = window.setInterval(() => {
+      polls++
+      if (polls > 400) {
+        if (runPollRef.current) {
+          window.clearInterval(runPollRef.current)
+          runPollRef.current = null
+        }
+        return
+      }
       void (async () => {
         try {
           const evs = await listRunEvents(id, afterRef.current)
@@ -362,7 +426,7 @@ export default function App() {
             })
           }
           const snap = await loadRun(id, false)
-          if (snap && !runStillActive(snap)) {
+          if (snap && !shouldKeepPolling(snap)) {
             if (runPollRef.current) {
               window.clearInterval(runPollRef.current)
               runPollRef.current = null
@@ -397,7 +461,10 @@ export default function App() {
   async function loadRunById() {
     if (!runId) return
     const snap = await loadRun(runId, true)
-    if (snap && runStillActive(snap)) startRunPolling(runId)
+    // 手动读任务也要看提案终态：已批准但 Worker 还没来领时，
+    // runStillActive 是 false，旧代码这里轮询起不来，
+    // 和 decide() 是同一个 bug。
+    if (snap && shouldKeepPolling(snap)) startRunPolling(runId)
   }
 
   async function decide(decision: 'approved' | 'rejected') {
@@ -410,8 +477,16 @@ export default function App() {
           decision === 'approved' ? 'Worker 会自动执行并验证，请稍等。' : '已拒绝，不会对集群做任何写入。'
         }`,
       )
-      const snap = await loadRun(snapshot.id, false)
-      if (snap && runStillActive(snap)) startRunPolling(snapshot.id)
+      await loadRun(snapshot.id, false)
+      if (decision === 'approved') {
+        // 批完无条件启动轮询：批完那一刻任务已是 completed、执行状态
+        // 还是 not_started（Worker 每 500ms 才来领），按旧的
+        // runStillActive 判断轮询根本起不来，用户看不到任何进度，
+        // 只能手动刷新。终态到了轮询自己会停（见 startRunPolling），
+        // 已经到终态时第一轮就停，多轮一次无害。
+        // 拒绝后什么都不会发生，不用轮询。
+        startRunPolling(snapshot.id)
+      }
     } catch (e) {
       setRunError(e instanceof Error ? e.message : '审批失败')
     } finally {
@@ -425,11 +500,43 @@ export default function App() {
   const activityRunning = mode === 'chat' ? chatBusy : snapshot ? runStillActive(snapshot) : false
   const runTotalMs = events.reduce((s, e) => s + (e.durationMs > 0 ? e.durationMs : 0), 0)
 
+  // 右侧活动面板的滚动（问题 2）：顺序留在下面（新的在下，和聊天、
+  // 时间线阅读顺序一致），加自动滚动，复用聊天那套模式——
+  // 已经在最底下就跟着滚到底，往上翻了只显示“有新内容”提示，
+  // 不把人拽下来。正在执行的卡片在最下面，高亮加自动滚才能看到。
+  function onActivityScroll() {
+    const el = activityRef.current
+    if (!el) return
+    const near = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+    activityNearBottomRef.current = near
+    if (near) setActivityHasNew(false)
+  }
+
+  function scrollActivityToBottom() {
+    const el = activityRef.current
+    if (!el) return
+    el.scrollTop = el.scrollHeight
+    activityNearBottomRef.current = true
+    setActivityHasNew(false)
+  }
+
+  useEffect(() => {
+    const el = activityRef.current
+    if (!el) return
+    if (activityNearBottomRef.current) {
+      el.scrollTop = el.scrollHeight
+      setActivityHasNew(false)
+    } else if (activityItems.length > 0 || activityRunning) {
+      setActivityHasNew(true)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activityItems.length, activityRunning, mode])
+
   // 正式诊断卡（Slice 7）：不固定在聊天底部，按锚点插进消息流。
   // App.tsx 下面的消息渲染里，锚点那条消息后面会插这张卡，
   // 锚点为空（例如消息为空时转换）则由下面的兜底渲染在消息流末尾。
   const runResultCard = snapshot ? (
-    <div className="card run-result" key={`run-${snapshot.id}`}>
+    <div className="card run-result" key={`run-${snapshot.id}`} ref={(el) => { runCardRef.current = el }}>
       <h3>正式诊断 · {snapshot.id}</h3>
       <p>
         任务 {snapshot.namespace}/{snapshot.kind}/{snapshot.name} 状态：
@@ -651,11 +758,16 @@ export default function App() {
           )}
         </main>
 
-        <aside className="activity">
+        <aside className="activity" ref={activityRef} onScroll={onActivityScroll}>
           <h3>Agent 活动</h3>
           <p className="muted small">
             每一步工具一张卡片，可点开展开看参数和结果。正在执行的卡片高亮。
           </p>
+          {activityHasNew && (
+            <button className="new-below activity-new" onClick={scrollActivityToBottom}>
+              ↓ 有新内容
+            </button>
+          )}
           <ActivityPanel items={activityItems} running={activityRunning} />
         </aside>
       </div>
@@ -702,7 +814,7 @@ export default function App() {
                     }
                   />
                   <span className="muted small">
-                    每次调用模型时带上的最近消息条数。调大更记得上文，但更费 token。
+                    每次调用模型时带上的最近用户/助手消息条数，工具调用不占名额。调大更记得上文，但更费 token。
                   </span>
                 </label>
                 <h4>单次诊断</h4>

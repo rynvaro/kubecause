@@ -2,6 +2,27 @@
 
 按版本号倒序。每个版本对应一个 git tag，例如 `v0.9.0`。
 
+## v0.11.0（2026-11-20）
+
+v0.11.0 修的是用户在 2026-11-20 晚反馈的 5 个问题：**审批后不知道在干嘛**（批完页面不反馈状态，要再问一句才刷出来）、**点转换按钮后不自动滚到审批卡**、**聊多了上下文混乱**（答案停留在上次问的问题上）、**右侧活动面板看不到最新工具调用**、**创建追问里出现内部字段名**（模型把 `suggestedCreation` 直接写给用户看）。根因都在代码里确认过，不是感觉问题：审批轮询的启动门控、历史按全量行数截断、当前问题在模型输入里出现两次，都是确定性的 bug。
+
+### 改了什么
+
+- **批完无条件轮询，审批卡上给进度线**（`frontend/src/App.tsx`、`frontend/src/components.tsx`）：`decide()` 批完只读一次任务、再按 `runStillActive` 决定要不要轮询——批完那一刻任务已是 completed、提案执行状态还是 `not_started`（Worker 每 500ms 才来领），判断是 false，轮询根本起不来；`RepairStatusCard` 在执行和验证都是 `not_started` 时直接返回 null，审批卡只显示“已决定”，没有任何进度。现在批完不管快照状态如何都启动轮询，一直轮到提案到终态（executed/failed/expired，验证 passed/failed/timeout）再停，上限 400 次（约 6 分钟）兜底；`loadRunById` 同样的门控一起修。`RepairStatusCard` 在已批准 + `not_started` 时渲染“已批准，等待 Worker 执行…”和一条进度线“✓ 已批准 → ◌ 执行 → · 验证 → · 完成”，不再返回 null；审批还没决定时仍不显示。验证：fake+stub 下 OOM 转换 → 提案 `chg_97aae4e2afb29e3f` → 批准，批完立即读正是 completed + `not_started`（旧前端轮询起不来的那一刻），继续轮询看到 executed + verifying → executed + passed。
+- **点转换后强制滚到审批卡**（`frontend/src/App.tsx`）：滚动 effect 只在 `nearBottomRef` 为真时才跟滚，用户点转换按钮时建议卡经常不在最底下（往上翻找到卡点的，或拿卡后又追问了几句），审批卡插在锚点消息后面、在可视区外。现在转换是用户主动操作，点完用 `scrollIntoView` 把审批卡滚进视野，不走“来了条新消息才跟滚”的逻辑；创建建议卡的转换按钮同样处理。VM 里没有真浏览器，这条是代码级验证 + Mac 手动验证步骤，见下面。
+- **历史只算用户/助手消息**（`internal/chat/chat.go`、`internal/chat/real.go`、`internal/config/config.go`、`config.yaml`、`README.md`、前端设置页文案）：`lastMessages` 以前按数据库全量行数取最近 N=10 条，所有角色都算；每次工具调用单独存一条 tool 消息，一轮对话 = 1 条用户 + 6~8 条 tool + 1 条助手，约 10 条，所以“最近 10 条”实际只够覆盖一轮，问两三轮后最早那轮的目标就被截掉了。现在只算 user 和 assistant，tool 消息不占名额；本轮调工具的结果由真模型循环实时追加进模型输入，上一轮的工具细节丢掉，但助手消息里的结论和事实摘要还在，能接上文。`resolveNamespace` 用的就是这份历史，同样按这个口径走。`config.yaml` 的 `maxHistoryMessages: 10` 含义改成“最近 10 条用户/助手消息”，配置说明、README 表格和设置页文案一起改。注意：没有做假的对话摘要，历史摘要是以后 roadmap 的单独一项。验证：新增测试构造 3 轮含 tool 消息的历史（24 行），确认模型输入里仍有第一轮的用户问题；6 轮时截到 10 条用户/助手消息，第一轮被截掉、第二轮还在。curl fake+stub 三轮：第一轮问 demo-api，第二轮问总览，第三轮不给 namespace 只说“那个一直重启的现在重启了几次”，仍解析到 demo、深挖 demo-api（OOMKilled、重启 5 次）。
+- **当前问题在模型输入里只出现一次**（`internal/chat/real.go`）：`RunMessage` 先把用户消息落盘，`history` 里已经有这句了，`runReal` 组装 `msgs` 时又在最后追加了一遍同样的 `text`，当前问题出现两次，模型会过度看重最新一句、跟着重复。现在不再追加，`history` 的最后一条就是当前问题。新增测试用 mock 真模型抓请求体确认：两次请求里当前问题都恰好出现一次。
+- **右侧活动面板自动滚动**（`frontend/src/App.tsx`、`frontend/src/index.css`）：`ActivityPanel` 没有任何滚动逻辑，列表是旧的在上、新的在下，越聊越长，最新在可视区外面。顺序留在下面（新的在下，和聊天、时间线阅读顺序一致），加自动滚动，复用聊天那套模式——已经在最底下就跟着滚到底，往上翻了显示“↓ 有新内容”按钮，不把人拽下来；正在执行的卡片在最下面，高亮加自动滚才能看到。VM 里没有真浏览器，代码级验证 + Mac 手动验证。
+- **提示词堵内部字段名外泄**（`internal/chat/real.go`）：截图里的 `demo-http`、`hashicorp/http-echo` 在代码里一个都没有，是真模型按提示词第 10 条现编的追问，不是写死的，不用改；要改的是模型把 `suggestedCreation` 直接写给用户看。`chatSystemPrompt` 加第 11 条：给用户看的回答里不要提任何内部字段名、工具名、结构化字段名（例如 suggestedRepair、suggestedCreation、submit_diagnosis、get_pod），只说人话；`runReal` 里那段追问结构化建议的文本也加了同样一句。
+
+### 未实现（仍未做）
+
+- 对话历史摘要（现在是截断，TODO 在代码和 README 里写清了）
+- 云端部署、鉴权、监控
+- 白名单做成可配置（用户说复杂先不做）
+- op 只支持 replace：add/remove 以后需要时再加，现在不做，避免删字段
+- command/args、hostNetwork、privileged 这些字段先禁掉，以后用户明确要求时再放开
+
 ## v0.10.0（2026-11-20）
 
 v0.10.0 修的是用户在 2026-11-20 反馈的两个问题：**转正式诊断按钮没带目标**（demo-bad-image 换镜像的建议卡，点了“创建可审批的修复任务”，建出来的却是 demo/Deployment/demo-api）和**正式诊断重跑失败**（建出来的 run 自己重新诊断，8 步用完、置信度 low、事实重复、没有提案，修复任务从来没成功过）；另外按用户要求**加了一个通用创建能力**（对话里说“在 demo 空间下创建一个 Pod/Deployment”，现在能走建议卡 → 审批 → 执行 → 验证），以后想改成 manager agent 时复用，不为每个操作单独写一套流程。

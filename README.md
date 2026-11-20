@@ -6,7 +6,7 @@ KubeCause 是一个 Kubernetes 故障诊断 Agent。用户选定 namespace 和 P
 
 ## 功能
 
-- **对话诊断**：选定 namespace 和 Pod 或 Deployment，描述故障现象，Agent 自主选择只读工具收集证据，检索排障手册（`runbooks/*.md`，SQLite FTS5 索引），输出诊断结论和修复建议。支持多轮追问，指代消解靠最近 10 条历史。
+- **对话诊断**：选定 namespace 和 Pod 或 Deployment，描述故障现象，Agent 自主选择只读工具收集证据，检索排障手册（`runbooks/*.md`，SQLite FTS5 索引），输出诊断结论和修复建议。支持多轮追问，指代消解靠最近 10 条用户/助手历史消息（工具调用不占名额）。
 - **单次诊断**：`POST /api/runs` 创建一个有 runId 的正式诊断任务，有步骤时间线、诊断报告、提案、审批、执行和验证，全程可审计，重启后可恢复。
 - **通用 Patch 修复**：修复建议是一组通用 Patch（`{op, path, value}`），只改白名单字段（镜像、内存/CPU 的 limit/request、副本数），不按故障类型分分支。人工审批后才执行，执行前 dry-run、核对 resourceVersion，执行后逐条读回确认，再做 rollout 验证。
 - **创建 Deployment**：对话里说“在 demo 空间下创建一个 Deployment，镜像 nginx:1.25”，Agent 先问缺的信息（命名空间、名字、镜像、副本数），问全了给一张创建建议卡，点“创建可审批的创建任务”后走同一套审批 → 执行 → 验证 rollout 的线。只创建 Deployment，不直接创建裸 Pod（Pod 挂了不会自动重建，也没有 rollout）；创建校验和 Patch 共用同一套安全思路（系统命名空间拒绝、镜像合法、副本数 1–10、内存/CPU 在上限内）。
@@ -66,7 +66,7 @@ op 只支持 `replace`。明确拒绝：hostNetwork、hostPID、privileged、met
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `chat.maxSteps` | 12 | 对话最大工具步数：一轮对话里模型最多调几次工具。预算，不是决策——调大不干预模型怎么选工具，只是允许查得更多；步数用完返回半成品，不报错 |
-| `chat.maxHistoryMessages` | 10 | 每次调用模型时带上的历史消息数，更早的消息数据库里全量保留 |
+| `chat.maxHistoryMessages` | 10 | 每次调用模型时带上的最近用户/助手消息条数，只算 user 和 assistant，tool 消息不占名额；更早的消息数据库里全量保留 |
 | `run.maxSteps` | 8 | 单次诊断（/api/runs）最大工具步数，和对话的 12 步分开 |
 | `run.timeoutSeconds` | 60 | 单次诊断整体超时秒数，超时后用已有证据收敛 |
 | `model.timeoutSeconds` | 30 | 每次模型 API 调用的超时秒数 |

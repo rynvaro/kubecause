@@ -102,10 +102,26 @@ func DoubleMemory(oldValue string, maxMi int64) string {
 	return fmt.Sprintf("%dMi", next)
 }
 
-// MaxMemoryMi 是单次修复允许的新值上限：4Gi。
-// ValidatePatchSpec 里同时检查“不超过旧值 4 倍”和“不超过 4Gi”，
+// MaxMemoryMi 是单次修复允许的新值上限（MiB）：默认 4096 即 4Gi。
+// MaxRatio 是新值相对旧值的最大倍数：默认 4。
+// ValidatePatchSpec 里同时检查“不超过旧值 MaxRatio 倍”和“不超过 MaxMemoryMi”，
 // 两个上限取更严的那一个，防止模型一次把 limit 提到天上去。
-const MaxMemoryMi = 4096
+// 这两个值不再是写死的常量，而是配置中心（internal/config）的
+// repair.maxMemoryMi / repair.maxRatio，启动时和热更新时由 ApplyLimits 填进来。
+var MaxMemoryMi int64 = 4096
+
+// MaxRatio 是修复新值相对旧值的最大倍数，默认 4。
+var MaxRatio int64 = 4
+
+// ApplyLimits 把配置中心的值应用到修复校验：热加载时调它，不用重启。
+// 非法值不改，保持旧值——校验层不能因为一次错误配置就放开上限。
+func ApplyLimits(maxMi, maxRatio int64) {
+	if maxMi < 128 || maxMi > 16384 || maxRatio < 1 || maxRatio > 10 {
+		return
+	}
+	MaxMemoryMi = maxMi
+	MaxRatio = maxRatio
+}
 
 // ValidatePatchSpec 是 Patch 的白名单校验，第一道防线。
 // 通用规则（Slice 4）：任意 namespace / Deployment / 容器都可以，
@@ -144,11 +160,11 @@ func ValidatePatchSpec(namespace, deployment, container, oldValue, newValue stri
 	if newMi <= oldMi {
 		return fmt.Errorf("新值 %s 必须大于旧值 %s", newValue, oldValue)
 	}
-	if newMi > oldMi*4 {
-		return fmt.Errorf("新值 %s 超过旧值 %s 的 4 倍，拒绝执行", newValue, oldValue)
+	if newMi > oldMi*MaxRatio {
+		return fmt.Errorf("新值 %s 超过旧值 %s 的 %d 倍，拒绝执行", newValue, oldValue, MaxRatio)
 	}
 	if newMi > MaxMemoryMi {
-		return fmt.Errorf("新值 %s 超过上限 4Gi，拒绝执行", newValue)
+		return fmt.Errorf("新值 %s 超过上限 %dMi，拒绝执行", newValue, MaxMemoryMi)
 	}
 	return nil
 }

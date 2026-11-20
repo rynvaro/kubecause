@@ -298,15 +298,37 @@ func (s *Store) ensureColumn(ctx context.Context, table, column, typ string) err
 
 func now() time.Time { return time.Now().UTC() }
 
+// DefaultRunMaxSteps / DefaultRunTimeoutSeconds 是创建任务时
+// MaxSteps / TimeoutSeconds 没填时的默认值：8 步 / 60 秒。
+// 不再是写死的常量：配置中心（internal/config）的 run.maxSteps /
+// run.timeoutSeconds 在启动和热更新时由 ApplyRunDefaults 填进来。
+// /api/runs 请求体里显式传了 maxSteps / timeoutSeconds 时，
+// 请求体的值优先，配置只决定“没填时用什么”。
+var DefaultRunMaxSteps = 8
+
+// DefaultRunTimeoutSeconds 是创建任务时 TimeoutSeconds 没填时的默认值（秒）。
+var DefaultRunTimeoutSeconds = 60
+
+// ApplyRunDefaults 把配置中心的值应用到任务创建默认值：热加载时调它。
+// 非法值不改，保持旧值。
+func ApplyRunDefaults(maxSteps, timeoutSeconds int) {
+	if maxSteps >= 1 && maxSteps <= 50 {
+		DefaultRunMaxSteps = maxSteps
+	}
+	if timeoutSeconds >= 5 && timeoutSeconds <= 600 {
+		DefaultRunTimeoutSeconds = timeoutSeconds
+	}
+}
+
 // CreateRun 创建一个 queued 任务。
 func (s *Store) CreateRun(ctx context.Context, r *Run) error {
 	r.ID = NewID("run_")
 	r.Status = StatusQueued
 	if r.MaxSteps <= 0 {
-		r.MaxSteps = 8
+		r.MaxSteps = DefaultRunMaxSteps
 	}
 	if r.TimeoutSeconds <= 0 {
-		r.TimeoutSeconds = 60
+		r.TimeoutSeconds = DefaultRunTimeoutSeconds
 	}
 	r.CreatedAt = now()
 	r.UpdatedAt = r.CreatedAt

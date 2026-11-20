@@ -121,6 +121,16 @@ export interface Conversation {
   updatedAt: string
 }
 
+// 配置中心（Slice 8）：和后端 internal/config.Config 的 JSON 字段一一对应。
+// 注意：这里没有 MODEL_API_KEY——Key 只从环境变量读，
+// 绝不进配置文件、绝不在 GET /api/config 里返回、绝不在前端显示。
+export interface AppConfig {
+  chat: { maxSteps: number; maxHistoryMessages: number }
+  run: { maxSteps: number; timeoutSeconds: number }
+  model: { timeoutSeconds: number; temperature: number }
+  repair: { maxMemoryMi: number; maxRatio: number }
+}
+
 // 工具返回的结构化行：Pod / Deployment 表格共用 isSystem 标记，
 // 系统命名空间的行前端显示“系统”徽章。
 export interface PodRow {

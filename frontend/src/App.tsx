@@ -28,11 +28,13 @@ import {
   createConversation,
   createRun,
   decideApproval,
+  getConfig,
   getConversation,
   getRun,
   listConversations,
   listRunEvents,
   postChatMessage,
+  updateConfig,
 } from './api'
 import {
   ActivityPanel,
@@ -47,7 +49,7 @@ import {
 } from './components'
 import type { ActivityItem } from './components'
 import { parseStructured, parseToolCalls } from './types'
-import type { Conversation, ConversationMessage, RunSnapshot, RunStep } from './types'
+import type { AppConfig, Conversation, ConversationMessage, RunSnapshot, RunStep } from './types'
 
 type Mode = 'chat' | 'run'
 
@@ -121,6 +123,15 @@ export default function App() {
   const [converting, setConverting] = useState(false)
   const [chatError, setChatError] = useState('')
   const [notice, setNotice] = useState('')
+
+  // 设置页（Slice 8，配置中心）：点 header 的“设置”打开弹窗，
+  // 读 GET /api/config，改完点保存调 POST /api/config，热加载不用重启。
+  // 配置里没有 MODEL_API_KEY：Key 只从环境变量读，前端不显示、不让改。
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [cfg, setCfg] = useState<AppConfig | null>(null)
+  const [cfgSaving, setCfgSaving] = useState(false)
+  const [cfgSaved, setCfgSaved] = useState('')
+  const [cfgError, setCfgError] = useState('')
 
   const [ns, setNs] = useState('demo')
   const [kind, setKind] = useState('Deployment')
@@ -218,6 +229,37 @@ export default function App() {
       await refreshConversations()
     } catch (e) {
       setChatError(e instanceof Error ? e.message : '创建会话失败')
+    }
+  }
+
+  // 设置页（Slice 8）：打开时读一次当前配置，保存时 POST 回去。
+  // 保存成功显示“已保存，立即生效，不用重启”；后端校验失败时
+  // 显示后端返回的错误（例如“chat.maxSteps 必须在 1-50 之间”），
+  // 旧配置继续生效，不会被非法值覆盖。
+  async function openSettings() {
+    setSettingsOpen(true)
+    setCfgSaved('')
+    setCfgError('')
+    try {
+      setCfg(await getConfig())
+    } catch (e) {
+      setCfgError(e instanceof Error ? e.message : '读取配置失败')
+    }
+  }
+
+  async function saveSettings() {
+    if (!cfg || cfgSaving) return
+    setCfgSaving(true)
+    setCfgSaved('')
+    setCfgError('')
+    try {
+      const r = await updateConfig(cfg)
+      setCfg(r.config)
+      setCfgSaved(r.note || '已保存，立即生效，不用重启')
+    } catch (e) {
+      setCfgError(e instanceof Error ? e.message : '保存失败')
+    } finally {
+      setCfgSaving(false)
     }
   }
 
@@ -407,6 +449,7 @@ export default function App() {
           <button className={mode === 'run' ? 'active' : ''} onClick={() => setMode('run')}>
             单次诊断
           </button>
+          <button onClick={() => void openSettings()}>设置</button>
         </nav>
       </header>
 
@@ -607,6 +650,155 @@ export default function App() {
           <ActivityPanel items={activityItems} running={activityRunning} />
         </aside>
       </div>
+
+      {/* 设置弹窗（Slice 8，配置中心）：每个参数一个输入框 + 一句中文说明。
+          保存后立即生效，不用重启。MODEL_API_KEY 不在这里显示、也不让改，
+          Key 只从环境变量读。 */}
+      {settingsOpen && (
+        <div className="modal-overlay" onClick={() => setSettingsOpen(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h3>设置</h3>
+            <p className="muted small">
+              改完点保存，立即生效，不用重启。非法值会被后端拒绝，旧配置继续生效。
+            </p>
+            {!cfg && !cfgError && <p className="muted">正在读取配置…</p>}
+            {cfgError && <div className="error">{cfgError}</div>}
+            {cfg && (
+              <div className="settings-form">
+                <h4>对话</h4>
+                <label>
+                  对话最大工具步数
+                  <input
+                    type="number"
+                    min={1}
+                    max={50}
+                    value={cfg.chat.maxSteps}
+                    onChange={(e) =>
+                      setCfg({ ...cfg, chat: { ...cfg.chat, maxSteps: Number(e.target.value) } })
+                    }
+                  />
+                  <span className="muted small">
+                    模型一轮最多调几次工具。调大可以查得更全，但更慢更贵；这只是预算，不干预模型怎么选工具。
+                  </span>
+                </label>
+                <label>
+                  历史消息数
+                  <input
+                    type="number"
+                    min={1}
+                    max={50}
+                    value={cfg.chat.maxHistoryMessages}
+                    onChange={(e) =>
+                      setCfg({ ...cfg, chat: { ...cfg.chat, maxHistoryMessages: Number(e.target.value) } })
+                    }
+                  />
+                  <span className="muted small">
+                    每次调用模型时带上的最近消息条数。调大更记得上文，但更费 token。
+                  </span>
+                </label>
+                <h4>单次诊断</h4>
+                <label>
+                  单次诊断最大工具步数
+                  <input
+                    type="number"
+                    min={1}
+                    max={50}
+                    value={cfg.run.maxSteps}
+                    onChange={(e) =>
+                      setCfg({ ...cfg, run: { ...cfg.run, maxSteps: Number(e.target.value) } })
+                    }
+                  />
+                  <span className="muted small">
+                    一次正式诊断最多调几次工具，和对话的步数是分开的两个预算。
+                  </span>
+                </label>
+                <label>
+                  单次诊断超时（秒）
+                  <input
+                    type="number"
+                    min={5}
+                    max={600}
+                    value={cfg.run.timeoutSeconds}
+                    onChange={(e) =>
+                      setCfg({ ...cfg, run: { ...cfg.run, timeoutSeconds: Number(e.target.value) } })
+                    }
+                  />
+                  <span className="muted small">超时后用已有证据收敛，不是一直等。</span>
+                </label>
+                <h4>模型</h4>
+                <label>
+                  模型调用超时（秒）
+                  <input
+                    type="number"
+                    min={5}
+                    max={300}
+                    value={cfg.model.timeoutSeconds}
+                    onChange={(e) =>
+                      setCfg({ ...cfg, model: { ...cfg.model, timeoutSeconds: Number(e.target.value) } })
+                    }
+                  />
+                  <span className="muted small">一次模型请求最多等多久。</span>
+                </label>
+                <label>
+                  模型温度（0–1）
+                  <input
+                    type="number"
+                    min={0}
+                    max={1}
+                    step={0.1}
+                    value={cfg.model.temperature}
+                    onChange={(e) =>
+                      setCfg({ ...cfg, model: { ...cfg.model, temperature: Number(e.target.value) } })
+                    }
+                  />
+                  <span className="muted small">越低越按证据说话，越高越自由发挥。诊断场景建议保持 0.2。</span>
+                </label>
+                <h4>修复上限</h4>
+                <label>
+                  修复最大内存（Mi）
+                  <input
+                    type="number"
+                    min={128}
+                    max={16384}
+                    value={cfg.repair.maxMemoryMi}
+                    onChange={(e) =>
+                      setCfg({ ...cfg, repair: { ...cfg.repair, maxMemoryMi: Number(e.target.value) } })
+                    }
+                  />
+                  <span className="muted small">
+                    修复建议的新值上限，默认 4096（即 4Gi）。超过这个值的新值会被校验拒绝。
+                  </span>
+                </label>
+                <label>
+                  修复最大倍数
+                  <input
+                    type="number"
+                    min={1}
+                    max={10}
+                    value={cfg.repair.maxRatio}
+                    onChange={(e) =>
+                      setCfg({ ...cfg, repair: { ...cfg.repair, maxRatio: Number(e.target.value) } })
+                    }
+                  />
+                  <span className="muted small">
+                    新值不超过旧值的几倍，默认 4。两个上限取更严的那一个。
+                  </span>
+                </label>
+                <p className="muted small">
+                  模型 API Key 不在这里改：Key 只从环境变量 MODEL_API_KEY 读。
+                </p>
+              </div>
+            )}
+            {cfgSaved && <div className="notice">{cfgSaved}</div>}
+            <div className="modal-actions">
+              <button className="primary" onClick={() => void saveSettings()} disabled={!cfg || cfgSaving}>
+                {cfgSaving ? '保存中…' : '保存'}
+              </button>
+              <button onClick={() => setSettingsOpen(false)}>关闭</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

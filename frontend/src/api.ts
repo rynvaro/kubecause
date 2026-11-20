@@ -2,6 +2,7 @@
 // 所有接口都是同源的 /api/*，开发模式下 Vite 会代理到 Go 服务。
 
 import type {
+  AppConfig,
   ChatReply,
   Conversation,
   ConversationMessage,
@@ -105,5 +106,18 @@ export async function decideApproval(
   return request<DecisionResponse>(`/api/runs/${runId}/approvals/${approvalId}/decision`, {
     method: 'POST',
     body: JSON.stringify({ decision, approver: 'varo' }),
+  })
+}
+
+// 配置中心（Slice 8）：GET 读当前配置，POST 保存并热加载。
+// 返回里没有 MODEL_API_KEY——Key 只从环境变量读，前端拿不到它、也改不了它。
+export async function getConfig(): Promise<AppConfig> {
+  return request<AppConfig>('/api/config')
+}
+
+export async function updateConfig(cfg: AppConfig): Promise<{ config: AppConfig; note: string }> {
+  return request<{ config: AppConfig; note: string }>('/api/config', {
+    method: 'POST',
+    body: JSON.stringify(cfg),
   })
 }

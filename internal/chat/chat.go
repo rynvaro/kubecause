@@ -25,17 +25,22 @@ import (
 	"strings"
 
 	"kubecause/internal/agent"
+	"kubecause/internal/config"
 	"kubecause/internal/model"
 	"kubecause/internal/repair"
 	"kubecause/internal/store"
 )
 
-// MaxHistoryMessages 是每次调用模型时带上的历史消息上限。
-const MaxHistoryMessages = 10
+// DefaultMaxChatSteps 是一轮对话里模型默认最多调工具的次数：12。
+// MaxChatSteps 是预算，不是决策：调大它不干预模型怎么选工具，
+// 只是允许模型在一轮里查得更多；步数用完时后端返回已查到的半成品，
+// 而不是直接报错（见 real.go）。
+// 单次诊断的预算是另外的 8 步（internal/run/worker.go + store 的默认值），
+// 两条线不要混成一个数。
+const DefaultMaxChatSteps = 12
 
-// MaxChatSteps 是一轮对话里模型最多调工具的次数，
-// 和单次诊断的 8 步上限一致，防止模型无限循环烧 token。
-const MaxChatSteps = 8
+// DefaultMaxHistoryMessages 是每次调用模型时默认带上的历史消息数：10。
+const DefaultMaxHistoryMessages = 10
 
 // ToolCallRecord 是一轮对话里调过的一个工具，
 // 存进 messages.tool_calls，前端能看到每一步调了什么。
@@ -61,15 +66,53 @@ type Reply struct {
 }
 
 // Service 持有对话所需的依赖：存储、只读工具、模型。
+// MaxSteps / MaxHistoryMessages 不再是写死的常量，而是从配置中心读：
+// 启动时 main.go 调 ApplyConfig 填进去，POST /api/config 热更新时再调一次。
+// 字段是导出的，测试可以直接改；<=0 时回落到默认值，
+// 防止配置中心出问题时对话一步工具都调不了。
 type Service struct {
 	Store *store.Store
 	Tools agent.Tools
 	Model agent.Model
+	// MaxSteps 是一轮对话的工具步数预算，默认 12。
+	MaxSteps int
+	// MaxHistoryMessages 是每次调用模型带上的历史消息数，默认 10。
+	MaxHistoryMessages int
 }
 
-// NewService 组装对话服务。
+// NewService 组装对话服务，步数和历史数先用默认值，
+// main.go 启动时再用配置中心的值覆盖（见 ApplyConfig）。
 func NewService(s *store.Store, tools agent.Tools, m agent.Model) *Service {
-	return &Service{Store: s, Tools: tools, Model: m}
+	return &Service{
+		Store: s, Tools: tools, Model: m,
+		MaxSteps: DefaultMaxChatSteps, MaxHistoryMessages: DefaultMaxHistoryMessages,
+	}
+}
+
+// ApplyConfig 把配置中心的值应用到对话服务：热加载时调它，不用重启。
+func (s *Service) ApplyConfig(c config.Config) {
+	if c.Chat.MaxSteps > 0 {
+		s.MaxSteps = c.Chat.MaxSteps
+	}
+	if c.Chat.MaxHistoryMessages > 0 {
+		s.MaxHistoryMessages = c.Chat.MaxHistoryMessages
+	}
+}
+
+// maxSteps 返回本轮可用的步数预算，<=0 时回落默认值。
+func (s *Service) maxSteps() int {
+	if s.MaxSteps <= 0 {
+		return DefaultMaxChatSteps
+	}
+	return s.MaxSteps
+}
+
+// maxHistory 返回每次调用模型带上的历史消息数，<=0 时回落默认值。
+func (s *Service) maxHistory() int {
+	if s.MaxHistoryMessages <= 0 {
+		return DefaultMaxHistoryMessages
+	}
+	return s.MaxHistoryMessages
 }
 
 // lastMessages 取一个会话最近 N 条消息，给模型做上下文。
@@ -102,7 +145,7 @@ func (s *Service) RunMessage(ctx context.Context, conversationID, text string) (
 	}); err != nil {
 		return nil, err
 	}
-	history, err := s.lastMessages(ctx, conversationID, MaxHistoryMessages)
+	history, err := s.lastMessages(ctx, conversationID, s.maxHistory())
 	if err != nil {
 		return nil, err
 	}

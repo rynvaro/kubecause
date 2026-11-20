@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"kubecause/internal/agent"
+	"kubecause/internal/config"
 	"kubecause/internal/kube"
 	"kubecause/internal/model"
 	"kubecause/internal/run"
@@ -149,7 +150,7 @@ func TestChatHistoryTruncation(t *testing.T) {
 			ConversationID: conv, Role: "user", Content: "历史消息",
 		})
 	}
-	got, err := svc.lastMessages(ctx, conv, MaxHistoryMessages)
+	got, err := svc.lastMessages(ctx, conv, svc.MaxHistoryMessages)
 	if err != nil {
 		t.Fatalf("取历史失败: %v", err)
 	}
@@ -332,6 +333,118 @@ func TestRealCanonicalKeys(t *testing.T) {
 	}
 	if structured["overview"] == nil || structured["problemPods"] == nil {
 		t.Fatalf("刷新后 Structured 里仍应有 overview 和 problemPods，得到 %v", structured)
+	}
+}
+
+// TestChatMaxStepsFromConfig 覆盖“步数从配置里读”：
+// 配置中心改 chat.maxSteps 后，ApplyConfig 应把新值应用到对话服务，
+// 下一轮对话就按新预算跑，不用重启。
+func TestChatMaxStepsFromConfig(t *testing.T) {
+	svc, _ := newTestService(t)
+	if svc.MaxSteps != 12 {
+		t.Fatalf("默认对话步数应是 12，得到 %d", svc.MaxSteps)
+	}
+	cfg := config.Defaults()
+	cfg.Chat.MaxSteps = 16
+	cfg.Chat.MaxHistoryMessages = 5
+	svc.ApplyConfig(cfg)
+	if svc.MaxSteps != 16 {
+		t.Fatalf("ApplyConfig 后对话步数应是 16，得到 %d", svc.MaxSteps)
+	}
+	if svc.MaxHistoryMessages != 5 {
+		t.Fatalf("ApplyConfig 后历史条数应是 5，得到 %d", svc.MaxHistoryMessages)
+	}
+	// 配置里改回文件默认值再应用，应回到 12 / 10。
+	svc.ApplyConfig(config.Defaults())
+	if svc.MaxSteps != 12 || svc.MaxHistoryMessages != 10 {
+		t.Fatalf("改回默认配置后应是 12 / 10，得到 %d / %d", svc.MaxSteps, svc.MaxHistoryMessages)
+	}
+}
+
+// TestRealStepsExhaustedReturnsPartial 覆盖 Slice 8 的“步数用完返回半成品”：
+// mock 模型一直调工具、永远不给最终回答，步数用完后对话不应报错，
+// 而应返回已经查到的总览和问题 Pod（structured 里有 overview 和 problemPods），
+// 文字里写明“步数用完了，还没来得及总结”，并问用户想深入查哪个目标。
+// 以前这里直接 return error，前端只剩一片空白加一句
+// “请换个更具体的问题再问”，等于把预算用完的锅推给用户。
+func TestRealStepsExhaustedReturnsPartial(t *testing.T) {
+	// mock 模型：每次都返回一个工具调用，交替调总览和问题 Pod，
+	// 永远不给最终回答，逼出步数用完的分支。
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		name := "get_cluster_overview"
+		if calls%2 == 0 {
+			name = "list_problem_pods"
+		}
+		_, _ = fmt.Fprintf(w, `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call-%d","type":"function","function":{"name":%q,"arguments":"{}"}}]}}]}`, calls, name)
+	}))
+	defer srv.Close()
+	ctx := context.Background()
+	s, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("打开内存库失败: %v", err)
+	}
+	defer s.Close()
+	real := model.NewRealWithConfig(model.RealConfig{
+		APIKey: "test-key", BaseURL: srv.URL, ModelName: "mock",
+		HTTPClient: srv.Client(), MaxRetries: 0,
+	})
+	svc := NewService(s, &run.ToolsAdapter{Kube: kube.NewFake()}, real)
+	// 步数预算压到 2 步，跑得快，也正好覆盖“总览 2 步就够”的场景。
+	svc.MaxSteps = 2
+	conv := newConversation(t, svc)
+	reply, err := svc.RunMessage(ctx, conv, "当前状态怎么样")
+	if err != nil {
+		t.Fatalf("步数用完应返回半成品、不应报错，得到错误: %v", err)
+	}
+	if reply == nil {
+		t.Fatalf("应返回半成品回复")
+	}
+	if !strings.Contains(reply.Reply, "步数用完了") {
+		t.Fatalf("半成品文字应说明步数用完了，得到 %q", reply.Reply)
+	}
+	if !strings.Contains(reply.Reply, "还没来得及总结") {
+		t.Fatalf("半成品文字应说明还没来得及总结，得到 %q", reply.Reply)
+	}
+	if !strings.Contains(reply.Reply, "想深入查哪个") {
+		t.Fatalf("半成品文字应问用户想深入查哪个目标，得到 %q", reply.Reply)
+	}
+	if strings.Contains(reply.Reply, "换个更具体的问题") {
+		t.Fatalf("半成品文字不应再让用户换问题背锅，得到 %q", reply.Reply)
+	}
+	if reply.Structured["overview"] == nil {
+		t.Fatalf("半成品 Structured 里应有总览，得到 %+v", reply.Structured)
+	}
+	if reply.Structured["problemPods"] == nil {
+		t.Fatalf("半成品 Structured 里应有问题 Pod，得到 %+v", reply.Structured)
+	}
+	if len(reply.ToolCalls) != 2 {
+		t.Fatalf("半成品应记录 2 步工具调用，得到 %d 步", len(reply.ToolCalls))
+	}
+	// 半成品要正常落盘成一条助手消息：刷新会话后还能看到总览卡片和问题 Pod 表，
+	// 而不是只在当次返回里有。
+	msgs, _ := s.ListMessages(ctx, conv)
+	var lastAssistant *store.ConversationMessage
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "assistant" {
+			lastAssistant = &msgs[i]
+			break
+		}
+	}
+	if lastAssistant == nil {
+		t.Fatalf("历史里应有半成品助手消息")
+	}
+	if !strings.Contains(lastAssistant.Content, "步数用完了") {
+		t.Fatalf("落盘的半成品消息应包含步数说明，得到 %q", lastAssistant.Content)
+	}
+	var structured map[string]any
+	if err := json.Unmarshal([]byte(lastAssistant.Structured), &structured); err != nil {
+		t.Fatalf("半成品 Structured 应是合法 JSON: %v", err)
+	}
+	if structured["overview"] == nil || structured["problemPods"] == nil {
+		t.Fatalf("刷新后半成品 Structured 里仍应有 overview 和 problemPods，得到 %v", structured)
 	}
 }
 

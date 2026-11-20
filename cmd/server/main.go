@@ -31,6 +31,7 @@ import (
 	"kubecause/internal/agent"
 	"kubecause/internal/api"
 	"kubecause/internal/chat"
+	"kubecause/internal/config"
 	"kubecause/internal/knowledge"
 	"kubecause/internal/kube"
 	"kubecause/internal/model"
@@ -45,6 +46,36 @@ func env(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// findConfigPath 找配置文件：CONFIG_PATH 显式指定时用它，
+// 否则依次试 config.yaml、../config.yaml、../../config.yaml
+// （从仓库根目录、cmd/server、或 go run 的不同工作目录启动时都能找到）。
+// 都找不到时返回 "config.yaml"：用默认值跑，
+// POST /api/config 第一次保存时会在仓库根目录创建它。
+func findConfigPath() string {
+	if p := os.Getenv("CONFIG_PATH"); p != "" {
+		return p
+	}
+	for _, p := range []string{"config.yaml", "../config.yaml", "../../config.yaml"} {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return "config.yaml"
+}
+
+// applyConfig 把配置中心的值应用到各组件：
+// 对话服务的步数/历史数、任务创建默认值、修复上限、真模型的超时/温度。
+// 启动时调一次，POST /api/config 热更新时再调一次，不用重启。
+// realModel 为 nil 时（stub 模式）跳过模型那一项。
+func applyConfig(cfg config.Config, chatSvc *chat.Service, realModel *model.Real) {
+	chatSvc.ApplyConfig(cfg)
+	store.ApplyRunDefaults(cfg.Run.MaxSteps, cfg.Run.TimeoutSeconds)
+	repair.ApplyLimits(cfg.Repair.MaxMemoryMi, cfg.Repair.MaxRatio)
+	if realModel != nil {
+		realModel.ApplyModelSettings(time.Duration(cfg.Model.TimeoutSeconds)*time.Second, cfg.Model.Temperature)
+	}
 }
 
 // spaHandler 托管 React 单页应用：
@@ -71,7 +102,21 @@ func main() {
 	kubeMode := strings.ToLower(env("KUBE_MODE", "fake"))
 	modelMode := strings.ToLower(env("MODEL_MODE", "stub"))
 
-	log.Printf("KubeCause Slice 5 启动：KUBE_MODE=%s MODEL_MODE=%s DB_PATH=%s ADDR=%s", kubeMode, modelMode, dbPath, addr)
+	log.Printf("KubeCause Slice 8 启动：KUBE_MODE=%s MODEL_MODE=%s DB_PATH=%s ADDR=%s", kubeMode, modelMode, dbPath, addr)
+
+	// 0. 配置中心（Slice 8）：先读 config.yaml，没有文件用默认值，
+	// 环境变量可覆盖（例如 CHAT_MAX_STEPS=16）。校验失败时启动失败，
+	// 不让服务带着非法配置跑起来。
+	// MODEL_API_KEY 不在这里：它只从环境变量读，绝不进配置文件。
+	cfgPath := findConfigPath()
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		log.Fatalf("加载配置失败: %v", err)
+	}
+	cfgMgr := config.NewManager(cfg, cfgPath)
+	log.Printf("配置已加载（%s）：对话步数=%d 历史=%d 单次诊断步数=%d 超时=%ds 模型超时=%ds 温度=%.2f 修复上限=%dMi/%d倍",
+		cfgPath, cfg.Chat.MaxSteps, cfg.Chat.MaxHistoryMessages, cfg.Run.MaxSteps, cfg.Run.TimeoutSeconds,
+		cfg.Model.TimeoutSeconds, cfg.Model.Temperature, cfg.Repair.MaxMemoryMi, cfg.Repair.MaxRatio)
 
 	// 1. 打开 SQLite，启动时自动执行迁移。
 	st, err := store.Open(dbPath)
@@ -136,7 +181,9 @@ func main() {
 	// 4. 按 MODEL_MODE 组装模型。
 	// Slice 2：real 从环境变量读 Key / BaseURL / ModelName，
 	// Key 缺失时启动就明确报错，不让服务带着调不通的模型跑起来。
+	// 超时和温度由配置中心给（见下面的 applyConfig）。
 	var m agent.Model
+	var realModel *model.Real
 	switch modelMode {
 	case "stub":
 		m = model.NewStub()
@@ -145,6 +192,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("MODEL_MODE=real 但无法创建真模型: %v", err)
 		}
+		realModel = real
 		m = real
 		log.Printf("使用真模型：base_url=%s model=%s（Key 只从环境变量读，不写进文件）", env("MODEL_BASE_URL", "https://api.deepseek.com/v1"), env("MODEL_NAME", "deepseek-chat"))
 	default:
@@ -178,7 +226,18 @@ func main() {
 	// 但只读，不生成提案、不执行修复。
 	chatSvc := chat.NewService(st, tools, m)
 
-	handler := &api.Handler{Store: st, Chat: chatSvc}
+	// 配置中心应用到各组件（Slice 8）：对话步数、任务默认值、
+	// 修复上限、真模型超时/温度。POST /api/config 后 OnConfigChange
+	// 会再调一次 applyConfig，热加载不用重启。
+	applyConfig(cfg, chatSvc, realModel)
+
+	handler := &api.Handler{
+		Store: st, Chat: chatSvc, Config: cfgMgr,
+		OnConfigChange: func(c config.Config) {
+			applyConfig(c, chatSvc, realModel)
+			log.Printf("配置已热更新：对话步数=%d 单次诊断步数=%d 温度=%.2f", c.Chat.MaxSteps, c.Run.MaxSteps, c.Model.Temperature)
+		},
+	}
 	mux := http.NewServeMux()
 	handler.Register(mux)
 	// React 前端（Slice 5）：go:embed 把 web/dist 打进二进制，

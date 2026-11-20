@@ -203,3 +203,56 @@ func TestTruncateRunes(t *testing.T) {
 		t.Fatalf("工具定义应能编码成 JSON: %v", err)
 	}
 }
+
+// TestToolDescriptionsDescribeOnly 覆盖 Slice 8 的“工具描述只描述、不禁止”：
+// 每个工具的 description 只能写它返回什么、覆盖多大范围，
+// 不能写“不要调 xxx”“不再需要调 xxx”这种禁止句。
+// 禁止句是替模型做决策：模型该调哪个工具，应由它按返回内容自己判断。
+// 同时要求发现工具的描述讲清“不带 namespace 时查全部、带时只查那个”。
+func TestToolDescriptionsDescribeOnly(t *testing.T) {
+	defs := toolDefs()
+	if len(defs) != 11 {
+		t.Fatalf("工具表应有 11 个定义（10 个工具 + submit_diagnosis），得到 %d", len(defs))
+	}
+	banned := []string{"不要调", "不再需要", "不需要调", "不要查", "不要再调", "禁止调"}
+	for _, d := range defs {
+		desc := d.Function.Description
+		if strings.TrimSpace(desc) == "" {
+			t.Fatalf("工具 %s 的描述不能为空", d.Function.Name)
+		}
+		for _, b := range banned {
+			if strings.Contains(desc, b) {
+				t.Fatalf("工具 %s 的描述里不应有禁止句 %q，得到 %q", d.Function.Name, b, desc)
+			}
+		}
+		for _, p := range d.Function.Parameters["properties"].(map[string]any) {
+			if pm, ok := p.(map[string]any); ok {
+				if ds, ok := pm["description"].(string); ok {
+					for _, b := range banned {
+						if strings.Contains(ds, b) {
+							t.Fatalf("工具 %s 的参数描述里不应有禁止句 %q，得到 %q", d.Function.Name, b, ds)
+						}
+					}
+				}
+			}
+		}
+	}
+	// 发现工具必须讲清返回范围：总览一次返回全集群汇总，
+	// 问题 Pod 不带 namespace 时查全部、带时只查那个。
+	byName := map[string]string{}
+	for _, d := range defs {
+		byName[d.Function.Name] = d.Function.Description
+	}
+	if !strings.Contains(byName["get_cluster_overview"], "全集群") {
+		t.Fatalf("get_cluster_overview 应讲清一次返回全集群汇总，得到 %q", byName["get_cluster_overview"])
+	}
+	if !strings.Contains(byName["list_problem_pods"], "全部命名空间") {
+		t.Fatalf("list_problem_pods 应讲清不带 namespace 时查全部命名空间，得到 %q", byName["list_problem_pods"])
+	}
+	if !strings.Contains(byName["list_namespaces"], "只返回名字") {
+		t.Fatalf("list_namespaces 应讲清只返回名字列表，得到 %q", byName["list_namespaces"])
+	}
+	if !strings.Contains(byName["list_deployments"], "不返回 Pod 详情") {
+		t.Fatalf("list_deployments 应讲清不返回 Pod 详情，得到 %q", byName["list_deployments"])
+	}
+}

@@ -127,6 +127,16 @@ h5 { font-size: 13px; margin: 10px 0 4px; }
 .conf-medium { background: #fff3e0; color: #b26a00; }
 .conf-low { background: #fdecea; color: #b3261e; }
 
+/* 设置弹窗（Slice 8，配置中心）：遮罩 + 居中卡片，表单每行一格。 */
+.modal-overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.4); display: flex; align-items: flex-start; justify-content: center; padding: 60px 16px; z-index: 10; }
+.modal { background: #fff; border-radius: 10px; padding: 20px 24px; width: 560px; max-width: 100%; max-height: calc(100vh - 120px); overflow-y: auto; }
+.modal h3 { margin-top: 0; }
+.modal .notice { border-radius: 6px; margin: 12px 0; }
+.settings-form label { display: block; margin: 10px 0; font-size: 14px; }
+.settings-form label input { display: block; width: 160px; margin: 4px 0; }
+.settings-form label .small { display: block; margin-top: 2px; }
+.modal-actions { display: flex; gap: 8px; margin-top: 16px; }
+
 @media (max-width: 1000px) {
   .layout { grid-template-columns: 200px 1fr; }
   .activity { display: none; }

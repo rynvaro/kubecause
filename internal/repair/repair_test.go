@@ -111,6 +111,37 @@ func TestValidatePatchSpecWhitelist(t *testing.T) {
 	}
 }
 
+// TestApplyLimitsFromConfig 覆盖“修复上限从配置中心读”：
+// ApplyLimits 改了上限后，ValidatePatchSpec 按新上限校验；
+// 改回默认值后恢复。包级变量改完必须在测试结束时还原，
+// 否则会污染同包的其他测试（它们默认用 4 倍 / 4Gi）。
+func TestApplyLimitsFromConfig(t *testing.T) {
+	oldMi, oldRatio := MaxMemoryMi, MaxRatio
+	t.Cleanup(func() { MaxMemoryMi, MaxRatio = oldMi, oldRatio })
+
+	// 上限收紧到 2 倍 / 512Mi：原来合法的 128Mi -> 512Mi（4 倍）应被拒绝。
+	ApplyLimits(512, 2)
+	if err := ValidatePatchSpec("demo", "demo-api", "demo-api", "128Mi", "512Mi"); err == nil {
+		t.Fatalf("上限改成 2 倍后，4 倍的新值应被拒绝")
+	}
+	if err := ValidatePatchSpec("demo", "demo-api", "demo-api", "128Mi", "256Mi"); err != nil {
+		t.Fatalf("上限改成 2 倍后，2 倍的新值应通过: %v", err)
+	}
+	if err := ValidatePatchSpec("demo", "demo-api", "demo-api", "256Mi", "1Gi"); err == nil {
+		t.Fatalf("上限改成 512Mi 后，1Gi 的新值应被拒绝")
+	}
+	// 非法值不改：上限保持 512Mi / 2 倍。
+	ApplyLimits(0, 0)
+	if MaxMemoryMi != 512 || MaxRatio != 2 {
+		t.Fatalf("非法上限不应改动当前值，得到 %dMi / %d 倍", MaxMemoryMi, MaxRatio)
+	}
+	// 改回默认值 4096Mi / 4 倍，恢复 Slice 7 的行为。
+	ApplyLimits(4096, 4)
+	if err := ValidatePatchSpec("demo", "demo-api", "demo-api", "128Mi", "512Mi"); err != nil {
+		t.Fatalf("改回默认上限后 4 倍应通过: %v", err)
+	}
+}
+
 // TestExecuteOldValueMismatchExpires 覆盖“旧值不匹配拒绝”：
 // 提案旧值是 64Mi，但集群现状是 128Mi，执行前校验应标为过期，不 Patch。
 func TestExecuteOldValueMismatchExpires(t *testing.T) {

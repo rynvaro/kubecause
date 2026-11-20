@@ -1,12 +1,61 @@
-# KubeCause — Kubernetes 故障诊断 Agent（Slice 7）
+# KubeCause — Kubernetes 故障诊断 Agent（Slice 8）
 
 KubeCause 是一个 Kubernetes 故障诊断 Agent。用户选定 namespace 和 Pod 或 Deployment，描述故障现象，Agent 自主选择只读工具收集证据，检索排障手册，输出诊断结论和建议。演示环境支持一类人工审批后的变更，即调整指定 Deployment 的容器内存限制，并验证变更后的运行状态。
 
-Slice 7 修的是用户在 Mac 真机（kind + 真模型）上反馈的 6 个问题，外加一个全新的故障案例 ImagePullBackOff，供用户测试 Agent 的通用发现能力。核心是三件事：**白屏不再发生**（后端报告空数组归一化 + 前端判空 + 错误边界）、**聊天不再是纯文本**（后端真模型路径存规范 key + 前端轻量 Markdown 渲染）、**正式诊断的按钮和位置说清楚**（只在有建议卡时显示，按时间顺序插进消息流）。
+Slice 8 修的是用户在 Mac 真机上反馈的“当前状态怎么样”8 步用完报错的问题（2026-11-20）：对话里问一句总览，页面中间一片空白，下面只有一句粉色报错“对话已达最大工具步数（8 步），请换个更具体的问题再问”。核心是三件事：**步数是预算不是决策**（MaxChatSteps 从 8 调到 12，步数用完返回已查到的半成品，不再直接报错）、**工具描述只描述、不禁止**（讲清每个工具返回什么、覆盖多大范围，删掉“不要调 xxx”这种替模型做决策的禁止句）、**提示词改成先给总览、等追问再深挖**（一轮里不要既看全貌又深挖）。另外加了一个轻量配置中心：`config.yaml` + 环境变量覆盖 + `GET/POST /api/config` 热加载，前端“设置”页能改，不用重启。
 
-Slice 1/2/3/4/5/6 已有的东西没有重写：SQLite 表、HTTP 接口、Worker 状态机、Agent 循环的校验和恢复、fake 客户端、桩模型、真模型适配器、FTS5 检索、条件 Patch 与 rollout 验证、对话会话、发现工具、React 前端，全部保留并做了回归。
+Slice 1/2/3/4/5/6/7 已有的东西没有重写：SQLite 表、HTTP 接口、Worker 状态机、Agent 循环的校验和恢复、fake 客户端、桩模型、真模型适配器、FTS5 检索、条件 Patch 与 rollout 验证、对话会话、发现工具、React 前端，全部保留并做了回归。
+
+## Slice 8 改了什么
+
+- **MaxChatSteps 从 8 改成 12，步数用完返回半成品，不再直接报错**（`internal/chat/chat.go`、`internal/chat/real.go`）：根因不是模型不会决策，是预算太小 + 预算用完时后端直接 `return error`，RunMessage 把错误丢回前端，用户看到的是空白加一句“请换个更具体的问题再问”——等于把预算用完的锅推给用户，问题本身（“当前状态怎么样”）一点错没有。修法两层：预算调到 12（对话专用，单次诊断的 8 步不动）；`runReal` 循环跑完 12 步还没收敛时，把已经查到的工具结果（`outputs` 的摘要 + `structured` 的规范 key）整理成半成品回复返回，文字写“已经查到了这些，但步数用完了，还没来得及总结：”然后列出已查到的总览和问题 Pod，再问“你想深入查哪个命名空间或 Pod？”。RunMessage 把半成品正常落盘成一条助手消息，前端按 `structured` 里的 `overview` / `problemPods` 正常渲染卡片和表格，刷新后也还在。MaxChatSteps 是预算不是决策：调大它不干预模型怎么选工具，只是允许一轮里查得更多。
+- **工具描述补全，只描述、不禁止**（`internal/model/model.go` 的 `toolDefs`）：每个工具的 description 现在讲清返回什么、覆盖多大范围，例如 `get_cluster_overview` 一次返回全集群汇总（节点数、命名空间数、Deployment 数、Pod 数、有问题 Pod 数），`list_problem_pods` 不带 namespace 时一次返回全部命名空间的有问题 Pod、带时只返回那个命名空间的，`list_namespaces` 只返回名字列表、不返回 Pod 状态，`list_deployments` 返回某个命名空间的 Deployment 列表、不返回 Pod 详情。描述里不写“不要调 xxx”“不再需要调 xxx”这种禁止句——该调哪个由模型按返回内容自己判断，写死禁止规则是替模型做决策。新增测试 `TestToolDescriptionsDescribeOnly`，描述里出现禁止句就失败。
+- **提示词改成“先给总览，等追问再深挖”**（`internal/chat/real.go` 的 `chatSystemPrompt`）：原来“先用发现工具看全貌、找问题，再用定向工具深挖”会鼓励模型一轮里既看全貌又深挖，浪费步数。现在改成：总览问题先查全集群状态、给出摘要就停下来，等用户追问某个命名空间或 Pod 时再深挖，不要在一轮里把所有命名空间、所有 Pod 都查完。没有写死“总览就是 2 个工具”——调几个工具由模型自己判断。指代消解、只读、诚实、修复建议必须结构化返回这几条原样保留。
+- **配置中心（轻量）**（新增 `internal/config/config.go`、`config.yaml`，`internal/api/api.go`、`cmd/server/main.go`）：配置文件 `config.yaml` 放仓库根目录，字段有 `chat.maxSteps`（12）、`chat.maxHistoryMessages`（10）、`run.maxSteps`（8）、`run.timeoutSeconds`（60）、`model.timeoutSeconds`（30）、`model.temperature`（0.2）、`repair.maxMemoryMi`（4096）、`repair.maxRatio`（4）。启动时先读文件，没有文件用默认值；环境变量可以覆盖（`CHAT_MAX_STEPS`、`CHAT_MAX_HISTORY_MESSAGES`、`RUN_MAX_STEPS`、`RUN_TIMEOUT_SECONDS`、`MODEL_TIMEOUT_SECONDS`、`MODEL_TEMPERATURE`、`REPAIR_MAX_MEMORY_MI`、`REPAIR_MAX_RATIO`），环境变量优先于文件。`GET /api/config` 读当前配置，`POST /api/config` 改配置：校验范围（非法值例如 `maxSteps=0`、`temperature=2` 返回 400，不保存、不生效），保存到 `config.yaml`，热加载不用重启。`MODEL_API_KEY` 绝不进配置中心：配置结构里没有这个字段，GET 不返回，前端不显示、不让改，Key 只从环境变量读。`internal/chat` 的步数/历史数、`internal/store` 的任务创建默认值、`internal/repair` 的上限（`MaxMemoryMi` / `MaxRatio` 从常量改成变量）、真模型的超时/温度，启动和热更新时都从配置中心读。
+- **前端“设置”页**（`frontend/src/App.tsx`、`frontend/src/api.ts`、`frontend/src/types.ts`、`frontend/src/index.css`）：header 旁边加了一个“设置”按钮，点开弹窗，8 个参数各一个输入框、带一句中文说明（例如“对话最大工具步数：模型一轮最多调几次工具，调大可以查得更全，但更慢更贵”），点“保存”调 `POST /api/config`，保存后显示“已保存，立即生效，不用重启”。半成品回复不需要前端特殊处理：它就是一条普通的助手消息，`StructuredView` 按 `overview` / `problemPods` 正常渲染卡片和表格；旧的“请换个更具体的问题再问”那句报错后端已经不再返回，前端也不再显示它。
+- **回归**：`go vet ./...` 通过，`go test ./...` 全部通过（含新增的配置加载/校验/热更新、步数用完返回半成品、配置中心 GET/POST、工具描述无禁止句、修复上限跟配置五个测试），`go run ./cmd/eval` 仍 3/3 通过；对话两轮能接上文、转正式诊断后审批执行验证全部回归通过。
+
+Slice 1/2/3/4/5/6/7 已有的东西没有重写：SQLite 表、HTTP 接口、Worker 状态机、Agent 循环的校验和恢复、fake 客户端、桩模型、真模型适配器、FTS5 检索、条件 Patch 与 rollout 验证、对话会话、发现工具、React 前端，全部保留并做了回归。
+
+## 配置中心
+
+`config.yaml`（仓库根目录）+ 环境变量覆盖 + `GET/POST /api/config` 热加载。启动时先读文件，没有文件用默认值；环境变量优先于文件；前端“设置”页改完点保存，立即生效，不用重启。
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `chat.maxSteps` | 12 | 对话最大工具步数：一轮对话里模型最多调几次工具。预算，不是决策——调大不干预模型怎么选工具，只是允许查得更多；步数用完返回半成品，不报错 |
+| `chat.maxHistoryMessages` | 10 | 每次调用模型时带上的历史消息数，更早的消息数据库里全量保留 |
+| `run.maxSteps` | 8 | 单次诊断（/api/runs）最大工具步数，和对话的 12 步分开 |
+| `run.timeoutSeconds` | 60 | 单次诊断整体超时秒数，超时后用已有证据收敛 |
+| `model.timeoutSeconds` | 30 | 每次模型 API 调用的超时秒数 |
+| `model.temperature` | 0.2 | 模型温度，0–1，越低越按证据说话 |
+| `repair.maxMemoryMi` | 4096 | 修复建议的新值上限（MiB），即 4Gi |
+| `repair.maxRatio` | 4 | 修复新值不超过旧值的倍数，两个上限取更严的那一个 |
+
+环境变量覆盖（部署时用，不用改文件）：`CHAT_MAX_STEPS`、`CHAT_MAX_HISTORY_MESSAGES`、`RUN_MAX_STEPS`、`RUN_TIMEOUT_SECONDS`、`MODEL_TIMEOUT_SECONDS`、`MODEL_TEMPERATURE`、`REPAIR_MAX_MEMORY_MI`、`REPAIR_MAX_RATIO`。配置文件路径可用 `CONFIG_PATH` 指定，默认找 `config.yaml`（依次试当前目录、`../config.yaml`、`../../config.yaml`）。
+
+`MODEL_API_KEY` 绝不进配置中心：不写进 `config.yaml`、不出现在 `GET /api/config` 的返回里、前端不显示、不让改，只从环境变量读。
+
+注意：通过前端“设置”页保存后，`config.yaml` 里的注释会被重写掉（YAML 序列化不保留注释），值本身不变；想保留注释就直接改文件后重启，或改完文件再用前端改一次值。
+
+```bash
+# 读当前配置
+curl -s http://localhost:8080/api/config
+
+# 改一个值（对话步数改成 16），保存后立即生效，不用重启
+curl -s -X POST http://localhost:8080/api/config \
+  -H 'Content-Type: application/json' \
+  -d '{"chat":{"maxSteps":16,"maxHistoryMessages":10},"run":{"maxSteps":8,"timeoutSeconds":60},"model":{"timeoutSeconds":30,"temperature":0.2},"repair":{"maxMemoryMi":4096,"maxRatio":4}}'
+
+# 非法值会被拒绝（400），旧配置继续生效
+curl -s -X POST http://localhost:8080/api/config \
+  -H 'Content-Type: application/json' \
+  -d '{"chat":{"maxSteps":0,"maxHistoryMessages":10},"run":{"maxSteps":8,"timeoutSeconds":60},"model":{"timeoutSeconds":30,"temperature":0.2},"repair":{"maxMemoryMi":4096,"maxRatio":4}}'
+```
 
 ## Slice 7 改了什么
+
+Slice 7 修的是用户在 Mac 真机（kind + 真模型）上反馈的 6 个问题，外加一个全新的故障案例 ImagePullBackOff，供用户测试 Agent 的通用发现能力。核心是三件事：**白屏不再发生**（后端报告空数组归一化 + 前端判空 + 错误边界）、**聊天不再是纯文本**（后端真模型路径存规范 key + 前端轻量 Markdown 渲染）、**正式诊断的按钮和位置说清楚**（只在有建议卡时显示，按时间顺序插进消息流）。
 
 - **修白屏（最优先）**（`internal/agent/agent.go`、`internal/model/model.go`、`internal/chat/real.go`、`frontend/src/components.tsx`、`frontend/src/types.ts`）：根因是真模型返回的 JSON 缺字段时，Go 解出来是 nil，再序列化成 JSON 就是 null，前端读 `report.facts.length` 直接抛错，整个 React 应用白屏。修法三层：后端 `Report.Normalize()` 把 facts、evidenceIds、recommendations、openQuestions 缺失时补成空数组，`ValidateReport` 和 `parseDiagnosisArgs` 都会调它，序列化出来是 `[]` 而不是 null；前端 `normalizeReport` 再兜一层，历史库里旧的 null 报告也能渲染，`ReportView`、`OverviewCards`、`PodTable`、`DeploymentTable`、`buildBlocks` 里所有 `.length`、`.map` 的地方都先判空；再加一个 React `ErrorBoundary` 包住聊天消息区和正式诊断卡片，某个卡片渲染出错时只显示“这个卡片渲染失败了，请刷新重试”，不让整个页面白屏。新增测试 `TestReportNormalizeEmptyArrays` 和 `TestValidateReportNormalizes`。
 - **正式诊断按钮说清楚 + 只在有建议时显示 + 快照按时间顺序**（`frontend/src/App.tsx`、`frontend/src/components.tsx`）：按钮文案从“转成正式诊断”改成“创建可审批的修复任务”，下面加一句小字解释：“生成一份带提案的诊断任务，人工审批后才会执行，不会直接改集群。”输入框旁边的按钮删掉了——没有建议卡时点它没有意义，入口只在修复建议卡上。快照卡片不再固定在聊天底部：转换时记下最后一条消息的 id 作为锚点，审批卡插在那条消息后面按时间顺序出现，之后再发的新问题会出现在它下面。**聊天和正式诊断的区别**：聊天是探索，只读不改，没有审批，没有执行记录；正式诊断是一个任务，有 runId、有状态、有步骤、有报告、有提案、有审批、有执行和验证，全都存在数据库里，能审计，能重启后恢复。按钮存在是因为聊天不能直接动手改集群，必须先生成一个正式任务走人工审批——这是安全边界，不是多余的一步。
@@ -149,6 +198,15 @@ make eval-real  # 真模型评估，无 Key 时明确跳过，不报错
 | `ADDR` | `:8080` | 监听地址 |
 | `KUBECONFIG` | 空 | kind 模式下指定读身份的 kubeconfig 路径，不填用默认 |
 | `REPAIR_KUBECONFIG` | 空 | 写身份专用的 kubeconfig，不填时和读身份用同一个文件；生产上应指向写身份的文件 |
+| `CONFIG_PATH` | `config.yaml` | 配置中心文件路径；不填时依次找 `config.yaml`、`../config.yaml`、`../../config.yaml`，都找不到用默认值跑 |
+| `CHAT_MAX_STEPS` | 12 | 覆盖 `config.yaml` 的 `chat.maxSteps`，环境变量优先于文件 |
+| `CHAT_MAX_HISTORY_MESSAGES` | 10 | 覆盖 `chat.maxHistoryMessages` |
+| `RUN_MAX_STEPS` | 8 | 覆盖 `run.maxSteps` |
+| `RUN_TIMEOUT_SECONDS` | 60 | 覆盖 `run.timeoutSeconds` |
+| `MODEL_TIMEOUT_SECONDS` | 30 | 覆盖 `model.timeoutSeconds` |
+| `MODEL_TEMPERATURE` | 0.2 | 覆盖 `model.temperature` |
+| `REPAIR_MAX_MEMORY_MI` | 4096 | 覆盖 `repair.maxMemoryMi` |
+| `REPAIR_MAX_RATIO` | 4 | 覆盖 `repair.maxRatio` |
 
 ## 启动
 
@@ -353,6 +411,19 @@ curl -s "http://localhost:8080/api/runs/$RUN_ID"
 - 发现工具：`list_namespaces`、`list_deployments`、`list_problem_pods`、`get_cluster_overview`，全部只读，结构化返回
 - 对话模式：会话 + 消息持久化、最近 10 条历史截断、指代消解、对话只读、修复建议卡、转正式诊断
 - Runbook 扩到 8 篇，评估仍 3/3 通过；单次诊断、审批执行、rollout 验证全部回归通过
+
+## Slice 8 已实现
+
+- 对话步数 12 步（配置中心可改），步数用完返回半成品，不再直接报错
+- 工具描述补全：只讲返回什么、覆盖多大范围，不写“不要调 xxx”
+- 提示词“先给总览，等追问再深挖”，总览调几个工具由模型自己判断
+- 轻量配置中心：`config.yaml` + 环境变量覆盖 + `GET/POST /api/config` 热加载 + 前端“设置”页，`MODEL_API_KEY` 绝不进配置中心
+
+## Slice 8 未实现（仍未做）
+
+- 对话历史摘要（现在是截断，TODO 在代码和 README 里写清了）
+- 云端部署、鉴权、监控
+- 配置中心不做多环境切换、配置版本管理，那是部署层面的事
 
 ## Slice 4 未实现（Slice 5 已实现）
 

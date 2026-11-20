@@ -15,15 +15,22 @@ import (
 
 	"kubecause/internal/agent"
 	"kubecause/internal/chat"
+	"kubecause/internal/config"
 	"kubecause/internal/store"
 )
 
 // Handler 持有 Store。
 // Chat 是对话服务（Slice 4），为 nil 时会话接口返回 503，
 // 单次诊断接口不受影响。
+// Config 是配置中心（Slice 8），为 nil 时配置接口返回 503。
+// OnConfigChange 在 POST /api/config 成功后调用，
+// 由 main.go 把新配置应用到对话服务、任务默认值、修复上限和真模型，
+// 热加载不用重启。
 type Handler struct {
-	Store *store.Store
-	Chat  *chat.Service
+	Store          *store.Store
+	Chat           *chat.Service
+	Config         *config.Manager
+	OnConfigChange func(config.Config)
 }
 
 // CreateRunRequest 是 POST /api/runs 的请求体。
@@ -252,6 +259,11 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/conversations/{id}", h.GetConversation)
 	mux.HandleFunc("POST /api/conversations/{id}/messages", h.PostConversationMessage)
 	mux.HandleFunc("POST /api/conversations/{id}/convert", h.ConvertConversation)
+	// 配置中心（Slice 8）：读当前配置、改配置并热加载。
+	// 配置里没有 MODEL_API_KEY 这个字段——Key 只从环境变量读，
+	// 绝不进配置文件、绝不在这里返回、绝不在前端显示。
+	mux.HandleFunc("GET /api/config", h.GetConfig)
+	mux.HandleFunc("POST /api/config", h.UpdateConfig)
 	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -365,6 +377,47 @@ func (h *Handler) ConvertConversation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"runId": runID, "conversationId": id})
+}
+
+// ---------------------------------------------------------------------------
+// 配置中心（Slice 8）
+// ---------------------------------------------------------------------------
+
+// GetConfig 处理 GET /api/config，返回当前生效的配置。
+// 返回里没有 MODEL_API_KEY：配置结构本身就没有 Key 这个字段，
+// Key 只从环境变量读，前端也拿不到它。
+func (h *Handler) GetConfig(w http.ResponseWriter, r *http.Request) {
+	if h.Config == nil {
+		writeError(w, http.StatusServiceUnavailable, "配置中心未配置")
+		return
+	}
+	writeJSON(w, http.StatusOK, h.Config.Current())
+}
+
+// UpdateConfig 处理 POST /api/config：
+// 校验新配置 → 写回 config.yaml → 换掉内存里的当前值 → 通知各组件热加载。
+// 校验失败返回 400，旧配置继续生效，文件不被改写。
+func (h *Handler) UpdateConfig(w http.ResponseWriter, r *http.Request) {
+	if h.Config == nil {
+		writeError(w, http.StatusServiceUnavailable, "配置中心未配置")
+		return
+	}
+	var cfg config.Config
+	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+		writeError(w, http.StatusBadRequest, "请求体不是合法 JSON")
+		return
+	}
+	if err := h.Config.Update(cfg); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if h.OnConfigChange != nil {
+		h.OnConfigChange(cfg)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"config": cfg,
+		"note":   "已保存，立即生效，不用重启",
+	})
 }
 
 // 确保 context 被用到（以后接权限校验时用）。

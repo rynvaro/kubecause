@@ -21,6 +21,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"kubecause/internal/agent"
@@ -328,13 +329,16 @@ func (s *Stub) buildReport(in agent.ModelInput) *agent.Report {
 // ---------------------------------------------------------------------------
 
 // RealConfig 是真模型的配置，全部来自环境变量，不写进代码和仓库。
+// Timeout / Temperature 由配置中心（internal/config）填，
+// POST /api/config 热更新时调 Real.ApplyModelSettings 改，不用重启。
 type RealConfig struct {
-	APIKey     string
-	BaseURL    string // 例如 https://api.deepseek.com/v1，默认 DeepSeek
-	ModelName  string // 例如 deepseek-chat，默认 deepseek-chat
-	HTTPClient *http.Client
-	MaxRetries int           // 网络 / 429 / 5xx 的重试次数，默认 3
-	Timeout    time.Duration // 每次请求的超时，默认 30 秒
+	APIKey      string
+	BaseURL     string // 例如 https://api.deepseek.com/v1，默认 DeepSeek
+	ModelName   string // 例如 deepseek-chat，默认 deepseek-chat
+	HTTPClient  *http.Client
+	MaxRetries  int           // 网络 / 429 / 5xx 的重试次数，默认 3
+	Timeout     time.Duration // 每次请求的超时，默认 30 秒
+	Temperature float64       // 模型温度，0-1，诊断场景默认 0.2
 }
 
 func (c RealConfig) withDefaults() RealConfig {
@@ -363,8 +367,30 @@ func (c RealConfig) withDefaults() RealConfig {
 // 把 submit_diagnosis 映射成最终报告。
 // 工具名、namespace、参数的合法性不在这里最终决定，
 // Agent 的 ValidateToolCall 还会再校验一次。
+// mu 保护 cfg：配置中心热更新超时和温度时，
+// 正在进行的请求不能读到改了一半的配置。
 type Real struct {
+	mu  sync.RWMutex
 	cfg RealConfig
+}
+
+// getCfg 返回当前配置的一份拷贝。
+func (r *Real) getCfg() RealConfig {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.cfg
+}
+
+// ApplyModelSettings 热更新模型的超时和温度（配置中心 POST 后调），
+// 不用重启；温度非法时不改，保持旧值。
+func (r *Real) ApplyModelSettings(timeout time.Duration, temperature float64) {
+	if timeout <= 0 || temperature < 0 || temperature > 1 {
+		return
+	}
+	r.mu.Lock()
+	r.cfg.Timeout = timeout
+	r.cfg.Temperature = temperature
+	r.mu.Unlock()
 }
 
 // NewReal 返回真模型（兼容 Slice 1 的调用方式，默认 DeepSeek）。
@@ -455,18 +481,21 @@ func toolDefs() []chatToolDef {
 	}
 	ns := map[string]any{"namespace": strParam("命名空间，必须和任务一致")}
 	return []chatToolDef{
-		def("list_workload_pods", "列出指定 Deployment 下的 Pod", merge(ns, map[string]any{"deployment": strParam("Deployment 名称")}), []string{"namespace", "deployment"}),
-		def("get_pod", "查询单个 Pod 的状态、重启次数和上次终止原因", merge(ns, map[string]any{"pod": strParam("Pod 名称")}), []string{"namespace", "pod"}),
-		def("get_events", "查询和目标相关的 Events", merge(ns, map[string]any{"name": strParam("Pod 或 Deployment 名称")}), []string{"namespace", "name"}),
-		def("get_pod_logs", "读取指定容器的日志", merge(ns, map[string]any{"pod": strParam("Pod 名称"), "container": strParam("容器名"), "previous": map[string]any{"type": "boolean", "description": "是否读上一次容器的日志"}}), []string{"namespace", "pod"}),
-		def("get_deployment", "查询 Deployment 的副本数和容器资源配置", merge(ns, map[string]any{"deployment": strParam("Deployment 名称")}), []string{"namespace", "deployment"}),
-		def("search_runbooks", "检索排障手册", map[string]any{"query": strParam("检索关键词，例如 OOMKilled、ImagePullBackOff、Liveness probe failed")}, []string{"query"}),
+		def("list_workload_pods", "列出指定 Deployment 下的 Pod，返回 Pod 名字列表和数量；只返回名字，不返回每个 Pod 的状态、重启次数和事件，想看单个 Pod 的状态再调 get_pod", merge(ns, map[string]any{"deployment": strParam("Deployment 名称")}), []string{"namespace", "deployment"}),
+		def("get_pod", "查询单个 Pod，返回它的状态（phase）、重启次数、上次终止原因、容器等待原因和归属 Deployment；只返回这一个 Pod 的信息", merge(ns, map[string]any{"pod": strParam("Pod 名称")}), []string{"namespace", "pod"}),
+		def("get_events", "查询和目标 Pod 或 Deployment 相关的 Events，返回最近 20 条，每条有原因、消息和关联对象；只返回事件，不返回 Pod 当前状态", merge(ns, map[string]any{"name": strParam("Pod 或 Deployment 名称")}), []string{"namespace", "name"}),
+		def("get_pod_logs", "读取指定容器的一段日志，返回截断后的日志文本（最多 100 行 / 64KB，超了会标注已截断）；previous 为 true 时读上一次容器的日志，否则读当前容器的日志", merge(ns, map[string]any{"pod": strParam("Pod 名称"), "container": strParam("容器名"), "previous": map[string]any{"type": "boolean", "description": "是否读上一次容器的日志"}}), []string{"namespace", "pod"}),
+		def("get_deployment", "查询单个 Deployment，返回副本数和容器列表，每个容器带镜像、内存 requests 和 limits；不返回它下面每个 Pod 的状态", merge(ns, map[string]any{"deployment": strParam("Deployment 名称")}), []string{"namespace", "deployment"}),
+		def("search_runbooks", "按关键词检索排障手册，返回相关片段，每条带标题、来源文件和关键句；只返回手册内容，不返回集群现场数据", map[string]any{"query": strParam("检索关键词，例如 OOMKilled、ImagePullBackOff、Liveness probe failed")}, []string{"query"}),
 		// 发现工具（只读）：对话模式里先看全貌、找问题，再用定向工具深挖。
-		// namespace 为空表示查全部命名空间，系统命名空间会被后端过滤。
-		def("list_namespaces", "列出集群的全部命名空间", map[string]any{}, []string{}),
-		def("list_deployments", "列出 Deployment，namespace 为空时查全部命名空间", map[string]any{"namespace": strParam("命名空间，为空表示全部")}, []string{}),
-		def("list_problem_pods", "列出有问题的 Pod（非 Running、未 Ready、重启过、有等待原因），namespace 为空时查全部命名空间", map[string]any{"namespace": strParam("命名空间，为空表示全部")}, []string{}),
-		def("get_cluster_overview", "返回集群总览：节点数、命名空间数、Deployment 数、Pod 数、有问题 Pod 数", map[string]any{}, []string{}),
+		// namespace 为空表示查全部命名空间；系统命名空间的结果也会返回，
+		// 行里带 isSystem 标记（Slice 5 起读放开、写挡住）。
+		// 描述里只写每个工具返回什么、覆盖多大范围，不写“不要调 xxx”：
+		// 该调哪个由模型按返回内容自己判断，写死禁止规则会替模型做决策。
+		def("list_namespaces", "列出集群的全部命名空间，返回名字列表和总数（含系统命名空间，另有 systemNamespaces 子集）；只返回名字，不返回各命名空间下的 Pod 状态", map[string]any{}, []string{}),
+		def("list_deployments", "列出 Deployment 列表，每条带命名空间、副本数、就绪副本数、已更新和可用副本数；namespace 为空时返回全部命名空间的，指定 namespace 时只返回那个命名空间的；不返回 Pod 详情", map[string]any{"namespace": strParam("命名空间，为空表示全部命名空间，指定时只查那个命名空间")}, []string{}),
+		def("list_problem_pods", "列出有问题的 Pod（非 Running、未 Ready、重启过、有等待原因），每条带 Pod 名、命名空间、状态、就绪情况、重启次数、归属 Deployment 和终止/等待原因；namespace 为空时一次返回全部命名空间的有问题 Pod，指定 namespace 时只返回那个命名空间的", map[string]any{"namespace": strParam("命名空间，为空表示全部命名空间，指定时只查那个命名空间")}, []string{}),
+		def("get_cluster_overview", "一次返回全集群的汇总：节点数、命名空间数（含系统命名空间数）、Deployment 数、Pod 总数、有问题 Pod 数（含系统命名空间的有问题 Pod 数）、未完全就绪的 Deployment 数；只返回汇总数字，不返回具体的 Pod 或 Deployment 列表", map[string]any{}, []string{}),
 		def("submit_diagnosis", "提交最终诊断报告，证据 ID 只能引用已返回的工具结果里的 ID", map[string]any{
 			"facts":           map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "观测事实，每条来自工具结果"},
 			"cause":           strParam("原因判断"),
@@ -517,7 +546,7 @@ const realSystemPrompt = `你是 Kubernetes 故障诊断助手。任务是根据
 
 // Next 问一次真模型，返回一步工具调用或最终报告。
 func (r *Real) Next(ctx context.Context, in agent.ModelInput) (agent.ModelStep, error) {
-	if strings.TrimSpace(r.cfg.APIKey) == "" {
+	if strings.TrimSpace(r.getCfg().APIKey) == "" {
 		return agent.ModelStep{}, fmt.Errorf("真模型缺少 API Key，请设置 MODEL_API_KEY")
 	}
 	msgs := buildRealMessages(in)
@@ -628,15 +657,16 @@ func truncateRunes(s string, n int) string {
 // callWithRetry 调一次 chat completions，429 / 5xx / 网络错误才重试，
 // 400 这类请求错误不重试。退避是指数退避，最多 3 次。
 func (r *Real) callWithRetry(ctx context.Context, msgs []chatMessage, tools []chatToolDef) (*chatResponse, error) {
+	cfg := r.getCfg()
 	body, err := json.Marshal(chatRequest{
-		Model: r.cfg.ModelName, Messages: msgs, Tools: tools,
-		ToolChoice: "auto", Temperature: 0,
+		Model: cfg.ModelName, Messages: msgs, Tools: tools,
+		ToolChoice: "auto", Temperature: cfg.Temperature,
 	})
 	if err != nil {
 		return nil, err
 	}
 	var lastErr error
-	for attempt := 0; attempt <= r.cfg.MaxRetries; attempt++ {
+	for attempt := 0; attempt <= cfg.MaxRetries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -644,15 +674,15 @@ func (r *Real) callWithRetry(ctx context.Context, msgs []chatMessage, tools []ch
 			case <-time.After(time.Duration(500*(1<<(attempt-1))) * time.Millisecond):
 			}
 		}
-		reqCtx, cancel := context.WithTimeout(ctx, r.cfg.Timeout)
-		req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, r.cfg.BaseURL+"/chat/completions", bytes.NewReader(body))
+		reqCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, cfg.BaseURL+"/chat/completions", bytes.NewReader(body))
 		if err != nil {
 			cancel()
 			return nil, err
 		}
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+r.cfg.APIKey)
-		resp, err := r.cfg.HTTPClient.Do(req)
+		req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
+		resp, err := cfg.HTTPClient.Do(req)
 		if err != nil {
 			cancel()
 			lastErr = fmt.Errorf("调用模型 API 失败: %w", err)
@@ -814,7 +844,7 @@ type ChatStep struct {
 // 所以对话里模型能先看全貌再深挖；submit_diagnosis 在对话里
 // 被当作一份结构化诊断结论返回，不会自动执行任何修改。
 func (r *Real) Chat(ctx context.Context, msgs []ChatMessage) (ChatStep, error) {
-	if strings.TrimSpace(r.cfg.APIKey) == "" {
+	if strings.TrimSpace(r.getCfg().APIKey) == "" {
 		return ChatStep{}, fmt.Errorf("真模型缺少 API Key，请设置 MODEL_API_KEY")
 	}
 	internal := make([]chatMessage, 0, len(msgs))

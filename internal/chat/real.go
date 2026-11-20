@@ -24,7 +24,12 @@ const chatSystemPrompt = `你是 Kubernetes 故障诊断助手，正在和用户
 
 规则：
 1. 只能调用提供的只读工具，不能执行任何修改。需要修复时，只在回答里给出修复建议，不要自己动手改集群。
-2. 先用发现工具（get_cluster_overview、list_problem_pods、list_namespaces）看全貌、找问题，再用定向工具（get_pod、get_events、get_pod_logs、get_deployment、search_runbooks）深挖。一次只调一个工具。
+2. 先给总览，等追问再深挖：用户问“当前状态怎么样”这种总览问题时，
+   先查全集群状态，给出摘要就停下来，不要在一轮里把所有命名空间、
+   所有 Pod 都查完。等用户追问某个命名空间或 Pod 时再用定向工具
+   （get_pod、get_events、get_pod_logs、get_deployment、search_runbooks）深挖。
+   总览调几个工具由你自己判断，不用每次都把发现工具全调一遍。
+   一次只调一个工具。
 3. 指代消解：用户说的“这个命名空间”、“刚才那个 Pod”、“它”、“那个一直重启的”要按会话历史里的最近提到的目标来理解。如果历史里没有明确的目标，或者有多个可能的目标，不要猜，直接问用户是哪个命名空间、哪个 Pod。
 4. 系统命名空间可以查、可以诊断，但不要把它当成用户业务下结论：如果查到的有问题 Pod 在 kube-system 等系统命名空间里，要明确说明这是系统组件，并且不要给它出修复建议——修复校验本来就会拒绝系统命名空间的修改。
 5. 证据不足时不要硬编结论，要说还需要补查什么。回答用中文，简明扼要，先给结论再给依据。
@@ -33,10 +38,16 @@ const chatSystemPrompt = `你是 Kubernetes 故障诊断助手，正在和用户
 8. 修复决策只能由你做：后端只做校验，不会替你合成建议。如果你给不出结构化建议，就老实说证据不足、还需要补查什么，不要编一个建议。`
 
 // runReal 是真模型的对话循环：
-// 每轮最多调 MaxChatSteps 次工具，每次问模型一步，
+// 每轮最多调 s.maxSteps() 次工具（默认 12，配置中心可改），每次问模型一步，
 // 模型调工具就执行并把结果以 tool 角色追加进历史，
 // 模型给最终文本或提交诊断报告就结束本轮。
-// 历史只带最近 MaxHistoryMessages 条，更早的截断（见 chat.go）。
+// 历史只带最近 s.maxHistory() 条，更早的截断（见 chat.go）。
+//
+// 步数用完时不直接报错：已经查到的工具结果会整理成半成品回复返回，
+// 文字里写明“步数用完了，还没来得及总结”，再问用户想深入查哪个目标。
+// MaxChatSteps 是预算不是决策——它只决定一轮最多查多少，
+// 不决定模型该查什么；查到的东西不能因为预算用完就丢掉，
+// 否则用户看到的是一片空白加一句报错，等于白查了。
 func (s *Service) runReal(ctx context.Context, conversationID, text string, history []store.ConversationMessage, m *model.Real) (*Reply, error) {
 	msgs := []model.ChatMessage{{Role: "system", Content: chatSystemPrompt}}
 	for _, h := range history {
@@ -65,7 +76,7 @@ func (s *Service) runReal(ctx context.Context, conversationID, text string, hist
 	// 补回来；补不回来就老实说还没法下结论，不要编一张卡。
 	askedForStructured := false
 
-	for step := 0; step < MaxChatSteps; step++ {
+	for step := 0; step < s.maxSteps(); step++ {
 		st, err := m.Chat(ctx, msgs)
 		if err != nil {
 			return nil, fmt.Errorf("调用模型失败: %w", err)
@@ -164,7 +175,35 @@ func (s *Service) runReal(ctx context.Context, conversationID, text string, hist
 			model.ChatMessage{Role: "tool", Content: out.Summary + "\n" + mustJSON(out.Data), ToolCallID: tc.ID},
 		)
 	}
-	return nil, fmt.Errorf("对话已达最大工具步数（%d 步），请换个更具体的问题再问", MaxChatSteps)
+	// 步数用完了：不直接 return error。
+	// 已经查到的工具结果（outputs 的摘要 + structured 的规范 key）
+	// 整理成半成品回复返回，RunMessage 会把它正常落盘成一条助手消息，
+	// 前端按 structured 里的 overview / problemPods 正常渲染卡片和表格，
+	// 用户看到的是已经查到的东西，而不是空白加报错。
+	return buildPartialReply(recs, outputs, structured), nil
+}
+
+// buildPartialReply 把步数用完时已查到的工具结果整理成半成品回复。
+// 文字里诚实说明两件事：已经查到了什么、还没来得及做什么（总结），
+// 再问用户想深入查哪个命名空间或 Pod，让下一轮从那里继续，
+// 而不是让用户换个更具体的问题重问——问题本身没错，
+// 错的是后端把“预算用完”当成“用户问错了”报出来。
+func buildPartialReply(recs []ToolCallRecord, outputs []agent.ToolOutput, structured map[string]any) *Reply {
+	var b strings.Builder
+	b.WriteString("已经查到了这些，但步数用完了，还没来得及总结：\n")
+	seen := map[string]bool{}
+	for _, out := range outputs {
+		if out.Summary == "" || seen[out.Summary] {
+			continue
+		}
+		seen[out.Summary] = true
+		b.WriteString("- " + out.Summary + "\n")
+	}
+	if len(outputs) == 0 {
+		b.WriteString("- 这一轮还没查到任何结果。\n")
+	}
+	b.WriteString("你想深入查哪个命名空间或 Pod？告诉我名字，我接着查。")
+	return &Reply{Reply: b.String(), ToolCalls: recs, Structured: structured}
 }
 
 // formatReportReply 把模型提交的结构化诊断报告转成给用户看的文本。

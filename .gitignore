@@ -1,0 +1,7 @@
+*.db
+*.db-wal
+*.db-shm
+kubecause
+kubecause-server
+/bin/
+/dist/

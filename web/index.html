@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>KubeCause — Kubernetes 故障诊断 Agent（Slice 1 演示页）</title>
+<style>body{font-family:system-ui,sans-serif;max-width:760px;margin:40px auto;padding:0 16px}input,select,button{padding:8px;margin:4px 0}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.card{border:1px solid #ddd;padding:12px;margin:12px 0}</style>
+</head>
+<body>
+<h1>KubeCause <small>Slice 1 演示</small></h1>
+<p>提交任务后 Worker 在后台跑诊断，关闭页面任务也会继续。刷新后在下面填 runId 可重新读取。</p>
+<div class="card">
+<label>Namespace <input id="ns" value="demo"></label><br>
+<label>类型 <select id="kind"><option>Deployment</option><option>Pod</option></select></label><br>
+<label>名称 <input id="name" value="demo-api" style="width:300px"></label><br>
+<label>问题 <input id="q" value="demo-api 为什么一直重启" style="width:300px"></label><br>
+<button onclick="createRun()">提交诊断任务</button>
+</div>
+<div class="card">
+<label>runId <input id="runId" style="width:300px"></label>
+<button onclick="loadRun()">读取任务</button>
+<button onclick="poll()">轮询时间线</button>
+</div>
+<h2>任务状态</h2>
+<pre id="status">尚未提交</pre>
+<h2>时间线</h2>
+<pre id="events"></pre>
+<h2>诊断报告 / 提案</h2>
+<pre id="report"></pre>
+<script>
+let after = 0;
+async function createRun() {
+  const r = await fetch('/api/runs', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({namespace: document.getElementById('ns').value, kind: document.getElementById('kind').value, name: document.getElementById('name').value, question: document.getElementById('q').value})});
+  const j = await r.json();
+  document.getElementById('runId').value = j.runId || '';
+  after = 0;
+  document.getElementById('status').textContent = JSON.stringify(j, null, 2);
+  poll();
+}
+async function loadRun() {
+  const id = document.getElementById('runId').value;
+  const r = await fetch('/api/runs/' + id);
+  const j = await r.json();
+  document.getElementById('status').textContent = JSON.stringify(j, null, 2);
+  document.getElementById('report').textContent = JSON.stringify({report: j.report, proposal: j.proposal, repairStatus: j.repairStatus}, null, 2);
+}
+async function poll() {
+  const id = document.getElementById('runId').value;
+  if (!id) return;
+  const r = await fetch('/api/runs/' + id + '/events?after=' + after);
+  const j = await r.json();
+  (j.events || []).forEach(e => {
+    document.getElementById('events').textContent += JSON.stringify(e) + '\n';
+    after = e.seq;
+  });
+  loadRun();
+}
+</script>
+</body>
+</html>

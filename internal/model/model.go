@@ -170,6 +170,23 @@ func discoverContainerName(in agent.ModelInput) string {
 	return "demo-api"
 }
 
+// discoverImage 从已查到的 Deployment 结果里读第一个容器的镜像。
+func discoverImage(in agent.ModelInput) string {
+	for _, h := range in.History {
+		if h.ToolName == "get_deployment" && h.ResultJSON != "" {
+			var v struct {
+				Containers []struct {
+					Image string `json:"image"`
+				} `json:"containers"`
+			}
+			if err := json.Unmarshal([]byte(h.ResultJSON), &v); err == nil && len(v.Containers) > 0 {
+				return v.Containers[0].Image
+			}
+		}
+	}
+	return ""
+}
+
 // discoverMemoryLimit 从已查到的 Deployment 结果里读第一个容器的内存 limit。
 func discoverMemoryLimit(in agent.ModelInput) string {
 	for _, h := range in.History {
@@ -275,6 +292,8 @@ func (s *Stub) buildReport(in agent.ModelInput) *agent.Report {
 				OldValue: oldLimit, NewValue: newLimit,
 				Reason: "容器内存限制过低，触发 OOMKilled 导致反复重启",
 			}
+			// 旧字段转成通用 Patch 格式再返回，和真模型路径一致。
+			sr.Normalize()
 		} else {
 			recs = append([]string{"将容器的内存 limit 适当调高（需人工审批后执行）"}, recs...)
 		}
@@ -288,17 +307,39 @@ func (s *Stub) buildReport(in agent.ModelInput) *agent.Report {
 			SuggestedRepair: sr,
 		}
 	case seenImagePull:
+		// 镜像拉取失败也可以给一张结构化建议卡，和 OOM 的内存卡
+		// 走同一套通用 Patch：改镜像的 path 是
+		// /spec/template/spec/containers/0/image。
+		// 这是 Stub 测试路径的确定性规则：fake 场景里坏镜像固定是
+		// demo-api:bad-tag，好镜像是 demo-api:latest（OOM 底子的镜像），
+		// 所以只能在这个场景里给；真模型路径不走这里，
+		// 新镜像由模型按证据和用户回答决定，后端只校验格式。
+		container := discoverContainerName(in)
+		badImage := discoverImage(in)
+		var sr *agent.SuggestedRepair
+		recs := []string{
+			"核对 Deployment 的 image 字段和 tag 是否写错",
+			"确认镜像仓库是否可达，imagePullSecrets 是否缺失",
+			"修正镜像后重新部署并观察 Pod 是否进入 Running",
+		}
+		if badImage == "demo-api:bad-tag" {
+			recs = append([]string{fmt.Sprintf("将 %s 容器的镜像从 %s 换成 demo-api:latest（需人工审批后执行）", container, badImage)}, recs...)
+			sr = &agent.SuggestedRepair{
+				Namespace: in.Namespace, Deployment: deployNameForReport(in),
+				Container: container, Field: "image",
+				OldValue: badImage, NewValue: "demo-api:latest",
+				Reason: "镜像 tag 不存在，拉取失败导致 Pod 卡在 ImagePullBackOff",
+			}
+			sr.Normalize()
+		}
 		return &agent.Report{
 			Facts:       facts,
 			Cause:       "镜像拉取失败，Pod 卡在 ImagePullBackOff，容器一直没起来",
 			EvidenceIDs: ids,
-			Recommendations: []string{
-				"核对 Deployment 的 image 字段和 tag 是否写错",
-				"确认镜像仓库是否可达，imagePullSecrets 是否缺失",
-				"修正镜像后重新部署并观察 Pod 是否进入 Running",
-			},
+			Recommendations: recs,
 			OpenQuestions: []string{"镜像仓库的访问凭证是否正确，仍需进一步确认"},
 			Confidence:    "high",
+			SuggestedRepair: sr,
 		}
 	case seenProbe:
 		return &agent.Report{
@@ -503,20 +544,32 @@ func toolDefs() []chatToolDef {
 			"recommendations": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
 			"openQuestions":   map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
 			"confidence":      map[string]any{"type": "string", "enum": []string{"high", "medium", "low"}},
-			// 修复建议是可选的：只有证据明确指向内存 limit 过低时才给，
-			// field 目前只支持 memoryLimit，旧值必须和查到的现状一致，
-			// 新值由你按证据和用户要求算出来（例如用户说“增加 128Mi”就按当前值加 128Mi，
-			// 用户说“调到 256Mi”就按 256Mi）；没有用户明确要求时也按证据算一个合理的新值，
-			// 不要默认翻倍。没把握时不要给这个字段，
-			// 后端不会凭空生成修复提案。
-			"suggestedRepair": map[string]any{"type": "object", "description": "可选的修复建议，只有内存 limit 过低这一种情况才给", "properties": map[string]any{
+			// 修复建议是可选的：只有在证据或用户明确要求指向一次具体变更时才给，
+			// 用 patches 列表描述要改的字段，每个 Patch 是 op/path/value：
+			// op 只支持 replace；path 是白名单里的字段，例如改镜像
+			// /spec/template/spec/containers/0/image、改内存 limit
+			// /spec/template/spec/containers/0/resources/limits/memory、
+			// 改副本数 /spec/replicas；value 是新值，例如 "nginx:1.25"、
+			// "256Mi"、3。用户明确说了新值（例如“换成 nginx:1.25”、
+			// “增加 128Mi”、“调到 256Mi”）时按用户说的算：
+			// 先查当前值，再按用户说的增量或目标值算，不要默认翻倍。
+			// 没有用户明确要求时也按证据算一个合理的新值。
+			// 没把握时不要给这个字段，后端不会凭空生成修复提案。
+			// field / oldValue / newValue 是旧字段，保留做兼容，
+			// 新建议直接给 patches 即可，两个都给了时以 patches 为准。
+			"suggestedRepair": map[string]any{"type": "object", "description": "可选的修复建议，用 patches 列表描述要改的字段，每个 Patch 是 op/path/value，op 只支持 replace，path 必须是白名单里的字段（镜像、内存、副本数），value 是合法的新值", "properties": map[string]any{
 				"namespace":  map[string]any{"type": "string"},
 				"deployment": map[string]any{"type": "string"},
 				"container":  map[string]any{"type": "string"},
-				"field":      map[string]any{"type": "string", "enum": []string{"memoryLimit"}},
-				"oldValue":   map[string]any{"type": "string", "description": "当前内存 limit，例如 128Mi"},
-				"newValue":   map[string]any{"type": "string", "description": "建议的新内存 limit，例如 256Mi"},
+				"field":      map[string]any{"type": "string", "description": "旧字段，保留做兼容，新建议不用填"},
+				"oldValue":   map[string]any{"type": "string", "description": "旧字段，保留做兼容，新建议不用填"},
+				"newValue":   map[string]any{"type": "string", "description": "旧字段，保留做兼容，新建议不用填"},
 				"reason":     map[string]any{"type": "string"},
+				"patches": map[string]any{"type": "array", "description": "要改的字段列表，每个 Patch 是 op/path/value", "items": map[string]any{"type": "object", "properties": map[string]any{
+					"op":    map[string]any{"type": "string", "description": "只支持 replace"},
+					"path":  map[string]any{"type": "string", "description": "白名单里的字段路径，例如 /spec/template/spec/containers/0/image、/spec/template/spec/containers/0/resources/limits/memory、/spec/replicas"},
+					"value": map[string]any{"description": "新值，例如 nginx:1.25、256Mi、3"},
+				}}},
 			}},
 		}, []string{"facts", "cause", "evidenceIds", "confidence"}),
 	}
@@ -540,9 +593,9 @@ const realSystemPrompt = `你是 Kubernetes 故障诊断助手。任务是根据
 2. 一次只调一个工具，先查 Pod 状态、事件和日志，再查 Deployment 和手册，不要凭空猜测。不知道目标在哪时，先用发现工具（list_namespaces、list_problem_pods、get_cluster_overview）看全貌、找问题，再用定向工具深挖。
 3. 证据不足时不要硬编结论，调用 submit_diagnosis 时把 confidence 写成 low，并写清还需要补查什么。
 4. 提交诊断必须调用 submit_diagnosis，evidenceIds 只能引用工具结果里已经出现过的 ID。
-5. 不要预设故障类型：原因要按证据自己判断，不要默认是内存、镜像或探针问题。只有证据明确指向容器内存 limit 过低时，才可以在 submit_diagnosis 的 suggestedRepair 里给一个修复建议（field 只能是 memoryLimit，oldValue 必须和查到的现状一致）；其他原因不要给修复建议。
+5. 原因按证据自己判断。需要修复时，在 submit_diagnosis 的 suggestedRepair 里用 patches 列表给一个修复建议（op 只支持 replace，path 是白名单里的字段：镜像、内存、副本数，value 是合法的新值）；其他原因给不出具体变更时不要给修复建议。
 6. 你只能诊断、不能执行任何修改：修复建议只是建议，是否执行由人工审批决定。
-7. 用户如果明确说了增加量（例如“增加 128Mi”、“调到 256Mi”），按用户说的算新值：先查当前值，再按用户说的增量或目标值算，不要默认翻倍。`
+7. 用户如果明确说了要改成什么值（例如“换成 nginx:1.25”、“增加 128Mi”、“调到 256Mi”），按用户说的算新值：先查当前值，再按用户说的增量或目标值算，不要默认翻倍。用户上一轮已经明确说了新值时，直接用那个值生成结构化 Patch，不要再问一遍。`
 
 // Next 问一次真模型，返回一步工具调用或最终报告。
 func (r *Real) Next(ctx context.Context, in agent.ModelInput) (agent.ModelStep, error) {
@@ -766,6 +819,11 @@ func parseDiagnosisArgs(raw string) (*agent.Report, error) {
 			OldValue   string `json:"oldValue"`
 			NewValue   string `json:"newValue"`
 			Reason     string `json:"reason"`
+			Patches    []struct {
+				Op    string `json:"op"`
+				Path  string `json:"path"`
+				Value any    `json:"value"`
+			} `json:"patches"`
 		} `json:"suggestedRepair"`
 	}
 	if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &v); err != nil {
@@ -786,12 +844,18 @@ func parseDiagnosisArgs(raw string) (*agent.Report, error) {
 	// 否则序列化成 null，前端读 .length 会白屏（见 agent.Report.Normalize）。
 	rep.Normalize()
 	if v.SuggestedRepair != nil {
-		rep.SuggestedRepair = &agent.SuggestedRepair{
+		sr := &agent.SuggestedRepair{
 			Namespace: v.SuggestedRepair.Namespace, Deployment: v.SuggestedRepair.Deployment,
 			Container: v.SuggestedRepair.Container, Field: v.SuggestedRepair.Field,
 			OldValue: v.SuggestedRepair.OldValue, NewValue: v.SuggestedRepair.NewValue,
 			Reason: v.SuggestedRepair.Reason,
 		}
+		for _, p := range v.SuggestedRepair.Patches {
+			sr.Patches = append(sr.Patches, agent.PatchOperation{Op: p.Op, Path: p.Path, Value: p.Value})
+		}
+		// 只有旧字段时转成通用 Patch，有 Patches 的直接保留。
+		sr.Normalize()
+		rep.SuggestedRepair = sr
 	}
 	return rep, nil
 }

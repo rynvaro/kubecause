@@ -4,12 +4,69 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
 	"kubecause/internal/agent"
+	"kubecause/internal/repair"
 	"kubecause/internal/store"
 )
+
+// imageTokenRe 从用户消息里提取一个镜像名（带 tag），
+// 例如“换成 nginx:1.25”里的 nginx:1.25。
+var imageTokenRe = regexp.MustCompile(`([a-z0-9][a-z0-9._/-]*:[a-zA-Z0-9._-]+)`)
+
+// extractImageChange 判断用户这轮是不是在说“把镜像换成 xxx”：
+// 消息里要有一个镜像名，并且是换/改/升级的意思，
+// 或者上一轮模型刚问过“换成哪个镜像”，用户这轮只回了一个镜像名。
+// 多轮追问的记忆靠会话历史：上一轮的提问在 history 里，
+// 这轮只回“nginx:1.25”也能接上，不用用户把整句话重说一遍。
+func extractImageChange(text string, history []store.ConversationMessage) string {
+	m := imageTokenRe.FindStringSubmatch(text)
+	if m == nil {
+		return ""
+	}
+	if strings.Contains(text, "换") || strings.Contains(text, "改") || strings.Contains(text, "升级") {
+		return m[1]
+	}
+	for _, h := range history {
+		if h.Role == "assistant" && (strings.Contains(h.Content, "哪个镜像") || strings.Contains(h.Content, "换成哪个")) {
+			return m[1]
+		}
+	}
+	return ""
+}
+
+// containerImageFromData 从 get_deployment 的结构化结果里读第一个容器的名字和镜像。
+func containerImageFromData(data any) (string, string) {
+	if d, ok := data.(map[string]any); ok {
+		if containers, ok := d["containers"].([]map[string]string); ok && len(containers) > 0 {
+			return containers[0]["name"], containers[0]["image"]
+		}
+	}
+	return "", ""
+}
+
+// deploymentMentionedInText 看用户消息里是否提到了某个已知的 Deployment 名。
+func deploymentMentionedInText(ctx context.Context, s *Service, text, namespace string) string {
+	if out, err := s.Tools.ListDeployments(ctx, namespace); err == nil {
+		b, _ := json.Marshal(out.Data)
+		var v struct {
+			Deployments []struct {
+				Name string `json:"name"`
+			} `json:"deployments"`
+		}
+		if err := json.Unmarshal(b, &v); err == nil {
+			for _, d := range v.Deployments {
+				if d.Name != "" && strings.Contains(text, d.Name) {
+					return d.Name
+				}
+			}
+		}
+	}
+	return ""
+}
 
 // runStub 是 Stub 模型的对话路径：确定性规则，不调真模型。
 // 规则按用户意图分三档，顺序不能乱：
@@ -57,6 +114,53 @@ func (s *Service) runStub(ctx context.Context, conversationID, text string, hist
 		strings.Contains(lower, "overview") || strings.Contains(text, "怎么样") ||
 		strings.Contains(text, "如何")
 	ns := s.resolveNamespace(ctx, text, history)
+
+	// 主动变更 / 多轮追问选镜像（Slice 9）：用户明确说了要换成哪个镜像，
+	// 不用先做故障诊断，直接查当前镜像、给一张 Patch 建议卡。
+	// Pod 是健康的也不用先找故障：主动变更和故障修复走同一套 Patch 流程。
+	// 触发条件在 extractImageChange 里：消息里有镜像名 + 换/改/升级，
+	// 或者上一轮模型刚问过选哪个镜像、这轮只回了一个镜像名。
+	if newImage := extractImageChange(text, history); newImage != "" {
+		if ns == "" {
+			reply.WriteString("你想换哪个命名空间的镜像？请告诉我 namespace，例如 demo。")
+			return &Reply{Reply: reply.String(), ToolCalls: recs, Structured: structured}, nil
+		}
+		deployment := deploymentMentionedInText(ctx, s, text, ns)
+		if deployment == "" {
+			_, deployment = resolveTargetFromHistory(ctx, s, history, ns)
+		}
+		if deployment == "" {
+			reply.WriteString("你想换哪个 Deployment 的镜像？请告诉我 Deployment 的名字，例如 demo-api。")
+			return &Reply{Reply: reply.String(), ToolCalls: recs, Structured: structured}, nil
+		}
+		depOut, err := call("get_deployment", map[string]string{"namespace": ns, "deployment": deployment})
+		if err != nil {
+			return &Reply{Reply: "查当前镜像时出错：" + err.Error(), ToolCalls: recs, Structured: structured}, nil
+		}
+		structured["deployment"] = depOut.Data
+		container, currentImage := containerImageFromData(depOut.Data)
+		if container == "" {
+			reply.WriteString(fmt.Sprintf("查不到 %s/%s 的容器，没法确认当前镜像。", ns, deployment))
+			return &Reply{Reply: reply.String(), ToolCalls: recs, Structured: structured}, nil
+		}
+		if currentImage == newImage {
+			reply.WriteString(fmt.Sprintf("%s/%s 容器 %s 的镜像已经是 %s，不用换。", ns, deployment, container, newImage))
+			return &Reply{Reply: reply.String(), ToolCalls: recs, Structured: structured}, nil
+		}
+		sr := &agent.SuggestedRepair{
+			Namespace: ns, Deployment: deployment, Container: container,
+			Field: "image", OldValue: currentImage, NewValue: newImage,
+			Reason: "用户要求把镜像换成 " + newImage,
+		}
+		sr.Normalize()
+		if err := repair.ValidatePatch(sr.Namespace, sr.Deployment, sr.Patches); err != nil {
+			reply.WriteString("这个镜像换不了：" + err.Error())
+			return &Reply{Reply: reply.String(), ToolCalls: recs, Structured: structured}, nil
+		}
+		structured["suggestedRepair"] = sr
+		reply.WriteString(fmt.Sprintf("查到了：%s/%s 容器 %s 当前镜像是 %s，建议换成 %s。这只是一张建议卡，不会自动执行——如果你想走正式流程，可以点“创建可审批的修复任务”，生成提案后人工审批再执行。", ns, deployment, container, currentImage, newImage))
+		return &Reply{Reply: reply.String(), ToolCalls: recs, Structured: structured, SuggestedRepair: sr}, nil
+	}
 
 	if isOverview {
 		ov, err := call("get_cluster_overview", map[string]string{})
@@ -139,7 +243,11 @@ func (s *Service) runStub(ctx context.Context, conversationID, text string, hist
 	}
 	if sr != nil {
 		structured["suggestedRepair"] = sr
-		reply.WriteString(fmt.Sprintf("\n初步判断是容器内存限制过低，建议把 %s 容器的内存 limit 从 %s 调到 %s。这只是一张建议卡，不会自动执行——如果你想走正式流程，可以点“创建可审批的修复任务”，生成提案后人工审批再执行。", sr.Container, sr.OldValue, sr.NewValue))
+		if len(sr.Patches) > 0 && strings.Contains(sr.Patches[0].Path, "/image") {
+			reply.WriteString(fmt.Sprintf("\n初步判断是镜像 tag 不存在，建议把 %s 容器的镜像从 %s 换成 %s。这只是一张建议卡，不会自动执行——如果你想走正式流程，可以点“创建可审批的修复任务”，生成提案后人工审批再执行。", sr.Container, sr.OldValue, sr.NewValue))
+		} else {
+			reply.WriteString(fmt.Sprintf("\n初步判断是容器内存限制过低，建议把 %s 容器的内存 limit 从 %s 调到 %s。这只是一张建议卡，不会自动执行——如果你想走正式流程，可以点“创建可审批的修复任务”，生成提案后人工审批再执行。", sr.Container, sr.OldValue, sr.NewValue))
+		}
 	} else {
 		reply.WriteString("\n目前没有明确的修复建议，需要更多证据才能下结论。")
 	}

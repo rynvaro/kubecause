@@ -52,19 +52,122 @@ const (
 	MaxLogBytes = 64 * 1024
 )
 
+// PatchOperation 是通用 Patch 里的一条操作（Slice 9）。
+// 执行器不再按故障类型分分支：OOM、ImagePullBackOff、主动换镜像版本，
+// 都走同一套 op/path/value。Op 目前只支持 "replace"，
+// 不做 add/remove，避免模型误删资源里的字段。
+// Path 例如：/spec/template/spec/containers/0/image（改镜像）、
+// /spec/template/spec/containers/0/resources/limits/memory（改内存 limit）、
+// /spec/replicas（改副本数）。下标是容器在 Deployment 里的顺序，
+// Worker 生成提案时会按容器名重算下标，模型给错下标也不会改错容器。
+// 本类型是 store.PatchOperation 的别名：store 不能 import agent
+// （agent 已经 import store），所以规范定义放在 store，
+// agent、repair、worker 共用同一份结构，JSON 形状完全一致。
+type PatchOperation = store.PatchOperation
+
 // SuggestedRepair 是模型在诊断报告里可选提出的修复建议。
 // 它只是一个建议，不是可直接执行的 Patch：Worker 收到后还要经过
-// repair.ValidatePatchSpec 白名单校验、读集群现状核对旧值、人工审批，
-// 三关都过了才生成提案。Field 目前只支持 "memoryLimit"，
-// 其他字段的建议会被 ValidateReport 清掉，不会进提案。
+// repair.ValidatePatch 白名单校验、读集群现状核对旧值、人工审批，
+// 三关都过了才生成提案。Patches 是通用 Patch 列表，
+// 不再只认内存——镜像、内存、副本数都用同一套结构表达，
+// 故障类型变了也不用给执行器加分支。
+// Field / OldValue / NewValue 是 Slice 8 及以前的旧字段，保留做兼容：
+// 老的 memory-only 建议卡（field=memoryLimit）读进来时，
+// Normalize() 会把它转成一条内存 limit 的 Patch，
+// 旧测试和 eval 不用改；新模型应直接给 Patches，
+// 两个都给了时以 Patches 为准。
 type SuggestedRepair struct {
-	Namespace  string `json:"namespace"`
-	Deployment string `json:"deployment"`
-	Container  string `json:"container"`
-	Field      string `json:"field"` // 目前只支持 "memoryLimit"
-	OldValue   string `json:"oldValue"`
-	NewValue   string `json:"newValue"`
-	Reason     string `json:"reason"`
+	Namespace  string            `json:"namespace"`
+	Deployment string            `json:"deployment"`
+	Container  string            `json:"container"`
+	Patches    []PatchOperation  `json:"patches,omitempty"`
+	Field      string            `json:"field,omitempty"` // 旧字段，已废弃，见 Normalize
+	OldValue   string            `json:"oldValue,omitempty"`
+	NewValue   string            `json:"newValue,omitempty"`
+	Reason     string            `json:"reason"`
+}
+
+// legacyFieldPath 把旧字段名映射到通用 Patch 的 path，
+// 容器下标先写 0，Worker 生成提案时按容器名重算。
+func legacyFieldPath(field string) (string, bool) {
+	switch field {
+	case "memoryLimit", "":
+		return "/spec/template/spec/containers/0/resources/limits/memory", true
+	case "memoryRequest":
+		return "/spec/template/spec/containers/0/resources/requests/memory", true
+	case "cpuLimit":
+		return "/spec/template/spec/containers/0/resources/limits/cpu", true
+	case "cpuRequest":
+		return "/spec/template/spec/containers/0/resources/requests/cpu", true
+	case "image":
+		return "/spec/template/spec/containers/0/image", true
+	case "replicas":
+		return "/spec/replicas", true
+	default:
+		return "", false
+	}
+}
+
+// ToPatches 返回这张建议卡的通用 Patch 列表。
+// 有 Patches 就直接用；只有旧字段时按 Field 映射成一条 Patch，
+// 这样 Slice 8 的 memory-only 卡不用改代码也能走通用执行器。
+// 既没有 Patches 也没有可用的旧字段时返回 nil，表示给不出结构化建议。
+func (sr *SuggestedRepair) ToPatches() []PatchOperation {
+	if sr == nil {
+		return nil
+	}
+	if len(sr.Patches) > 0 {
+		out := make([]PatchOperation, len(sr.Patches))
+		copy(out, sr.Patches)
+		return out
+	}
+	if sr.NewValue == "" {
+		return nil
+	}
+	path, ok := legacyFieldPath(sr.Field)
+	if !ok {
+		return nil
+	}
+	return []PatchOperation{{Op: "replace", Path: path, Value: sr.NewValue}}
+}
+
+// Normalize 把旧字段的建议卡补成通用 Patch 格式。
+// 有 Patches 的不改；只有旧字段的，Patches 按旧字段填上，
+// OldValue / NewValue 留着做展示和执行前提核对用。
+// 调用点：ValidateReport（报告进 Worker 之前统一归一化），
+// 以及 Stub / synthesizeRepair 构造建议卡之后。
+func (sr *SuggestedRepair) Normalize() {
+	if sr == nil || len(sr.Patches) > 0 {
+		return
+	}
+	if patches := sr.ToPatches(); len(patches) > 0 {
+		sr.Patches = patches
+	}
+}
+
+// PatchValueString 把 Patch 的 Value 转成可展示的字符串，
+// Value 在 JSON 里可能是字符串、数字或布尔，
+// 直接 fmt 打印数字会带小数点，这里按类型处理。
+func PatchValueString(v any) string {
+	switch t := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return t
+	case float64:
+		if t == float64(int64(t)) {
+			return fmt.Sprintf("%d", int64(t))
+		}
+		return fmt.Sprintf("%v", t)
+	case bool:
+		if t {
+			return "true"
+		}
+		return "false"
+	default:
+		b, _ := json.Marshal(t)
+		return string(b)
+	}
 }
 
 // Report 是诊断报告，字段和架构文档一致。
@@ -102,6 +205,9 @@ func (r *Report) Normalize() {
 	}
 	if r.OpenQuestions == nil {
 		r.OpenQuestions = []string{}
+	}
+	if r.SuggestedRepair != nil {
+		r.SuggestedRepair.Normalize()
 	}
 }
 
@@ -264,14 +370,14 @@ func ValidateReport(rep *Report, validEvidence map[string]bool) {
 	if rep.Confidence == "" {
 		rep.Confidence = "medium"
 	}
-	// 修复建议只认内存 limit 这一个字段：模型想改别的字段
-	// （例如改镜像、改副本数）时直接清掉，不进提案，Worker 也不会执行。
-	// Field 为空时按 memoryLimit 理解，旧值/新值留给 Worker 再核对集群现状。
+	// 修复建议归一化成通用 Patch（Slice 9）：有 Patches 的直接保留，
+	// 只有旧字段（field=oldValue->newValue）的按字段映射成 Patch，
+	// 字段映射不到（模型编了一个不存在的字段）时才清掉。
+	// 校验字段值本身是 repair.ValidatePatch 的职责（白名单、格式、倍数），
+	// 这里只做形状归一化，不替校验层做决定。
 	if sr := rep.SuggestedRepair; sr != nil {
-		if sr.Field == "" {
-			sr.Field = "memoryLimit"
-		}
-		if sr.Field != "memoryLimit" {
+		sr.Normalize()
+		if len(sr.Patches) == 0 {
 			rep.SuggestedRepair = nil
 		}
 	}

@@ -8,7 +8,9 @@ package kube
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -422,6 +424,15 @@ type RepairClient interface {
 	// dryRun 为真时只校验不落盘。其他字段一律不改，调用方（repair 包）
 	// 还要在 Patch 前做一次白名单校验，双重防线。
 	PatchDeploymentMemoryLimit(ctx context.Context, namespace, name, container, newValue, resourceVersion string, dryRun bool) (*appsv1.Deployment, error)
+	// PatchDeployment 是通用 Patch 入口（Slice 9）：按 JSONPatchType
+	// 把一组 op/path/value 原样发给 API Server，改镜像、改内存、
+	// 改副本数都走这一个方法，不再每个字段写一个专用的 Patch 方法。
+	// patchJSON 是 JSONPatch 数组的序列化结果（op 只支持 replace，
+	// 白名单由 repair 包在调用前校验）；resourceVersion 是执行前那次
+	// 读取的版本，JSONPatch 体里没有放它的位置，调用方在 Patch 前
+	// 重读一次核对版本，见 repair.executePatch 的注释；
+	// dryRun 为真时只校验不落盘。
+	PatchDeployment(ctx context.Context, namespace, name string, patchJSON []byte, resourceVersion string, dryRun bool) (*appsv1.Deployment, error)
 	// ListPodsForRepair 按标签列 Pod，供 rollout 验证区分新旧 Pod。
 	ListPodsForRepair(ctx context.Context, namespace string, labels map[string]string) ([]corev1.Pod, error)
 }
@@ -460,6 +471,139 @@ func (r *Real) PatchDeploymentMemoryLimit(ctx context.Context, namespace, name, 
 	}
 	return r.client.AppsV1().Deployments(namespace).Patch(ctx, name, types.StrategicMergePatchType,
 		memoryLimitPatch(container, newValue, resourceVersion), opts)
+}
+
+// PatchDeployment 用 JSONPatchType 把一组 Patch 发给 API Server。
+// 白名单由 repair 包在调用前校验，这里只负责发，不再按字段分方法：
+// 镜像、内存、副本数都走这一个入口，新增可改字段不用加新方法。
+// resourceVersion 不写进 patch 体（JSONPatch 没有放它的位置），
+// 调用方在 Patch 前重读核对，见 repair.executePatch。
+func (r *Real) PatchDeployment(ctx context.Context, namespace, name string, patchJSON []byte, resourceVersion string, dryRun bool) (*appsv1.Deployment, error) {
+	opts := metav1.PatchOptions{}
+	if dryRun {
+		opts.DryRun = []string{metav1.DryRunAll}
+	}
+	return r.client.AppsV1().Deployments(namespace).Patch(ctx, name, types.JSONPatchType, patchJSON, opts)
+}
+
+// genericPatchOp 是 JSONPatch 里的一条操作，Fake 在内存里应用它。
+// 只处理 op=replace，白名单由 repair 包在调用前校验，
+// 这里再按 path 形状分发一次，形状不对直接报错，不静默跳过。
+type genericPatchOp struct {
+	Op    string          `json:"op"`
+	Path  string          `json:"path"`
+	Value json.RawMessage `json:"value"`
+}
+
+var genericContainerPathRe = regexp.MustCompile(`^/spec/template/spec/containers/(\d+)/(image|resources/(limits|requests)/(memory|cpu))$`)
+
+// applyGenericPatch 把一组 JSONPatch 应用到 Deployment 的内存副本上，
+// 不写回 clientset，调用方决定 dry-run 还是落盘。
+// 内存/CPU 按 resource.Quantity 解析，镜像按字符串，副本数按数字。
+func applyGenericPatch(dep *appsv1.Deployment, patchJSON []byte) error {
+	var ops []genericPatchOp
+	if err := json.Unmarshal(patchJSON, &ops); err != nil {
+		return fmt.Errorf("Patch 解析失败: %w", err)
+	}
+	for _, op := range ops {
+		if op.Op != "replace" {
+			return fmt.Errorf("Fake 只支持 replace，得到 %q", op.Op)
+		}
+		if op.Path == "/spec/replicas" {
+			var n float64
+			if err := json.Unmarshal(op.Value, &n); err != nil {
+				return fmt.Errorf("副本数必须是数字: %s", string(op.Value))
+			}
+			v := int32(n)
+			dep.Spec.Replicas = &v
+			continue
+		}
+		m := genericContainerPathRe.FindStringSubmatch(op.Path)
+		if m == nil {
+			return fmt.Errorf("Fake 不支持的 path: %q", op.Path)
+		}
+		idx := 0
+		for _, c := range m[1] {
+			idx = idx*10 + int(c-'0')
+		}
+		if idx >= len(dep.Spec.Template.Spec.Containers) {
+			return fmt.Errorf("容器下标 %d 越界", idx)
+		}
+		ct := &dep.Spec.Template.Spec.Containers[idx]
+		switch m[2] {
+		case "image":
+			var img string
+			if err := json.Unmarshal(op.Value, &img); err != nil {
+				return fmt.Errorf("镜像必须是字符串: %s", string(op.Value))
+			}
+			ct.Image = img
+		case "resources/limits/memory", "resources/requests/memory":
+			var s string
+			if err := json.Unmarshal(op.Value, &s); err != nil {
+				return fmt.Errorf("内存值必须是字符串: %s", string(op.Value))
+			}
+			q, err := resource.ParseQuantity(s)
+			if err != nil {
+				return fmt.Errorf("内存值非法 %q: %w", s, err)
+			}
+			if m[2] == "resources/limits/memory" {
+				if ct.Resources.Limits == nil {
+					ct.Resources.Limits = corev1.ResourceList{}
+				}
+				ct.Resources.Limits[corev1.ResourceMemory] = q
+			} else {
+				if ct.Resources.Requests == nil {
+					ct.Resources.Requests = corev1.ResourceList{}
+				}
+				ct.Resources.Requests[corev1.ResourceMemory] = q
+			}
+		case "resources/limits/cpu", "resources/requests/cpu":
+			var s string
+			if err := json.Unmarshal(op.Value, &s); err != nil {
+				return fmt.Errorf("CPU 值必须是字符串: %s", string(op.Value))
+			}
+			q, err := resource.ParseQuantity(s)
+			if err != nil {
+				return fmt.Errorf("CPU 值非法 %q: %w", s, err)
+			}
+			if m[2] == "resources/limits/cpu" {
+				if ct.Resources.Limits == nil {
+					ct.Resources.Limits = corev1.ResourceList{}
+				}
+				ct.Resources.Limits[corev1.ResourceCPU] = q
+			} else {
+				if ct.Resources.Requests == nil {
+					ct.Resources.Requests = corev1.ResourceList{}
+				}
+				ct.Resources.Requests[corev1.ResourceCPU] = q
+			}
+		}
+	}
+	return nil
+}
+
+// PatchDeployment 是 Fake 的通用 Patch 实现。
+// dryRun 时只在内存副本上算，不落盘、不模拟 rollout；
+// 真实 Patch 时写回 clientset，再模拟控制器行为（见 simulateRollout）。
+// fake clientset 的 JSONPatch 支持不完整，这里直接在对象上应用
+// 再 Update，和 Real 的 JSONPatch 殊途同归：最终状态一致。
+func (f *Fake) PatchDeployment(ctx context.Context, namespace, name string, patchJSON []byte, resourceVersion string, dryRun bool) (*appsv1.Deployment, error) {
+	dep, err := f.GetDeployment(ctx, namespace, name)
+	if err != nil {
+		return nil, err
+	}
+	cp := dep.DeepCopy()
+	if err := applyGenericPatch(cp, patchJSON); err != nil {
+		return nil, err
+	}
+	if dryRun {
+		return cp, nil
+	}
+	if _, err := f.client.AppsV1().Deployments(namespace).Update(ctx, cp, metav1.UpdateOptions{}); err != nil {
+		return nil, err
+	}
+	f.simulateRollout(ctx, cp, "")
+	return f.GetDeployment(ctx, namespace, name)
 }
 
 func (f *Fake) GetDeploymentForRepair(ctx context.Context, namespace, name string) (*appsv1.Deployment, error) {
@@ -518,22 +662,28 @@ func (f *Fake) PatchDeploymentMemoryLimit(ctx context.Context, namespace, name, 
 // simulateRollout 模拟控制器在 Patch 后的行为，只在 Fake 里用。
 func (f *Fake) simulateRollout(ctx context.Context, dep *appsv1.Deployment, newValue string) {
 	const newHash = "9a1b2c3d4"
+	// 副本数按 Deployment 的 spec 来：改副本数的 Patch 也要能验证通过，
+	// 不能写死 1。
+	replicas := int32(1)
+	if dep.Spec.Replicas != nil {
+		replicas = *dep.Spec.Replicas
+	}
 	// 1. generation +1，status 置为已更新且可用。
 	dep.Generation++
 	if _, err := f.client.AppsV1().Deployments(dep.Namespace).Update(ctx, dep, metav1.UpdateOptions{}); err != nil {
 		return
 	}
 	dep.Status.ObservedGeneration = dep.Generation
-	dep.Status.Replicas = 1
-	dep.Status.UpdatedReplicas = 1
-	dep.Status.AvailableReplicas = 1
-	dep.Status.ReadyReplicas = 1
+	dep.Status.Replicas = replicas
+	dep.Status.UpdatedReplicas = replicas
+	dep.Status.AvailableReplicas = replicas
+	dep.Status.ReadyReplicas = replicas
 	_, _ = f.client.AppsV1().Deployments(dep.Namespace).UpdateStatus(ctx, dep, metav1.UpdateOptions{})
 
 	// 2. 建带新 hash 的 ReplicaSet（已存在时跳过，保证重复 Patch 不报错）。
 	rsName := dep.Name + "-" + newHash
 	if _, err := f.client.AppsV1().ReplicaSets(dep.Namespace).Get(ctx, rsName, metav1.GetOptions{}); err != nil {
-		replicas := int32(1)
+		rsReplicas := replicas
 		tmpl := *dep.Spec.Template.DeepCopy()
 		if tmpl.Labels == nil {
 			tmpl.Labels = map[string]string{}
@@ -546,7 +696,7 @@ func (f *Fake) simulateRollout(ctx context.Context, dep *appsv1.Deployment, newV
 				Labels:          map[string]string{"app": dep.Name, "pod-template-hash": newHash},
 			},
 			Spec: appsv1.ReplicaSetSpec{
-				Replicas: &replicas,
+				Replicas: &rsReplicas,
 				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": dep.Name, "pod-template-hash": newHash}},
 				Template: tmpl,
 			},
@@ -555,8 +705,14 @@ func (f *Fake) simulateRollout(ctx context.Context, dep *appsv1.Deployment, newV
 	}
 
 	// 3. 建一个 Ready、重启 0 次的新 Pod（已存在时跳过）。
+	// 新 Pod 的容器名和镜像按 Patch 后的 Deployment 现状来，
+	// 改镜像的 Patch 模拟出的新 Pod 也要是新镜像，不然验证读 Pod 会对不上。
 	podName := dep.Name + "-" + newHash + "-abcde"
 	if _, err := f.client.CoreV1().Pods(dep.Namespace).Get(ctx, podName, metav1.GetOptions{}); err != nil {
+		podContainer := corev1.Container{Name: DemoContainer, Image: "demo-api:latest"}
+		if len(dep.Spec.Template.Spec.Containers) > 0 {
+			podContainer = corev1.Container{Name: dep.Spec.Template.Spec.Containers[0].Name, Image: dep.Spec.Template.Spec.Containers[0].Image}
+		}
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: podName, Namespace: dep.Namespace,
@@ -564,11 +720,11 @@ func (f *Fake) simulateRollout(ctx context.Context, dep *appsv1.Deployment, newV
 				OwnerReferences:   []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: rsName, UID: types.UID("uid-" + rsName)}},
 				CreationTimestamp: metav1.Now(),
 			},
-			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: DemoContainer, Image: "demo-api:latest"}}},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{podContainer}},
 			Status: corev1.PodStatus{
 				Phase: corev1.PodRunning,
 				ContainerStatuses: []corev1.ContainerStatus{{
-					Name: DemoContainer, Ready: true, RestartCount: 0,
+					Name: podContainer.Name, Ready: true, RestartCount: 0,
 					State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
 				}},
 			},

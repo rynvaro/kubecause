@@ -1,6 +1,61 @@
-# KubeCause — Kubernetes 故障诊断 Agent（Slice 8）
+# KubeCause — Kubernetes 故障诊断 Agent（Slice 9）
 
-KubeCause 是一个 Kubernetes 故障诊断 Agent。用户选定 namespace 和 Pod 或 Deployment，描述故障现象，Agent 自主选择只读工具收集证据，检索排障手册，输出诊断结论和建议。演示环境支持一类人工审批后的变更，即调整指定 Deployment 的容器内存限制，并验证变更后的运行状态。
+KubeCause 是一个 Kubernetes 故障诊断 Agent。用户选定 namespace 和 Pod 或 Deployment，描述故障现象，Agent 自主选择只读工具收集证据，检索排障手册，输出诊断结论和建议。演示环境支持人工审批后的变更：用一组通用 Patch 改指定 Deployment 的白名单字段（镜像、内存 limit/request、CPU limit/request、副本数），并验证变更后的运行状态。
+
+Slice 9 修的是用户在 2026-11-20 反馈的三个问题：**整页滚动**（输入框还是被顶走，时间线看不到）、**只有 OOM 能出修复建议**（ImagePullBackOff 没有卡）、**每个故障都要单独写代码吗**（执行器只认内存）。核心是两件事：**布局锁死一屏**（`.app` 从 `min-height:100vh` 改成 `height:100vh; overflow:hidden`，三栏各自内部滚动）和**执行器改成通用 Patch**（建议卡、校验、执行、提案、审批卡全部按 op/path/value 走，不再按故障类型分分支，OOM、ImagePullBackOff、主动换镜像版本都走同一套流程）。
+
+Slice 1/2/3/4/5/6/7/8 已有的东西没有重写：SQLite 表（只给 change_requests 加了一列 patches_json，老库启动时自动补列）、HTTP 接口、Worker 状态机、Agent 循环的校验和恢复、fake 客户端、桩模型、真模型适配器、FTS5 检索、条件 Patch 与 rollout 验证、对话会话、发现工具、React 前端，全部保留并做了回归。
+
+## Slice 9 改了什么
+
+- **修布局：三栏各自独立滚动**（`frontend/src/index.css`）：根因是 `.app` 是 `min-height:100vh` 不是 `height:100vh`——内容一长整个页面就比屏幕高，浏览器出现整页滚动条，`.main`、`.sidebar`、`.activity` 的内部滚动根本触发不了，输入框也被顶走。修法：`html, body` 加 `height:100%; overflow:hidden`，`.app` 改成 `height:100vh; overflow:hidden`，高度锁死在一屏；`.layout` 保持 `flex:1; min-height:0`，三列高度都被锁住；左边 `.sidebar`、中间 `.main`、右边 `.activity` 各自 `overflow-y:auto`，自己滚自己的，互不影响；中间聊天区内部再分上面 `.chat-scroll` 自己滚、下面 `.composer`（`flex-shrink:0`）固定在底部；单次诊断的 `.run-scroll` 也一样处理。验证：20 条以上长对话里，滚中间聊天时右侧活动面板不动、一直能看到工具卡片，滚右侧时中间不动，输入框一直固定在底部。
+- **执行器改通用 Patch**（`internal/agent/agent.go`、`internal/repair/repair.go`、`internal/store/store.go`、`internal/kube/client.go`、`internal/run/worker.go`）：`SuggestedRepair` 不再是 namespace/deployment/container/field/oldValue/newValue 这种只认内存的形状，改成通用 Patch 列表 `Patches []PatchOperation`，每条是 `{op, path, value}`，op 只支持 `replace`（不做 add/remove，避免删字段），path 例如 `/spec/template/spec/containers/0/image`、`/spec/template/spec/containers/0/resources/limits/memory`、`/spec/replicas`，value 例如 `"nginx:1.25"`、`"256Mi"`、`3`。校验改成 `ValidatePatch`（只按字段分，不按故障分）+ `ValidatePatchWithCurrent`（现状相关：容器下标越界、内存倍数/上限）：只允许改 Deployment，白名单 path 只有副本数（1-10）、容器镜像（合法镜像名）、容器内存/CPU 的 limit/request；黑名单明确拒绝 hostNetwork、hostPID、privileged、metadata/name、namespace、command、args；系统命名空间拒绝；内存新值大于旧值、不超过旧值 4 倍、不超过 4Gi。执行改成 `kube.RepairClient.PatchDeployment`，直接用 client-go 的 Patch API（JSONPatchType）把模型给的 Patches 列表原样发出去，执行前先 dry-run，Patch 前重读一次核对 resourceVersion 没变（JSONPatch 体里没有放 resourceVersion 的位置，这一步和原来把 resourceVersion 写进 strategic merge patch 的 metadata 是同一层保证），执行后逐条读回确认（镜像读 image、内存读 limits.memory、副本数读 replicas，不一致就标记执行失败）。rollout 验证保持原来的逻辑（observedGeneration、updated/available replicas、新 Pod Ready、重启次数不增长），没改。Worker 的 `maybeCreateProposal` 改成通用：按建议卡的 Patches 生成提案，容器下标按容器名重算，改前值逐条按现状读，第一个 Patch 的改前/改后值存进 OldValue/NewValue 做展示；`change_requests` 表加 `patches_json` 列，`ChangeRequest` 加 `Patches` 字段。前端 `RepairSuggestionCard` 和审批卡改成显示 Patch 列表（字段中文名 + path + 新值，旧值读不到只显示新值，不编旧值）。
+- **向后兼容**（不删旧逻辑）：`SuggestedRepair` 里旧的 Field/OldValue/NewValue 字段保留，`Normalize()` / `ToPatches()` 会把旧的 memory-only 卡转成一条内存 limit 的 Patch；`repair.ValidatePatchSpec` 保留，内部转成通用 Patch 再校验；`store` 读老提案（patches_json 为空）时从 oldValue/newValue 反推一条内存 Patch；`kube.PatchDeploymentMemoryLimit` 保留，老测试照常用。`go run ./cmd/eval` 仍 3/3 通过。
+- **多轮追问选镜像**（`internal/chat/real.go`、`internal/chat/stub.go`）：模型问“你想换成哪个镜像？是 nginx:1.25 还是 nginx:latest？”之后，用户回“换成 nginx:1.25”，下一轮模型把用户的回答转成结构化 Patch，而不是再问一遍。多轮记忆靠最近 10 条历史（已经有了）：提示词加了一句“用户上一轮已经明确说了新值时，直接用那个值生成结构化 Patch，不要再问一遍”。Stub 路径也支持：消息里有镜像名 + 换/改/升级，或者上一轮刚问过选哪个镜像、这轮只回了一个镜像名，就直接查当前镜像、给 Patch 卡。mock 模型服务两轮对话测试已覆盖。
+- **主动变更走同一套 Patch**（`internal/chat/real.go`、`internal/chat/stub.go`）：用户说“帮我把 demo-api 的镜像换成 nginx:1.26”，Pod 是健康的，不用诊断，直接查一下当前镜像是什么，确认一下，然后给一张 Patch 建议卡，点了“创建可审批的修复任务”，审批后执行，再验证 rollout。提示词加了一句“用户明确说了要改成什么值时，不用先做故障诊断：先查当前值确认一下，再直接给出 Patch 建议”。mock 模型 + Stub 两路测试已覆盖（主动变更只调 get_deployment，不调 list_problem_pods、get_pod、get_events 这些诊断工具）。
+- **提示词通用化**（`internal/chat/real.go`、`internal/model/model.go`）：对话提示词第 6、7 条和单次诊断提示词第 5、7 条不再只写内存，改成“用 patches 列表描述要改的字段”；`submit_diagnosis` 的 suggestedRepair 工具定义加了 `patches` 数组字段，旧的 field/oldValue/newValue 保留做兼容。提示词和工具描述里不写“不要调 xxx”这种禁止句，只描述每个工具返回什么、Patch 白名单里有什么，让模型自己判断。
+- **Stub 的镜像建议**（`internal/model/model.go`、`internal/chat/chat.go`，测试路径专用）：Stub 的 imagepull 场景现在也给一张镜像 Patch 卡（demo-api:bad-tag → demo-api:latest），和 OOM 的内存卡走同一套通用 Patch；`synthesizeRepair` 也支持镜像卡。注意：这两处都是桩模型测试路径的确定性规则，真模型路径不走这里；真集群上的坏镜像 tag 各不相同，新镜像只能由模型按证据和用户回答决定，规则合成猜不出一个正确的 tag。另外修了一个相关 bug：`synthesizeRepair` 以前把 runbook 检索片段也当成一手证据，查 ImagePullBackOff 时 OOM 手册里的 "out of memory" 会把镜像案误判成内存案，现在检索片段只看摘要、不参与信号判断。
+- **回归**：`go vet ./...` 通过，`go test ./...` 全部通过（含新增的通用 Patch 白名单、通用 Patch 执行（镜像/内存/副本数/多 Patch）、多轮追问、主动变更、Stub 镜像卡、提案 Patch 持久化、旧卡向后兼容测试），`go run ./cmd/eval` 仍 3/3 通过；对话两轮能接上文、转正式诊断后审批执行验证全部回归通过。
+
+## 通用 Patch 格式和白名单
+
+建议卡 / 提案里的 Patch 列表：
+
+```json
+{"patches": [{"op": "replace", "path": "/spec/template/spec/containers/0/image", "value": "nginx:1.25"}]}
+```
+
+| path | value | 说明 |
+| --- | --- | --- |
+| `/spec/replicas` | 1–10 的整数 | 改副本数 |
+| `/spec/template/spec/containers/{i}/image` | 合法镜像名，如 `nginx:1.25` | 改镜像 |
+| `/spec/template/spec/containers/{i}/resources/limits/memory` | Mi/Gi，如 `256Mi` | 新值 > 旧值、≤ 旧值 4 倍、≤ 4Gi |
+| `/spec/template/spec/containers/{i}/resources/requests/memory` | Mi/Gi | 同上（旧值为空时只检查上限） |
+| `/spec/template/spec/containers/{i}/resources/limits/cpu` | 如 `500m`、`1` | 合法 CPU 数量 |
+| `/spec/template/spec/containers/{i}/resources/requests/cpu` | 如 `500m`、`1` | 合法 CPU 数量 |
+
+op 只支持 `replace`。明确拒绝：hostNetwork、hostPID、privileged、metadata/name、metadata/namespace、command、args，以及 kube-system / kube-public / kube-node-lease。容器下标按容器名重算，模型给错下标也不会改错容器。
+
+多轮追问和主动变更的用法（对话模式）：
+
+```bash
+# 模型问选哪个镜像，用户选了之后继续审批执行
+# 第一轮：问“demo 那个一直拉不到镜像的是怎么回事”
+#   → 模型问“你想换成哪个镜像？是 nginx:1.25 还是 nginx:latest？”
+# 第二轮：回“换成 nginx:1.25”
+#   → 模型返回一张 image Patch 建议卡，点“创建可审批的修复任务”走审批执行
+
+# 主动变更：健康 Pod 换镜像版本，不用先诊断
+# 问“把 demo-api 的镜像换成 nginx:1.26”
+#   → Agent 先查当前镜像，再直接给一张 Patch 建议卡
+```
+
+## Slice 9 未实现（仍未做）
+
+- 对话历史摘要（现在是截断，TODO 在代码和 README 里写清了）
+- 云端部署、鉴权、监控
+- op 只支持 replace：add/remove 以后需要时再加，现在不做，避免删字段
+- command/args、hostNetwork、privileged 这些字段先禁掉，以后用户明确要求时再放开
 
 Slice 8 修的是用户在 Mac 真机上反馈的“当前状态怎么样”8 步用完报错的问题（2026-11-20）：对话里问一句总览，页面中间一片空白，下面只有一句粉色报错“对话已达最大工具步数（8 步），请换个更具体的问题再问”。核心是三件事：**步数是预算不是决策**（MaxChatSteps 从 8 调到 12，步数用完返回已查到的半成品，不再直接报错）、**工具描述只描述、不禁止**（讲清每个工具返回什么、覆盖多大范围，删掉“不要调 xxx”这种替模型做决策的禁止句）、**提示词改成先给总览、等追问再深挖**（一轮里不要既看全貌又深挖）。另外加了一个轻量配置中心：`config.yaml` + 环境变量覆盖 + `GET/POST /api/config` 热加载，前端“设置”页能改，不用重启。
 

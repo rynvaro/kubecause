@@ -1,12 +1,15 @@
 // Package repair 负责审批后的修复：条件 Patch 与 rollout 验证。
 //
-// Slice 4 起白名单是通用的，不再只认 demo/demo-api 这一组：
+// Slice 9 起执行器是通用的，不再按故障类型分分支：
 // 任意 namespace / Deployment / 容器都可以提修复建议，
-// 但只允许改内存 limit 这一个字段，且新值必须大于旧值、
-// 不超过旧值的 4 倍、不超过 4Gi。安全边界分三层，缺一不可：
-//  1. 白名单：只允许改内存 limit，值必须合法，见 ValidatePatchSpec；
+// 但只能改白名单里的字段（镜像、内存 limit/request、CPU limit/request、
+// 副本数），值必须合法，内存新值还要满足“大于旧值、不超过旧值 4 倍、
+// 不超过 4Gi”。OOM、ImagePullBackOff、主动换镜像版本，
+// 都走同一套 Patch 流程：模型决策改什么，后端只校验能不能改，
+// 校验过了、人工批了，才执行。安全边界分三层，缺一不可：
+//  1. 白名单：只允许改白名单里的 path，值必须合法，见 ValidatePatch；
 //  2. 执行前校验：重新读取目标，核对 UID、容器名、变更前旧值，
-//     再用本次读取的 resourceVersion 做条件 Patch，防并发覆盖；
+//     再用本次读取的 resourceVersion 做条件更新，防并发覆盖；
 //  3. 执行和验证分开：写入成功不等于修复成功，验证要独立检查 rollout、
 //     新 Pod 是否 Ready、重启次数是否继续增长，超时要明确标出来。
 //
@@ -19,6 +22,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"strconv"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -30,15 +35,19 @@ import (
 )
 
 // Proposal 是修复提案，和 change_requests 表一一对应。
-// 一份提案只改一个东西：指定 Deployment 的指定容器的内存 limit。
+// 一份提案是一组通用 Patch：指定 Deployment 的若干个字段改成新值。
 // 字段和值都要由修复模块校验，不允许模型直接拼一个任意 Patch。
+// OldValue / NewValue 只保留做展示用，取第一个 Patch 的改前/改后值；
+// 执行时以 Patches 为准。老提案没有 Patches 时，
+// CreateProposal 会从 OldValue / NewValue 反推一条内存 Patch。
 type Proposal struct {
 	RunID         string
 	Namespace     string
 	Deployment    string
 	Container     string
-	OldValue      string // 例如 128Mi
-	NewValue      string // 例如 256Mi
+	OldValue      string // 例如 128Mi（展示用，第一个 Patch 的旧值）
+	NewValue      string // 例如 256Mi（展示用，第一个 Patch 的新值）
+	Patches       []store.PatchOperation
 	DeploymentUID string // 提案生成时绑定的目标 UID，空表示老提案未绑定
 }
 
@@ -46,13 +55,28 @@ type Proposal struct {
 // 提案一旦生成就不可变：改目标、改前后值都要生成新提案，
 // 不能原地改旧提案，这样审批时看到的东西和执行时用的东西才一致。
 func CreateProposal(s *store.Store, p *Proposal) (*store.ChangeRequest, error) {
-	if err := ValidatePatchSpec(p.Namespace, p.Deployment, p.Container, p.OldValue, p.NewValue); err != nil {
-		return nil, err
+	patches := p.Patches
+	if len(patches) == 0 {
+		// 老调用方只给了 old/new 值：按旧字段反推一条内存 limit 的 Patch，
+		// 让老提案也走通用执行器，不用再维护两套创建逻辑。
+		if p.OldValue == "" || p.NewValue == "" {
+			return nil, fmt.Errorf("提案缺少 Patch，也没有新旧值")
+		}
+		if err := ValidatePatchSpec(p.Namespace, p.Deployment, p.Container, p.OldValue, p.NewValue); err != nil {
+			return nil, err
+		}
+		patches = []store.PatchOperation{{
+			Op: "replace", Path: "/spec/template/spec/containers/0/resources/limits/memory", Value: p.NewValue,
+		}}
+	} else {
+		if err := ValidatePatch(p.Namespace, p.Deployment, patches); err != nil {
+			return nil, err
+		}
 	}
 	return s.CreateChangeRequest(context.Background(), &store.ChangeRequest{
 		RunID: p.RunID, Namespace: p.Namespace, Deployment: p.Deployment,
 		Container: p.Container, OldValue: p.OldValue, NewValue: p.NewValue,
-		DeploymentUID: p.DeploymentUID,
+		Patches: patches, DeploymentUID: p.DeploymentUID,
 	})
 }
 
@@ -123,15 +147,130 @@ func ApplyLimits(maxMi, maxRatio int64) {
 	MaxRatio = maxRatio
 }
 
-// ValidatePatchSpec 是 Patch 的白名单校验，第一道防线。
-// 通用规则（Slice 4）：任意 namespace / Deployment / 容器都可以，
-// 但只允许改内存 limit 这一个字段；值必须是 Mi / Gi 结尾；
-// 新值必须大于旧值、不超过旧值的 4 倍、不超过 4Gi；
-// 系统命名空间、空目标、非法格式一律拒绝。
-// 旧值和集群现状是否一致不在这里查，那是执行前校验（executePatch）
-// 重新读目标时核对的，两层分开，职责才清楚。
-func ValidatePatchSpec(namespace, deployment, container, oldValue, newValue string) error {
-	if namespace == "" || deployment == "" || container == "" {
+var (
+	imageRe = regexp.MustCompile(`^[a-z0-9._/-]+(:[a-zA-Z0-9._-]+)?(@sha256:[a-f0-9]{64})?$`)
+	// 容器下标路径，例如 /spec/template/spec/containers/0/image。
+	containerPathRe = regexp.MustCompile(`^/spec/template/spec/containers/(\d+)/(image|resources/(limits|requests)/(memory|cpu))$`)
+)
+
+// parsePatchPath 解析一条 Patch 的 path，返回它是哪一类字段、
+// 容器下标（副本数时为 -1）。白名单外的 path 在这里就被挡掉，
+// 不会进到执行器。
+func parsePatchPath(path string) (kind string, containerIdx int, err error) {
+	if path == "/spec/replicas" {
+		return "replicas", -1, nil
+	}
+	m := containerPathRe.FindStringSubmatch(path)
+	if m == nil {
+		return "", -1, fmt.Errorf("path 不在白名单里: %q", path)
+	}
+	idx := 0
+	for _, c := range m[1] {
+		idx = idx*10 + int(c-'0')
+	}
+	switch m[2] {
+	case "image":
+		return "image", idx, nil
+	case "resources/limits/memory":
+		return "memoryLimit", idx, nil
+	case "resources/requests/memory":
+		return "memoryRequest", idx, nil
+	case "resources/limits/cpu":
+		return "cpuLimit", idx, nil
+	case "resources/requests/cpu":
+		return "cpuRequest", idx, nil
+	}
+	return "", -1, fmt.Errorf("path 不在白名单里: %q", path)
+}
+
+// isBlacklistedPath 对明确禁止的字段给一句清楚的拒绝原因，
+// 而不是只说“不在白名单里”：这些字段改了可能让 Pod 起不来
+// （command/args、hostNetwork、privileged），或改了资源身份
+// （metadata/name、namespace），先禁掉，以后用户明确要求时再放开。
+func isBlacklistedPath(path string) string {
+	for _, bad := range []string{
+		"hostNetwork", "hostPID", "privileged",
+		"/metadata/namespace", "/metadata/name",
+		"/command", "/args",
+	} {
+		if strings.Contains(path, bad) {
+			return bad
+		}
+	}
+	return ""
+}
+
+// patchNumber 把 Patch 的 Value 转成数字（副本数用），
+// JSON 里数字可能是 float64，模型也可能给成 "3" 这样的字符串。
+func patchNumber(v any) (float64, bool) {
+	switch t := v.(type) {
+	case float64:
+		return t, true
+	case int:
+		return float64(t), true
+	case int64:
+		return float64(t), true
+	case json.Number:
+		f, err := t.Float64()
+		return f, err == nil
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(t), 64)
+		return f, err == nil
+	}
+	return 0, false
+}
+
+// validatePatchValue 只校验值的格式，不看集群现状：
+// 镜像名要合法、内存要 Mi/Gi 结尾、CPU 要合法数量、副本数 1-10。
+// 和现状有关的检查（内存新值相对旧值的倍数、容器下标越界）
+// 在 ValidatePatchWithCurrent 里做，那里才有现状可读。
+func validatePatchValue(kind string, value any) error {
+	switch kind {
+	case "image":
+		s, ok := value.(string)
+		if !ok || s == "" || strings.Contains(s, " ") || !imageRe.MatchString(s) {
+			return fmt.Errorf("镜像名非法: %v", value)
+		}
+	case "memoryLimit", "memoryRequest":
+		s, ok := value.(string)
+		if !ok || !isMemoryValue(s) {
+			return fmt.Errorf("内存值必须是 Mi 或 Gi 结尾，例如 128Mi、2Gi，得到 %v", value)
+		}
+	case "cpuLimit", "cpuRequest":
+		s, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("CPU 值必须是字符串，例如 500m、1，得到 %v", value)
+		}
+		q, err := resource.ParseQuantity(s)
+		if err != nil || q.Sign() <= 0 {
+			return fmt.Errorf("CPU 值非法: %q", s)
+		}
+	case "replicas":
+		n, ok := patchNumber(value)
+		if !ok || n != float64(int64(n)) || n < 1 || n > 10 {
+			return fmt.Errorf("副本数必须是 1-10 之间的整数，得到 %v", value)
+		}
+	}
+	return nil
+}
+
+// ValidatePatch 是通用 Patch 的白名单校验，第一道防线。
+// 只按字段分，不按故障分：OOM、ImagePullBackOff、主动变更
+// 都过同一套检查，新增一种故障不用给执行器加分支。
+// 规则：
+//   - 只允许改 Deployment（调用方保证目标是 Deployment，
+//     这里再校验 namespace / Deployment 名格式）；
+//   - op 只支持 "replace"，不做 add/remove，避免删字段；
+//   - path 必须在白名单里：副本数、容器镜像、容器内存/CPU 的
+//     limit/request；黑名单字段（hostNetwork、privileged、
+//     command/args、metadata/name 等）明确拒绝；
+//   - 每个 Patch 的值格式要合法，不合法就拒绝整个建议，
+//     不给一张半合法的卡；
+//   - 系统命名空间一律拒绝。
+// 和集群现状有关的检查（容器下标越界、内存倍数）不在这里，
+// 在 ValidatePatchWithCurrent 里，调用方读到现状后再调它。
+func ValidatePatch(namespace, deployment string, patches []store.PatchOperation) error {
+	if namespace == "" || deployment == "" {
 		return fmt.Errorf("提案缺少目标信息")
 	}
 	if namespace == "kube-system" || namespace == "kube-public" || namespace == "kube-node-lease" {
@@ -140,15 +279,33 @@ func ValidatePatchSpec(namespace, deployment, container, oldValue, newValue stri
 	if !repairNsRe.MatchString(namespace) {
 		return fmt.Errorf("namespace 格式非法: %q", namespace)
 	}
-	if !repairNameRe.MatchString(deployment) || !repairNameRe.MatchString(container) {
-		return fmt.Errorf("目标名格式非法: %s/%s", deployment, container)
+	if !repairNameRe.MatchString(deployment) {
+		return fmt.Errorf("目标名格式非法: %q", deployment)
 	}
-	if oldValue == "" || newValue == "" || oldValue == newValue {
-		return fmt.Errorf("提案的新旧值非法")
+	if len(patches) == 0 {
+		return fmt.Errorf("Patch 列表为空")
 	}
-	if !isMemoryValue(oldValue) || !isMemoryValue(newValue) {
-		return fmt.Errorf("内存值必须是 Mi 或 Gi 结尾，例如 128Mi、2Gi")
+	for i, p := range patches {
+		if p.Op != "replace" {
+			return fmt.Errorf("第 %d 个 Patch 的 op 只支持 replace，得到 %q", i+1, p.Op)
+		}
+		if bad := isBlacklistedPath(p.Path); bad != "" {
+			return fmt.Errorf("禁止修改字段 %q（path %q）", bad, p.Path)
+		}
+		kind, _, err := parsePatchPath(p.Path)
+		if err != nil {
+			return fmt.Errorf("第 %d 个 Patch：%w", i+1, err)
+		}
+		if err := validatePatchValue(kind, p.Value); err != nil {
+			return fmt.Errorf("第 %d 个 Patch（%s）：%w", i+1, p.Path, err)
+		}
 	}
+	return nil
+}
+
+// checkMemoryBounds 检查内存新值相对旧值的两个上限：
+// 新值必须大于旧值、不超过旧值的 MaxRatio 倍、不超过 MaxMemoryMi。
+func checkMemoryBounds(oldValue, newValue string) error {
 	oldMi, err := parseMemoryMi(oldValue)
 	if err != nil || oldMi <= 0 {
 		return fmt.Errorf("旧值解析失败: %q", oldValue)
@@ -169,24 +326,138 @@ func ValidatePatchSpec(namespace, deployment, container, oldValue, newValue stri
 	return nil
 }
 
+// ValidatePatchWithCurrent 在读到集群现状后做第二层校验：
+// 容器下标不能越界；内存 limit/request 的新值要满足倍数和上限。
+// 内存 request 的旧值可能为空（没配 request），
+// 此时只检查新值不超过上限，不做倍数比较。
+func ValidatePatchWithCurrent(dep *appsv1.Deployment, patches []store.PatchOperation) error {
+	if dep == nil {
+		return fmt.Errorf("目标 Deployment 为空")
+	}
+	containers := dep.Spec.Template.Spec.Containers
+	for i, p := range patches {
+		kind, idx, err := parsePatchPath(p.Path)
+		if err != nil {
+			return fmt.Errorf("第 %d 个 Patch：%w", i+1, err)
+		}
+		if idx >= 0 {
+			if idx >= len(containers) {
+				return fmt.Errorf("第 %d 个 Patch 的容器下标 %d 越界，目标只有 %d 个容器", i+1, idx, len(containers))
+			}
+			ct := containers[idx]
+			newStr := patchValueString(p.Value)
+			switch kind {
+			case "memoryLimit":
+				if err := checkMemoryBounds(ct.Resources.Limits.Memory().String(), newStr); err != nil {
+					return fmt.Errorf("第 %d 个 Patch（%s）：%w", i+1, p.Path, err)
+				}
+			case "memoryRequest":
+				old := ct.Resources.Requests.Memory().String()
+				if old != "" && old != "0" {
+					if err := checkMemoryBounds(old, newStr); err != nil {
+						return fmt.Errorf("第 %d 个 Patch（%s）：%w", i+1, p.Path, err)
+					}
+				} else if newMi, err := parseMemoryMi(newStr); err != nil || newMi <= 0 || newMi > MaxMemoryMi {
+					return fmt.Errorf("第 %d 个 Patch（%s）：新值 %s 超过上限 %dMi", i+1, p.Path, newStr, MaxMemoryMi)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// patchValueString 把 Patch 的 Value 转成字符串，
+// 和 agent.PatchValueString 同样的规则（数字不带小数点），
+// repair 包内直接用，避免循环引用。
+func patchValueString(v any) string {
+	switch t := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return t
+	case float64:
+		if t == float64(int64(t)) {
+			return fmt.Sprintf("%d", int64(t))
+		}
+		return fmt.Sprintf("%v", t)
+	default:
+		b, _ := json.Marshal(t)
+		return string(b)
+	}
+}
+
+// ResolveContainerIndex 按容器名重算 Patch 里的容器下标。
+// 模型给的 path 里下标可能写错（例如多容器 Deployment 里写了 0，
+// 实际要改的是第 2 个容器）：这里按建议卡里的容器名找到正确下标，
+// 把 /containers/N/ 里的 N 换成正确的，保证改的是模型指明的容器。
+// 容器名为空或在 Deployment 里找不到时，原样返回，不猜。
+func ResolveContainerIndex(patches []store.PatchOperation, dep *appsv1.Deployment, container string) []store.PatchOperation {
+	if container == "" || dep == nil {
+		return patches
+	}
+	idx := -1
+	for i, c := range dep.Spec.Template.Spec.Containers {
+		if c.Name == container {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return patches
+	}
+	out := make([]store.PatchOperation, len(patches))
+	for i, p := range patches {
+		out[i] = p
+		if m := containerPathRe.FindStringSubmatch(p.Path); m != nil {
+			out[i].Path = strings.Replace(p.Path, "/containers/"+m[1]+"/", fmt.Sprintf("/containers/%d/", idx), 1)
+		}
+	}
+	return out
+}
+
+// ValidatePatchSpec 是老接口（Slice 4-8 用），保留做兼容：
+// 只认内存 limit 的 old->new，内部转成一条通用 Patch 再校验，
+// 校验逻辑和新接口同一套，不再维护两份白名单。
+// 旧值和集群现状是否一致不在这里查，那是执行前校验（executePatch）
+// 重新读目标时核对的，两层分开，职责才清楚。
+func ValidatePatchSpec(namespace, deployment, container, oldValue, newValue string) error {
+	if namespace == "" || deployment == "" || container == "" {
+		return fmt.Errorf("提案缺少目标信息")
+	}
+	if oldValue == "" || newValue == "" || oldValue == newValue {
+		return fmt.Errorf("提案的新旧值非法")
+	}
+	if !isMemoryValue(oldValue) || !isMemoryValue(newValue) {
+		return fmt.Errorf("内存值必须是 Mi 或 Gi 结尾，例如 128Mi、2Gi")
+	}
+	patches := []store.PatchOperation{{
+		Op: "replace", Path: "/spec/template/spec/containers/0/resources/limits/memory", Value: newValue,
+	}}
+	if err := ValidatePatch(namespace, deployment, patches); err != nil {
+		return err
+	}
+	return checkMemoryBounds(oldValue, newValue)
+}
+
 // ExecutionResult 是执行结果，和 VerificationResult 分开存。
 // Satisfied 表示读回目标后确认新值已生效；Unknown 表示写入后
 // 读回失败、归因不明确，不能谎报成功，也不能直接判失败。
 // OldPodTemplateHash 是 Patch 前旧 Pod 的 pod-template-hash，
 // 验证阶段用它区分新旧 Pod。
 type ExecutionResult struct {
-	Status             string    `json:"status"`
-	DryRunOK           bool      `json:"dryRunOk"`
-	UID                string    `json:"uid,omitempty"`
-	ResourceVersion    string    `json:"resourceVersion,omitempty"`
-	BeforeValue        string    `json:"beforeValue,omitempty"`
-	AfterValue         string    `json:"afterValue,omitempty"`
-	Satisfied          bool      `json:"satisfied"`
-	Unknown            bool      `json:"unknown"`
-	AlreadyApplied     bool      `json:"alreadyApplied,omitempty"`
-	OldPodTemplateHash string    `json:"oldPodTemplateHash,omitempty"`
-	PatchTime          time.Time `json:"patchTime,omitempty"`
-	Error              string    `json:"error,omitempty"`
+	Status             string                  `json:"status"`
+	DryRunOK           bool                    `json:"dryRunOk"`
+	UID                string                  `json:"uid,omitempty"`
+	ResourceVersion    string                  `json:"resourceVersion,omitempty"`
+	BeforeValue        string                  `json:"beforeValue,omitempty"`
+	AfterValue         string                  `json:"afterValue,omitempty"`
+	Patches            []store.PatchOperation  `json:"patches,omitempty"`
+	Satisfied          bool                    `json:"satisfied"`
+	Unknown            bool                    `json:"unknown"`
+	AlreadyApplied     bool                    `json:"alreadyApplied,omitempty"`
+	OldPodTemplateHash string                  `json:"oldPodTemplateHash,omitempty"`
+	PatchTime          time.Time               `json:"patchTime,omitempty"`
+	Error              string                  `json:"error,omitempty"`
 }
 
 func (r ExecutionResult) toJSON() string {
@@ -295,8 +566,17 @@ func (e *Executor) Execute(ctx context.Context, changeID string) (*ExecutionResu
 	if c.Status != store.ChangeApproved {
 		return nil, nil, fmt.Errorf("提案 %s 未批准（状态 %s），不能执行", changeID, c.Status)
 	}
+	// 兜底：Patches 为空的老提案（直接写库、没走 CreateProposal 的），
+	// 从 old/new 值反推一条内存 Patch，和读库时的反推保持一致。
+	if len(c.Patches) == 0 && c.OldValue != "" && c.NewValue != "" {
+		c.Patches = []store.PatchOperation{{
+			Op: "replace", Path: "/spec/template/spec/containers/0/resources/limits/memory", Value: c.NewValue,
+		}}
+	}
 	// 白名单校验在前，非法提案直接标过期，不碰集群。
-	if err := ValidatePatchSpec(c.Namespace, c.Deployment, c.Container, c.OldValue, c.NewValue); err != nil {
+	// 静态校验（字段、格式）不过就直接拒绝；现状相关的校验
+	// （容器下标、内存倍数）在 executePatch 读到现状后再做。
+	if err := ValidatePatch(c.Namespace, c.Deployment, c.Patches); err != nil {
 		_ = e.Store.SetChangeExpired(ctx, changeID, err.Error())
 		e.appendStep(ctx, c.RunID, "修复被拒绝（白名单校验失败）："+err.Error(), "", err.Error())
 		return &ExecutionResult{Status: store.ExecExpired, Error: err.Error()}, nil, nil
@@ -316,13 +596,32 @@ func (e *Executor) Execute(ctx context.Context, changeID string) (*ExecutionResu
 	return execRes, verRes, nil
 }
 
+// patchSummary 把一组 Patch 写成一行摘要：
+// "path 旧值 -> 新值；path 旧值 -> 新值"，旧值读不到时只写新值。
+func patchSummary(patches []store.PatchOperation, before map[string]string) string {
+	parts := make([]string, 0, len(patches))
+	for _, p := range patches {
+		after := patchValueString(p.Value)
+		if old, ok := before[p.Path]; ok && old != "" {
+			parts = append(parts, fmt.Sprintf("%s %s -> %s", p.Path, old, after))
+		} else {
+			parts = append(parts, fmt.Sprintf("%s -> %s", p.Path, after))
+		}
+	}
+	return strings.Join(parts, "；")
+}
+
 func (e *Executor) execSummary(r *ExecutionResult) string {
 	switch r.Status {
 	case store.ExecExecuted:
 		if r.AlreadyApplied {
-			return fmt.Sprintf("修复已生效（之前已应用过）：容器内存 limit 已是 %s", r.AfterValue)
+			return fmt.Sprintf("修复已生效（之前已应用过）：%s", patchSummary(r.Patches, map[string]string{}))
 		}
-		return fmt.Sprintf("修复已写入：容器内存 limit %s -> %s，读回确认已生效", r.BeforeValue, r.AfterValue)
+		before := map[string]string{}
+		if r.BeforeValue != "" && len(r.Patches) > 0 {
+			before[r.Patches[0].Path] = r.BeforeValue
+		}
+		return fmt.Sprintf("修复已写入：%s，读回确认已生效", patchSummary(r.Patches, before))
 	case store.ExecExpired:
 		return "修复过期未执行：" + r.Error
 	case store.ExecUnknown:
@@ -343,13 +642,83 @@ func (e *Executor) verifySummary(r *VerificationResult) string {
 	}
 }
 
-func currentMemoryLimit(dep *appsv1.Deployment, container string) (string, bool) {
-	for _, ct := range dep.Spec.Template.Spec.Containers {
-		if ct.Name == container {
-			return ct.Resources.Limits.Memory().String(), true
+// currentValueForPatch 从 Deployment 现状里读一条 Patch 对应的当前值，
+// 返回可展示的字符串。内存/CPU 用 resource.Quantity 的规范写法
+// （例如 "128Mi"、"500m"），镜像直接比字符串，副本数比数字。
+// 找不到容器时返回 found=false。
+func currentValueForPatch(dep *appsv1.Deployment, p store.PatchOperation) (string, bool) {
+	kind, idx, err := parsePatchPath(p.Path)
+	if err != nil {
+		return "", false
+	}
+	if kind == "replicas" {
+		if dep.Spec.Replicas == nil {
+			return "1", true
 		}
+		return fmt.Sprintf("%d", *dep.Spec.Replicas), true
+	}
+	if idx < 0 || idx >= len(dep.Spec.Template.Spec.Containers) {
+		return "", false
+	}
+	ct := dep.Spec.Template.Spec.Containers[idx]
+	switch kind {
+	case "image":
+		return ct.Image, true
+	case "memoryLimit":
+		return ct.Resources.Limits.Memory().String(), true
+	case "memoryRequest":
+		return ct.Resources.Requests.Memory().String(), true
+	case "cpuLimit":
+		return ct.Resources.Limits.Cpu().String(), true
+	case "cpuRequest":
+		return ct.Resources.Requests.Cpu().String(), true
 	}
 	return "", false
+}
+
+// patchValuesEqual 比较 Patch 的期望值和现状值是否一致。
+// 内存/CPU 按数量比较（"256Mi" 和 "256Mi" 相等，"0.5" 和 "500m" 也相等），
+// 镜像和副本数按字符串比较（副本数先转成整数再比，避免 "3" 和 "3.0" 不等）。
+func patchValuesEqual(kind, current, expected string) bool {
+	switch kind {
+	case "memoryLimit", "memoryRequest", "cpuLimit", "cpuRequest":
+		cq, err1 := resource.ParseQuantity(current)
+		eq, err2 := resource.ParseQuantity(expected)
+		if err1 != nil || err2 != nil {
+			return current == expected
+		}
+		return cq.Cmp(eq) == 0
+	case "replicas":
+		cn, ok1 := patchNumber(current)
+		en, ok2 := patchNumber(expected)
+		if !ok1 || !ok2 {
+			return current == expected
+		}
+		return cn == en
+	default:
+		return current == expected
+	}
+}
+
+// currentValues 批量读一组 Patch 的当前值，key 是 path。
+func currentValues(dep *appsv1.Deployment, patches []store.PatchOperation) map[string]string {
+	out := map[string]string{}
+	for _, p := range patches {
+		if v, ok := currentValueForPatch(dep, p); ok {
+			out[p.Path] = v
+		}
+	}
+	return out
+}
+
+// firstPatchBeforeAfter 取第一个 Patch 的改前/改后值，
+// 存进 ExecutionResult 的 BeforeValue / AfterValue 做展示和兼容，
+// 完整列表在 ExecutionResult.Patches 里。
+func firstPatchBeforeAfter(patches []store.PatchOperation, before map[string]string) (string, string) {
+	if len(patches) == 0 {
+		return "", ""
+	}
+	return before[patches[0].Path], patchValueString(patches[0].Value)
 }
 
 func oldPodTemplateHash(ctx context.Context, rc kube.RepairClient, namespace, deployment string) string {
@@ -368,6 +737,9 @@ func oldPodTemplateHash(ctx context.Context, rc kube.RepairClient, namespace, de
 }
 
 // executePatch 做执行前校验、dry-run、真实 Patch 和读回确认。
+// 通用流程（Slice 9）：不再只拼内存 Patch，
+// 而是把模型给的 Patches 列表原样传给 client-go 的 Patch API
+// （JSONPatchType），改镜像、改内存、改副本数走同一条路。
 // 返回的 ExecutionResult 一定不为空，调用方按 Status 分流。
 func (e *Executor) executePatch(ctx context.Context, c *store.ChangeRequest) *ExecutionResult {
 	// 1. 重新读取目标，执行前校验。读不到目标就按未知处理：
@@ -378,81 +750,145 @@ func (e *Executor) executePatch(ctx context.Context, c *store.ChangeRequest) *Ex
 	}
 	uid := string(dep.UID)
 	oldHash := oldPodTemplateHash(ctx, e.Repair, c.Namespace, c.Deployment)
+	// 按容器名重算下标：模型给的 path 里下标可能写错，
+	// 这里按提案里的容器名纠正，保证改的是指明的容器。
+	patches := ResolveContainerIndex(c.Patches, dep, c.Container)
 	// 2. UID 校验：提案生成时绑定的 UID 非空、且和现在的不一样，
 	// 说明目标已被删了重建，提案的前提变了，标为过期，不执行。
 	if c.DeploymentUID != "" && c.DeploymentUID != uid {
 		reason := fmt.Sprintf("目标 UID 已变化（提案 %s，现在 %s），目标可能已被重建", c.DeploymentUID, uid)
 		_ = e.Store.SetChangeExpired(ctx, c.ID, reason)
-		return &ExecutionResult{Status: store.ExecExpired, UID: uid, OldPodTemplateHash: oldHash, Error: reason}
+		return &ExecutionResult{Status: store.ExecExpired, UID: uid, Patches: patches, OldPodTemplateHash: oldHash, Error: reason}
 	}
-	// 3. 容器和当前值校验。
-	current, found := currentMemoryLimit(dep, c.Container)
-	if !found {
-		reason := fmt.Sprintf("目标里没有容器 %q", c.Container)
+	// 容器名校验：提案指明的容器必须在目标里，否则前提变了。
+	if c.Container != "" {
+		found := false
+		for _, ct := range dep.Spec.Template.Spec.Containers {
+			if ct.Name == c.Container {
+				found = true
+				break
+			}
+		}
+		if !found {
+			reason := fmt.Sprintf("目标里没有容器 %q", c.Container)
+			_ = e.Store.SetChangeExpired(ctx, c.ID, reason)
+			return &ExecutionResult{Status: store.ExecExpired, UID: uid, Patches: patches, OldPodTemplateHash: oldHash, Error: reason}
+		}
+	}
+	before := currentValues(dep, patches)
+	beforeVal, afterVal := firstPatchBeforeAfter(patches, before)
+	// 4. 幂等：如果每条 Patch 的当前值都已经等于新值，
+	// 说明 Patch 其实已经生效过（例如上次执行后进程崩了、重启后重跑），
+	// 直接记为已执行，不要重复 Patch，也不要误判为过期。
+	if len(patches) > 0 && e.allPatchesSatisfied(dep, patches) {
+		return &ExecutionResult{Status: store.ExecExecuted, UID: uid, ResourceVersion: dep.ResourceVersion, BeforeValue: beforeVal, AfterValue: afterVal, Patches: patches, Satisfied: true, AlreadyApplied: true, OldPodTemplateHash: oldHash, PatchTime: time.Now()}
+	}
+	// 4b. 现状校验：容器下标越界、内存倍数/上限在这里查，
+	// 提案生成时校验过一次，执行前还要再查一次现状，
+	// 因为审批和执行之间现状可能已经变了。
+	// 注意顺序：必须放在幂等判断之后——当前值已经等于新值时，
+	// “新值必须大于旧值”这条倍数检查一定不通过（新值等于现状），
+	// 但那正是“之前已经执行过”的情况，应该直接记为已执行，
+	// 而不是标过期。
+	if err := ValidatePatchWithCurrent(dep, patches); err != nil {
+		reason := "执行前校验失败：" + err.Error()
 		_ = e.Store.SetChangeExpired(ctx, c.ID, reason)
-		return &ExecutionResult{Status: store.ExecExpired, UID: uid, OldPodTemplateHash: oldHash, Error: reason}
+		return &ExecutionResult{Status: store.ExecExpired, UID: uid, Patches: patches, OldPodTemplateHash: oldHash, Error: reason}
 	}
-	// 幂等：如果当前值已经等于新值，说明 Patch 其实已经生效过
-	// （例如上次执行后进程崩了、重启后重跑），直接记为已执行，
-	// 不要重复 Patch，也不要误判为过期。
-	if current == c.NewValue {
-		return &ExecutionResult{Status: store.ExecExecuted, UID: uid, ResourceVersion: dep.ResourceVersion, BeforeValue: current, AfterValue: current, Satisfied: true, AlreadyApplied: true, OldPodTemplateHash: oldHash, PatchTime: time.Now()}
-	}
-	// 旧值也不匹配，说明有人在审批和执行之间改过目标，前提变了，过期。
-	if current != c.OldValue {
-		reason := fmt.Sprintf("当前值 %s 既不是提案旧值 %s 也不是新值 %s，前提已变", current, c.OldValue, c.NewValue)
-		_ = e.Store.SetChangeExpired(ctx, c.ID, reason)
-		return &ExecutionResult{Status: store.ExecExpired, UID: uid, BeforeValue: current, OldPodTemplateHash: oldHash, Error: reason}
+	// 5. 前提核对：第一个 Patch 的当前值既不是提案旧值也不是新值，
+	// 说明有人在审批和执行之间改过目标，前提变了，过期。
+	// OldValue 是提案生成时第一个 Patch 的改前值（Worker 按现状填的），
+	// 老提案的 OldValue 是内存旧值，同一条逻辑。
+	if c.OldValue != "" && len(patches) > 0 {
+		kind, _, _ := parsePatchPath(patches[0].Path)
+		cur := before[patches[0].Path]
+		if !patchValuesEqual(kind, cur, c.OldValue) && !patchValuesEqual(kind, cur, patchValueString(patches[0].Value)) {
+			reason := fmt.Sprintf("当前值 %s 既不是提案旧值 %s 也不是新值 %s，前提已变", cur, c.OldValue, patchValueString(patches[0].Value))
+			_ = e.Store.SetChangeExpired(ctx, c.ID, reason)
+			return &ExecutionResult{Status: store.ExecExpired, UID: uid, BeforeValue: cur, Patches: patches, OldPodTemplateHash: oldHash, Error: reason}
+		}
 	}
 	rv := dep.ResourceVersion
+	patchJSON, _ := json.Marshal(patches)
 
-	// 4. dry-run 先行：只校验，不落盘。dry-run 失败就停在这里，
+	// 6. dry-run 先行：只校验，不落盘。dry-run 失败就停在这里，
 	// 不要发真实 Patch。
 	patchCtx, cancel := context.WithTimeout(ctx, e.patchTimeout())
 	defer cancel()
-	if _, err := e.Repair.PatchDeploymentMemoryLimit(patchCtx, c.Namespace, c.Deployment, c.Container, c.NewValue, rv, true); err != nil {
-		return &ExecutionResult{Status: store.ExecFailed, UID: uid, ResourceVersion: rv, BeforeValue: current, OldPodTemplateHash: oldHash, Error: "dry-run 失败：" + err.Error()}
+	if _, err := e.Repair.PatchDeployment(patchCtx, c.Namespace, c.Deployment, patchJSON, rv, true); err != nil {
+		return &ExecutionResult{Status: store.ExecFailed, UID: uid, ResourceVersion: rv, BeforeValue: beforeVal, AfterValue: afterVal, Patches: patches, OldPodTemplateHash: oldHash, Error: "dry-run 失败：" + err.Error()}
 	}
 
-	// 5. 真实 Patch，用本次读取的 resourceVersion 做并发校验。
-	// 如果中间有人改过目标，API Server 会返回 409，Patch 失败。
+	// 7. 条件更新：JSONPatchType 的 patch 体里没有地方放 resourceVersion，
+	// 所以在发真实 Patch 之前再读一次目标，核对 resourceVersion 没变，
+	// 变了说明中间有人改过目标，停下来标过期，不按旧前提 Patch。
+	// 这和原来把 resourceVersion 写进 strategic merge patch 的
+	// metadata 是同一层保证，只是换了一种实现方式。
+	if dep2, err := e.Repair.GetDeploymentForRepair(ctx, c.Namespace, c.Deployment); err != nil || dep2.ResourceVersion != rv {
+		reason := "执行期间目标被修改（resourceVersion 已变），前提已变"
+		if err != nil {
+			reason = "真实 Patch 前重读目标失败：" + err.Error()
+		}
+		_ = e.Store.SetChangeExpired(ctx, c.ID, reason)
+		return &ExecutionResult{Status: store.ExecExpired, UID: uid, ResourceVersion: rv, BeforeValue: beforeVal, AfterValue: afterVal, Patches: patches, OldPodTemplateHash: oldHash, Error: reason}
+	}
+
+	// 8. 真实 Patch，用同一组 Patches。
 	patchTime := time.Now()
-	if _, err := e.Repair.PatchDeploymentMemoryLimit(patchCtx, c.Namespace, c.Deployment, c.Container, c.NewValue, rv, false); err != nil {
+	if _, err := e.Repair.PatchDeployment(patchCtx, c.Namespace, c.Deployment, patchJSON, rv, false); err != nil {
 		// 写入出错（包括超时）先读回目标再下结论，不要直接判失败：
 		// Patch 可能其实已经生效了，只是响应没回来。
-		return e.readBackAfterPatchError(ctx, c, uid, rv, current, oldHash, patchTime, err)
+		return e.readBackAfterPatchError(ctx, c, patches, uid, rv, beforeVal, oldHash, patchTime, err)
 	}
 
-	// 6. 写入后读回确认。
-	return e.readBack(ctx, c, uid, rv, current, oldHash, patchTime)
+	// 9. 写入后读回确认：逐条核对每条 Patch 的值都已生效。
+	return e.readBack(ctx, c, patches, uid, rv, beforeVal, oldHash, patchTime)
 }
 
 // readBackAfterPatchError 在 Patch 报错后读回目标，
-// 新值已生效记 executed，仍是旧值记 failed，读回也失败记 unknown。
-func (e *Executor) readBackAfterPatchError(ctx context.Context, c *store.ChangeRequest, uid, rv, before, oldHash string, patchTime time.Time, patchErr error) *ExecutionResult {
+// 每条 Patch 的新值都已生效记 executed，
+// 仍是旧值记 failed，读回也失败记 unknown。
+func (e *Executor) readBackAfterPatchError(ctx context.Context, c *store.ChangeRequest, patches []store.PatchOperation, uid, rv, before string, oldHash string, patchTime time.Time, patchErr error) *ExecutionResult {
 	dep, err := e.Repair.GetDeploymentForRepair(ctx, c.Namespace, c.Deployment)
 	if err != nil {
-		return &ExecutionResult{Status: store.ExecUnknown, UID: uid, ResourceVersion: rv, BeforeValue: before, DryRunOK: true, OldPodTemplateHash: oldHash, PatchTime: patchTime, Error: fmt.Sprintf("Patch 失败（%v），且读回目标也失败，无法确认是否生效", patchErr)}
+		return &ExecutionResult{Status: store.ExecUnknown, UID: uid, ResourceVersion: rv, BeforeValue: before, DryRunOK: true, Patches: patches, OldPodTemplateHash: oldHash, PatchTime: patchTime, Error: fmt.Sprintf("Patch 失败（%v），且读回目标也失败，无法确认是否生效", patchErr)}
 	}
-	current, _ := currentMemoryLimit(dep, c.Container)
-	if current == c.NewValue {
-		return &ExecutionResult{Status: store.ExecExecuted, UID: uid, ResourceVersion: dep.ResourceVersion, BeforeValue: before, AfterValue: current, Satisfied: true, DryRunOK: true, OldPodTemplateHash: oldHash, PatchTime: patchTime, Error: fmt.Sprintf("Patch 返回错误（%v），但读回确认新值已生效", patchErr)}
+	after := currentValues(dep, patches)
+	_, afterVal := firstPatchBeforeAfter(patches, after)
+	if e.allPatchesSatisfied(dep, patches) {
+		return &ExecutionResult{Status: store.ExecExecuted, UID: uid, ResourceVersion: dep.ResourceVersion, BeforeValue: before, AfterValue: afterVal, Satisfied: true, DryRunOK: true, Patches: patches, OldPodTemplateHash: oldHash, PatchTime: patchTime, Error: fmt.Sprintf("Patch 返回错误（%v），但读回确认新值已生效", patchErr)}
 	}
-	return &ExecutionResult{Status: store.ExecFailed, UID: uid, ResourceVersion: dep.ResourceVersion, BeforeValue: before, AfterValue: current, DryRunOK: true, OldPodTemplateHash: oldHash, PatchTime: patchTime, Error: "Patch 失败：" + patchErr.Error()}
+	return &ExecutionResult{Status: store.ExecFailed, UID: uid, ResourceVersion: dep.ResourceVersion, BeforeValue: before, AfterValue: afterVal, DryRunOK: true, Patches: patches, OldPodTemplateHash: oldHash, PatchTime: patchTime, Error: "Patch 失败：" + patchErr.Error()}
 }
 
-// readBack 写入后读回目标，确认新值已生效才记 executed，
+// allPatchesSatisfied 检查每条 Patch 的当前值是否都等于期望的新值。
+func (e *Executor) allPatchesSatisfied(dep *appsv1.Deployment, patches []store.PatchOperation) bool {
+	for _, p := range patches {
+		kind, _, err := parsePatchPath(p.Path)
+		if err != nil {
+			return false
+		}
+		cur, ok := currentValueForPatch(dep, p)
+		if !ok || !patchValuesEqual(kind, cur, patchValueString(p.Value)) {
+			return false
+		}
+	}
+	return true
+}
+
+// readBack 写入后读回目标，确认每条 Patch 的新值都已生效才记 executed，
 // 否则记 unknown（不谎报成功）。
-func (e *Executor) readBack(ctx context.Context, c *store.ChangeRequest, uid, rv, before, oldHash string, patchTime time.Time) *ExecutionResult {
+func (e *Executor) readBack(ctx context.Context, c *store.ChangeRequest, patches []store.PatchOperation, uid, rv, before string, oldHash string, patchTime time.Time) *ExecutionResult {
 	dep, err := e.Repair.GetDeploymentForRepair(ctx, c.Namespace, c.Deployment)
 	if err != nil {
-		return &ExecutionResult{Status: store.ExecUnknown, UID: uid, ResourceVersion: rv, BeforeValue: before, DryRunOK: true, OldPodTemplateHash: oldHash, PatchTime: patchTime, Error: "写入后读回目标失败，无法确认是否生效：" + err.Error()}
+		return &ExecutionResult{Status: store.ExecUnknown, UID: uid, ResourceVersion: rv, BeforeValue: before, DryRunOK: true, Patches: patches, OldPodTemplateHash: oldHash, PatchTime: patchTime, Error: "写入后读回目标失败，无法确认是否生效：" + err.Error()}
 	}
-	current, _ := currentMemoryLimit(dep, c.Container)
-	if current == c.NewValue {
-		return &ExecutionResult{Status: store.ExecExecuted, UID: uid, ResourceVersion: dep.ResourceVersion, BeforeValue: before, AfterValue: current, Satisfied: true, DryRunOK: true, OldPodTemplateHash: oldHash, PatchTime: patchTime}
+	after := currentValues(dep, patches)
+	_, afterVal := firstPatchBeforeAfter(patches, after)
+	if e.allPatchesSatisfied(dep, patches) {
+		return &ExecutionResult{Status: store.ExecExecuted, UID: uid, ResourceVersion: dep.ResourceVersion, BeforeValue: before, AfterValue: afterVal, Satisfied: true, DryRunOK: true, Patches: patches, OldPodTemplateHash: oldHash, PatchTime: patchTime}
 	}
-	return &ExecutionResult{Status: store.ExecUnknown, UID: uid, ResourceVersion: dep.ResourceVersion, BeforeValue: before, AfterValue: current, DryRunOK: true, OldPodTemplateHash: oldHash, PatchTime: patchTime, Error: fmt.Sprintf("写入后读回的值是 %s，不是期望的新值 %s", current, c.NewValue)}
+	return &ExecutionResult{Status: store.ExecUnknown, UID: uid, ResourceVersion: dep.ResourceVersion, BeforeValue: before, AfterValue: afterVal, DryRunOK: true, Patches: patches, OldPodTemplateHash: oldHash, PatchTime: patchTime, Error: fmt.Sprintf("写入后读回的值是 %v，不是期望的新值", after)}
 }
 
 // Verify 独立验证 rollout。

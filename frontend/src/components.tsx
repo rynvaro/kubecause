@@ -523,7 +523,12 @@ function ResultBlockView({ block, onConvert, converting }: { block: ResultBlock;
     case 'repairSuggestion': {
       const sr = block.data as SuggestedRepair
       if (!sr || !sr.namespace || !sr.deployment) return null
-      summary = `${sr.namespace}/${sr.deployment} ${sr.oldValue ?? ''} → ${sr.newValue ?? ''}`
+      // 通用 Patch 摘要：有 patches 时写“n 个 Patch”，
+      // 老卡没有 patches 时沿用旧的“旧值 → 新值”写法。
+      summary =
+        sr.patches && sr.patches.length > 0
+          ? `${sr.namespace}/${sr.deployment} · ${sr.patches.length} 个 Patch`
+          : `${sr.namespace}/${sr.deployment} ${sr.oldValue ?? ''} → ${sr.newValue ?? ''}`
       body = <RepairSuggestionCard sr={sr} onConvert={onConvert} converting={converting} />
       break
     }
@@ -587,6 +592,75 @@ export function StructuredView({
   )
 }
 
+/** 把一条 Patch 的 path 翻译成人话，再配上新值展示。
+ * 旧值只有老卡才有（field=oldValue->newValue），通用 Patch 只有新值，
+ * 读不到旧值时只显示新值，不编一个旧值出来。 */
+export function patchLabel(path: string): string {
+  if (path === '/spec/replicas') return '副本数'
+  if (path.endsWith('/image')) return '镜像'
+  if (path.endsWith('/resources/limits/memory')) return '内存 limit'
+  if (path.endsWith('/resources/requests/memory')) return '内存 request'
+  if (path.endsWith('/resources/limits/cpu')) return 'CPU limit'
+  if (path.endsWith('/resources/requests/cpu')) return 'CPU request'
+  return path
+}
+
+function patchValueText(v: unknown): string {
+  if (v === null || v === undefined) return '—'
+  if (typeof v === 'string') return v
+  return String(v)
+}
+
+/** 通用 Patch 列表展示（Slice 9）：每行一个 Patch，
+ * 字段中文名 + path + 旧值 → 新值（旧值读不到只显示新值）。
+ * 老的 memory-only 卡没有 patches 时，按旧字段显示一行内存变更。 */
+export function PatchList({
+  patches,
+  oldValue,
+  newValue,
+}: {
+  patches?: Array<{ op: string; path: string; value: unknown }>
+  oldValue?: string
+  newValue?: string
+}) {
+  const list = patches ?? []
+  if (list.length === 0) {
+    return (
+      <p>
+        {oldValue ?? ''} → <b>{newValue ?? ''}</b>
+      </p>
+    )
+  }
+  return (
+    <table className="tbl">
+      <thead>
+        <tr>
+          <th>字段</th>
+          <th>路径</th>
+          <th>新值</th>
+        </tr>
+      </thead>
+      <tbody>
+        {list.map((p, i) => (
+          <tr key={`${p.path}-${i}`}>
+            <td>{patchLabel(p.path)}</td>
+            <td>
+              <code>{p.path}</code>
+            </td>
+            <td>
+              {/* 只有单条 Patch 且老卡给了旧值时才显示旧值 → 新值，
+                  否则只显示新值：旧值要从集群现状读，前端手里没有，
+                  不能编。 */}
+              {list.length === 1 && oldValue ? `${oldValue} → ` : ''}
+              <b>{patchValueText(p.value)}</b>
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  )
+}
+
 /** 修复建议卡（对话模式）：只是一张卡，不会自动执行。 */
 export function RepairSuggestionCard({
   sr,
@@ -603,10 +677,9 @@ export function RepairSuggestionCard({
       <p>
         目标：{sr.namespace}/{sr.deployment} 容器 {sr.container}
         <br />
-        字段：{sr.field}，{sr.oldValue} → <b>{sr.newValue}</b>
-        <br />
         理由：{sr.reason}
       </p>
+      <PatchList patches={sr.patches} oldValue={sr.oldValue} newValue={sr.newValue} />
       <p className="muted small">
         这只是一张建议卡，不会自动改集群。想走正式流程，点“创建可审批的修复任务”，
         生成一份带提案的诊断任务，人工审批后才会执行。
@@ -693,11 +766,10 @@ export function ApprovalCard({
       <p>
         目标：{proposal.namespace}/{proposal.deployment} 容器 {proposal.container}
         <br />
-        内存 limit {proposal.oldValue} → <b>{proposal.newValue}</b>
-        <br />
         提案状态：{proposal.status}
         {proposal.approver ? `，审批人：${proposal.approver}` : ''}
       </p>
+      <PatchList patches={proposal.patches} oldValue={proposal.oldValue} newValue={proposal.newValue} />
       <button onClick={() => onDecide('approved')} disabled={!pending || deciding}>
         批准
       </button>{' '}

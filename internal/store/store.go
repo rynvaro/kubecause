@@ -17,6 +17,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -99,6 +100,21 @@ type RunStep struct {
 // DeploymentUID 是提案生成时绑定的目标 Deployment UID，执行前要重新
 // 核对，变了就说明目标已被重建，提案过期。ExecutionDetail /
 // VerificationDetail 存执行和验证结果的 JSON，分开存、分开展示。
+//
+// Patches 是通用 Patch 列表（Slice 9）：一份提案可以改多个字段，
+// 每个 Patch 是 op/path/value（目前只支持 op="replace"），
+// 例如改镜像 /spec/template/spec/containers/0/image、改内存
+// /spec/template/spec/containers/0/resources/limits/memory、
+// 改副本数 /spec/replicas。OldValue / NewValue 只保留做展示用，
+// 取第一个 Patch 的改前/改后值；执行时以 Patches 为准。
+// 老提案没有 Patches（库里 patches_json 为空）时，读出来会从
+// OldValue / NewValue 反推一条内存 limit 的 Patch，保证向后兼容。
+type PatchOperation struct {
+	Op    string `json:"op"`   // 目前只支持 "replace"
+	Path  string `json:"path"` // 例如 /spec/template/spec/containers/0/image
+	Value any    `json:"value"`
+}
+
 type ChangeRequest struct {
 	ID                 string    `json:"id"`
 	RunID              string    `json:"runId"`
@@ -107,6 +123,7 @@ type ChangeRequest struct {
 	Container          string    `json:"container"`
 	OldValue           string    `json:"oldValue"`
 	NewValue           string    `json:"newValue"`
+	Patches            []PatchOperation `json:"patches,omitempty"`
 	DeploymentUID      string    `json:"deploymentUid,omitempty"`
 	Status             string    `json:"status"`
 	Approver           string    `json:"approver,omitempty"`
@@ -223,6 +240,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			container TEXT NOT NULL,
 			old_value TEXT NOT NULL,
 			new_value TEXT NOT NULL,
+			patches_json TEXT NOT NULL DEFAULT '',
 			deployment_uid TEXT NOT NULL DEFAULT '',
 			status TEXT NOT NULL DEFAULT 'pending',
 			approver TEXT NOT NULL DEFAULT '',
@@ -264,6 +282,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	// SQLite 的 ADD COLUMN 没有 IF NOT EXISTS，所以先查表结构再决定加不加。
 	for _, col := range []struct{ name, typ string }{
 		{"deployment_uid", "TEXT NOT NULL DEFAULT ''"},
+		{"patches_json", "TEXT NOT NULL DEFAULT ''"},
 		{"execution_detail", "TEXT NOT NULL DEFAULT ''"},
 		{"verification_detail", "TEXT NOT NULL DEFAULT ''"},
 	} {
@@ -481,6 +500,36 @@ func (s *Store) ListStepsAfter(ctx context.Context, runID string, after int) ([]
 	return out, rows.Err()
 }
 
+// marshalPatches 把 Patch 列表序列化成存库的 JSON，空列表存 ""。
+func marshalPatches(patches []PatchOperation) string {
+	if len(patches) == 0 {
+		return ""
+	}
+	b, _ := json.Marshal(patches)
+	return string(b)
+}
+
+// unmarshalPatches 把库里的 patches_json 读回 Patch 列表。
+// 空字符串表示老提案（Slice 8 及以前建的库没有这一列），
+// 此时从 oldValue / newValue 反推一条内存 limit 的 Patch，
+// 让老提案读出来也是通用 Patch 格式，前端和执行器不用分两套逻辑。
+// 反推的 path 用容器下标 0：执行前 repair 层会按容器名重算下标，
+// 这里只是给展示和兼容用，不直接拿去 Patch。
+func unmarshalPatches(patchesJSON, oldValue, newValue string) []PatchOperation {
+	if strings.TrimSpace(patchesJSON) != "" {
+		var out []PatchOperation
+		if err := json.Unmarshal([]byte(patchesJSON), &out); err == nil && len(out) > 0 {
+			return out
+		}
+	}
+	if oldValue != "" && newValue != "" {
+		return []PatchOperation{{
+			Op: "replace", Path: "/spec/template/spec/containers/0/resources/limits/memory", Value: newValue,
+		}}
+	}
+	return nil
+}
+
 // CreateChangeRequest 创建一份待审批提案，同一任务重复创建时直接返回已有的那份，
 // 保证一个任务最多只有一份有效提案，不会因为 Worker 重试而重复出提案。
 func (s *Store) CreateChangeRequest(ctx context.Context, c *ChangeRequest) (*ChangeRequest, error) {
@@ -498,39 +547,42 @@ func (s *Store) CreateChangeRequest(ctx context.Context, c *ChangeRequest) (*Cha
 	c.CreatedAt = now()
 	c.UpdatedAt = c.CreatedAt
 	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO change_requests(id, run_id, namespace, deployment, container, old_value, new_value, deployment_uid, status, approver, execution_status, verification_status, execution_detail, verification_detail, created_at, updated_at)
-		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		c.ID, c.RunID, c.Namespace, c.Deployment, c.Container, c.OldValue, c.NewValue, c.DeploymentUID, c.Status, "", c.ExecutionStatus, c.VerificationStatus, "", "", c.CreatedAt, c.UpdatedAt)
+		`INSERT INTO change_requests(id, run_id, namespace, deployment, container, old_value, new_value, patches_json, deployment_uid, status, approver, execution_status, verification_status, execution_detail, verification_detail, created_at, updated_at)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		c.ID, c.RunID, c.Namespace, c.Deployment, c.Container, c.OldValue, c.NewValue, marshalPatches(c.Patches), c.DeploymentUID, c.Status, "", c.ExecutionStatus, c.VerificationStatus, "", "", c.CreatedAt, c.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
+	return c, nil
+}
+
+// scanChangeRequest 把一行 change_requests 读进结构体，
+// patches_json 和 old/new 值的映射集中在这里，三个读入口共用。
+func scanChangeRequest(row *sql.Row) (*ChangeRequest, error) {
+	c := &ChangeRequest{}
+	var patchesJSON string
+	err := row.Scan(&c.ID, &c.RunID, &c.Namespace, &c.Deployment, &c.Container, &c.OldValue, &c.NewValue, &patchesJSON, &c.DeploymentUID, &c.Status, &c.Approver, &c.ExecutionStatus, &c.VerificationStatus, &c.ExecutionDetail, &c.VerificationDetail, &c.CreatedAt, &c.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	c.Patches = unmarshalPatches(patchesJSON, c.OldValue, c.NewValue)
 	return c, nil
 }
 
 // GetChangeRequestByRun 取一个任务的提案。
 func (s *Store) GetChangeRequestByRun(ctx context.Context, runID string) (*ChangeRequest, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, run_id, namespace, deployment, container, old_value, new_value, deployment_uid, status, approver, execution_status, verification_status, execution_detail, verification_detail, created_at, updated_at
+		`SELECT id, run_id, namespace, deployment, container, old_value, new_value, patches_json, deployment_uid, status, approver, execution_status, verification_status, execution_detail, verification_detail, created_at, updated_at
 		 FROM change_requests WHERE run_id=? ORDER BY created_at ASC LIMIT 1`, runID)
-	c := &ChangeRequest{}
-	err := row.Scan(&c.ID, &c.RunID, &c.Namespace, &c.Deployment, &c.Container, &c.OldValue, &c.NewValue, &c.DeploymentUID, &c.Status, &c.Approver, &c.ExecutionStatus, &c.VerificationStatus, &c.ExecutionDetail, &c.VerificationDetail, &c.CreatedAt, &c.UpdatedAt)
-	if err != nil {
-		return nil, err
-	}
-	return c, nil
+	return scanChangeRequest(row)
 }
 
 // GetChangeRequest 按提案 ID 取。
 func (s *Store) GetChangeRequest(ctx context.Context, id string) (*ChangeRequest, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, run_id, namespace, deployment, container, old_value, new_value, deployment_uid, status, approver, execution_status, verification_status, execution_detail, verification_detail, created_at, updated_at
+		`SELECT id, run_id, namespace, deployment, container, old_value, new_value, patches_json, deployment_uid, status, approver, execution_status, verification_status, execution_detail, verification_detail, created_at, updated_at
 		 FROM change_requests WHERE id=?`, id)
-	c := &ChangeRequest{}
-	err := row.Scan(&c.ID, &c.RunID, &c.Namespace, &c.Deployment, &c.Container, &c.OldValue, &c.NewValue, &c.DeploymentUID, &c.Status, &c.Approver, &c.ExecutionStatus, &c.VerificationStatus, &c.ExecutionDetail, &c.VerificationDetail, &c.CreatedAt, &c.UpdatedAt)
-	if err != nil {
-		return nil, err
-	}
-	return c, nil
+	return scanChangeRequest(row)
 }
 
 // DecideApproval 是审批决定的唯一入口，幂等：
@@ -572,10 +624,10 @@ func (s *Store) ClaimApprovedChange(ctx context.Context) (*ChangeRequest, error)
 	}
 	defer func() { _ = tx.Rollback() }()
 	row := tx.QueryRowContext(ctx,
-		`SELECT id, run_id, namespace, deployment, container, old_value, new_value, deployment_uid, status, approver, execution_status, verification_status, execution_detail, verification_detail, created_at, updated_at
+		`SELECT id, run_id, namespace, deployment, container, old_value, new_value, patches_json, deployment_uid, status, approver, execution_status, verification_status, execution_detail, verification_detail, created_at, updated_at
 		 FROM change_requests WHERE status='approved' AND execution_status='not_started' ORDER BY created_at ASC LIMIT 1`)
-	c := &ChangeRequest{}
-	if err := row.Scan(&c.ID, &c.RunID, &c.Namespace, &c.Deployment, &c.Container, &c.OldValue, &c.NewValue, &c.DeploymentUID, &c.Status, &c.Approver, &c.ExecutionStatus, &c.VerificationStatus, &c.ExecutionDetail, &c.VerificationDetail, &c.CreatedAt, &c.UpdatedAt); err != nil {
+	c, err := scanChangeRequest(row)
+	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}

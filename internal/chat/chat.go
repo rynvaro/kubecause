@@ -420,56 +420,94 @@ func resolveTargetFromHistory(ctx context.Context, s *Service, history []store.C
 // 注意：这只是桩模型（Stub）测试路径用的确定性规则，不是产品逻辑。
 // 真模型路径（runReal）不调它：修复决策只能由模型做，后端只做校验。
 // 即便有 OOM 这个案例，也不要为了演示写死——规则合成永远只是测试替身。
-// 只有证据明确指向 OOMKilled、且能读到 Deployment 的当前内存 limit 时才给，
-// 新值是旧值翻倍（封顶 4Gi），再过一次 ValidatePatchSpec，
+// 只有证据明确指向 OOMKilled、且能读到 Deployment 的当前内存 limit 时才给内存卡，
+// 或证据明确指向 ImagePullBackOff、且当前镜像是 fake 场景的坏 tag 时才给镜像卡，
+// 新值是旧值翻倍（封顶 4Gi）或 fake 场景的好镜像，再过一次 ValidatePatch，
 // 不通过就不给卡。合成的卡和模型直接给的卡一样，
 // 都只是建议，不生成 change_requests，不执行。
+// 两种卡都走同一套通用 Patch 格式，不再只认内存。
 func synthesizeRepair(ctx context.Context, s *Service, outputs []agent.ToolOutput, namespace, deployment string) *agent.SuggestedRepair {
 	joined := ""
-	var limit, container string
+	var limit, container, image string
 	for _, out := range outputs {
 		joined += out.Summary + " "
+		// 一手证据优先：search_runbooks 的片段是手册内容，不是现场数据，
+		// 不能让它参与信号判断——例如查 ImagePullBackOff 时，
+		// 手册片段里可能提到 OOM，会把镜像案误判成内存案。
+		// 检索结果只看摘要（摘要里只有命中了哪篇手册），不看片段全文。
+		if data, ok := out.Data.(map[string]any); ok {
+			if _, isRunbook := data["snippets"]; isRunbook {
+				continue
+			}
+		}
 		b, _ := json.Marshal(out.Data)
 		joined += string(b) + " "
 		if data, ok := out.Data.(map[string]any); ok {
 			if containers, ok := data["containers"].([]map[string]string); ok && len(containers) > 0 {
 				limit = containers[0]["memoryLimit"]
 				container = containers[0]["name"]
+				image = containers[0]["image"]
 			}
 		}
-	}
-	if !strings.Contains(joined, "OOMKilled") && !strings.Contains(joined, "out of memory") {
-		return nil
 	}
 	if namespace == "" || deployment == "" {
 		return nil
 	}
-	// 容器和 limit 以集群现状为准：建议卡上的旧值必须和现状一致，
+	// 容器、limit 和镜像以集群现状为准：建议卡上的旧值必须和现状一致，
 	// 否则转成正式诊断时 Worker 会直接放弃生成提案。
-	if limit == "" || container == "" {
+	if limit == "" || container == "" || image == "" {
 		if depOut, err := s.Tools.GetDeployment(ctx, namespace, deployment); err == nil {
 			if data, ok := depOut.Data.(map[string]any); ok {
 				if containers, ok := data["containers"].([]map[string]string); ok && len(containers) > 0 {
-					limit = containers[0]["memoryLimit"]
-					container = containers[0]["name"]
+					if limit == "" {
+						limit = containers[0]["memoryLimit"]
+					}
+					if container == "" {
+						container = containers[0]["name"]
+					}
+					if image == "" {
+						image = containers[0]["image"]
+					}
 				}
 			}
 		}
 	}
-	if limit == "" || container == "" {
+	if container == "" {
 		return nil
 	}
-	newValue := repair.DoubleMemory(limit, repair.MaxMemoryMi)
-	if newValue == "" {
-		return nil
+	isOOM := strings.Contains(joined, "OOMKilled") || strings.Contains(joined, "out of memory")
+	isImagePull := strings.Contains(joined, "ImagePullBackOff") || strings.Contains(joined, "Failed to pull image")
+	if isOOM && limit != "" {
+		newValue := repair.DoubleMemory(limit, repair.MaxMemoryMi)
+		if newValue == "" {
+			return nil
+		}
+		sr := &agent.SuggestedRepair{
+			Namespace: namespace, Deployment: deployment, Container: container,
+			Field: "memoryLimit", OldValue: limit, NewValue: newValue,
+			Reason: "容器内存限制过低，触发 OOMKilled 导致反复重启",
+		}
+		sr.Normalize()
+		if err := repair.ValidatePatchSpec(sr.Namespace, sr.Deployment, sr.Container, sr.OldValue, sr.NewValue); err != nil {
+			return nil
+		}
+		return sr
 	}
-	sr := &agent.SuggestedRepair{
-		Namespace: namespace, Deployment: deployment, Container: container,
-		Field: "memoryLimit", OldValue: limit, NewValue: newValue,
-		Reason: "容器内存限制过低，触发 OOMKilled 导致反复重启",
+	// 镜像卡：只在 fake 场景的坏 tag（demo-api:bad-tag）上给，
+	// 新镜像是 fake 场景的好镜像 demo-api:latest。
+	// 真集群上的坏镜像 tag 各不相同，新镜像只能由模型或用户决定，
+	// 规则合成猜不出一个正确的 tag，这里不猜。
+	if isImagePull && image == "demo-api:bad-tag" {
+		sr := &agent.SuggestedRepair{
+			Namespace: namespace, Deployment: deployment, Container: container,
+			Field: "image", OldValue: image, NewValue: "demo-api:latest",
+			Reason: "镜像 tag 不存在，拉取失败导致 Pod 卡在 ImagePullBackOff",
+		}
+		sr.Normalize()
+		if err := repair.ValidatePatch(sr.Namespace, sr.Deployment, sr.Patches); err != nil {
+			return nil
+		}
+		return sr
 	}
-	if err := repair.ValidatePatchSpec(sr.Namespace, sr.Deployment, sr.Container, sr.OldValue, sr.NewValue); err != nil {
-		return nil
-	}
-	return sr
+	return nil
 }

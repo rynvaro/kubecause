@@ -1,13 +1,27 @@
 // 前后端共用的类型定义，和 Go 后端返回的 JSON 字段一一对应。
 // 后端改了字段名这里也要跟着改，不要各写各的。
 
+// 通用 Patch 里的一条操作（Slice 9）：op 只支持 replace，
+// path 是白名单里的字段路径，value 是新值。
+export interface PatchOperation {
+  op: string
+  path: string
+  value: unknown
+}
+
+// 修复建议（Slice 9，通用 Patch 格式）：
+// patches 是要改的字段列表，不再只认内存。
+// field / oldValue / newValue 是旧字段，保留做兼容，
+// 老的 memory-only 卡读进来时后端已转成 patches，
+// 前端两个都给了时以 patches 为准。
 export interface SuggestedRepair {
   namespace: string
   deployment: string
   container: string
-  field: string
-  oldValue: string
-  newValue: string
+  patches?: PatchOperation[]
+  field?: string
+  oldValue?: string
+  newValue?: string
   reason: string
 }
 
@@ -37,6 +51,9 @@ export interface ChangeRequest {
   container: string
   oldValue: string
   newValue: string
+  // 通用 Patch 列表（Slice 9）：审批卡按这个列表展示，
+  // 老提案没有它时按 oldValue/newValue 显示一条内存变更。
+  patches?: PatchOperation[]
   deploymentUid?: string
   status: string
   approver?: string

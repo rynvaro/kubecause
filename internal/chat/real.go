@@ -33,9 +33,10 @@ const chatSystemPrompt = `你是 Kubernetes 故障诊断助手，正在和用户
 3. 指代消解：用户说的“这个命名空间”、“刚才那个 Pod”、“它”、“那个一直重启的”要按会话历史里的最近提到的目标来理解。如果历史里没有明确的目标，或者有多个可能的目标，不要猜，直接问用户是哪个命名空间、哪个 Pod。
 4. 系统命名空间可以查、可以诊断，但不要把它当成用户业务下结论：如果查到的有问题 Pod 在 kube-system 等系统命名空间里，要明确说明这是系统组件，并且不要给它出修复建议——修复校验本来就会拒绝系统命名空间的修改。
 5. 证据不足时不要硬编结论，要说还需要补查什么。回答用中文，简明扼要，先给结论再给依据。
-6. 如果证据明确指向容器内存 limit 过低，可以在回答最后给出修复建议（目标、旧值、新值、理由），并提醒用户：这只是建议，要创建可审批的修复任务、人工审批后才会执行。
-7. 修复建议必须通过 submit_diagnosis 的 suggestedRepair 结构化字段返回，不要只在自由文本里提一句。用户如果明确说了增加量（例如“增加 128Mi”、“调到 256Mi”），按用户说的算新值：先查当前值，再按用户说的增量或目标值算，不要默认翻倍。没有用户明确要求时，也按证据算一个合理的新值，不要只会翻倍。
-8. 修复决策只能由你做：后端只做校验，不会替你合成建议。如果你给不出结构化建议，就老实说证据不足、还需要补查什么，不要编一个建议。`
+6. 如果证据或用户明确要求指向一次具体变更，可以在回答最后给出修复建议（目标、要改的字段、新值、理由），并提醒用户：这只是建议，要创建可审批的修复任务、人工审批后才会执行。
+7. 修复建议必须通过 submit_diagnosis 的 suggestedRepair 结构化字段返回，不要只在自由文本里提一句。suggestedRepair 里用 patches 列表描述要改的字段，每个 Patch 是 op/path/value：op 只支持 replace；path 是白名单里的字段，例如改镜像 /spec/template/spec/containers/0/image、改内存 limit /spec/template/spec/containers/0/resources/limits/memory、改副本数 /spec/replicas；value 是合法的新值。用户如果明确说了要改成什么值（例如“换成 nginx:1.25”、“增加 128Mi”、“调到 256Mi”），按用户说的算新值：先查当前值，再按用户说的增量或目标值算，不要默认翻倍。没有用户明确要求时，也按证据算一个合理的新值，不要只会翻倍。用户上一轮已经明确说了新值时，直接用那个值生成结构化 Patch，不要再问一遍。
+8. 修复决策只能由你做：后端只做校验，不会替你合成建议。如果你给不出结构化建议，就老实说证据不足、还需要补查什么，不要编一个建议。
+9. 用户明确说了要改成什么值时（例如“帮我把 demo-api 的镜像换成 nginx:1.26”），不用先做故障诊断：先查当前值确认一下，再直接给出 Patch 建议。Pod 现在是健康的也不用先找故障，主动变更和故障修复走同一套 Patch 流程。`
 
 // runReal 是真模型的对话循环：
 // 每轮最多调 s.maxSteps() 次工具（默认 12，配置中心可改），每次问模型一步，
@@ -96,13 +97,23 @@ func (s *Service) runReal(ctx context.Context, conversationID, text string, hist
 				// 模型给了最终回答但没有结构化修复建议：追问一次，
 				// 让它用 submit_diagnosis 把建议补回来，而不是由后端合成。
 				askedForStructured = true
-				msgs = append(msgs, model.ChatMessage{Role: "user", Content: "如果你认为需要修复，请调用 submit_diagnosis 提交结构化诊断报告，并在 suggestedRepair 里给出目标、旧值、新值和理由（用户如果明确说了增加量，按用户说的算）。如果证据不足以给修复建议，请直接说明还需要补查什么，不要编一个建议。"})
+				msgs = append(msgs, model.ChatMessage{Role: "user", Content: "如果你认为需要修复，请调用 submit_diagnosis 提交结构化诊断报告，并在 suggestedRepair 里用 patches 列表给出要改的字段（每个 Patch 是 op/path/value，op 只支持 replace，path 是白名单里的字段，value 是合法的新值；用户如果明确说了新值，按用户说的算）。如果证据不足以给修复建议，请直接说明还需要补查什么，不要编一个建议。"})
 				continue
 			}
 			if sr != nil {
 				structured["suggestedRepair"] = sr
-				replyText += fmt.Sprintf("\n修复建议：%s/%s 容器 %s 的内存 limit 从 %s 调到 %s（%s）。这只是一张建议卡，不会自动执行——想走正式流程可以点“创建可审批的修复任务”，生成提案后人工审批再执行。",
-					sr.Namespace, sr.Deployment, sr.Container, sr.OldValue, sr.NewValue, sr.Reason)
+				// 通用 Patch 摘要：逐条列 path 和新值，旧值能从建议卡里
+				// 读到时才写“旧值 -> 新值”，读不到只写新值，不编旧值。
+				parts := make([]string, 0, len(sr.Patches))
+				for _, p := range sr.Patches {
+					parts = append(parts, fmt.Sprintf("%s -> %s", p.Path, agent.PatchValueString(p.Value)))
+				}
+				summary := strings.Join(parts, "；")
+				if summary == "" && sr.NewValue != "" {
+					summary = fmt.Sprintf("%s -> %s", sr.Field, sr.NewValue)
+				}
+				replyText += fmt.Sprintf("\n修复建议：%s/%s 容器 %s：%s（%s）。这只是一张建议卡，不会自动执行——想走正式流程可以点“创建可审批的修复任务”，生成提案后人工审批再执行。",
+					sr.Namespace, sr.Deployment, sr.Container, summary, sr.Reason)
 			}
 			return &Reply{Reply: replyText, ToolCalls: recs, Structured: structured, SuggestedRepair: sr}, nil
 		}

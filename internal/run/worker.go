@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -122,6 +123,25 @@ func (w *Worker) execute(ctx context.Context, run *store.Run) error {
 		_ = w.Store.SetStatus(ctx, run.ID, store.StatusFailed, "", fmt.Sprintf("读取已有步骤失败: %v", err))
 		return err
 	}
+	// 1b. 对话里已确认的建议（Slice 10）：转正式诊断时前端把建议卡的
+	// 目标和 Patches（或创建规格）一起带过来，存在 Run 上。
+	// 这种任务不用重新诊断一遍，直接拿建议去校验、生成提案。
+	// 以前这里总是重跑 Agent 循环：目标猜错（demo-bad-image 的卡
+	// 建成 demo-api 的任务）、8 步用完、置信度 low、事实重复、
+	// 没有提案，修复任务从来没成功过。带建议的任务跳过 Agent 循环，
+	// 报告按建议直接生成，事实去重在 Report.Normalize 里做。
+	if carried := carriedReport(run); carried != nil {
+		reportJSON, _ := json.Marshal(carried)
+		if err := w.Store.SetStatus(ctx, run.ID, store.StatusCompleted, string(reportJSON), ""); err != nil {
+			return err
+		}
+		seq, _ := w.Store.NextSeq(ctx, run.ID)
+		_ = w.Store.AppendStep(ctx, &store.RunStep{RunID: run.ID, Seq: seq, Kind: "report", Summary: carried.Cause, ResultJSON: string(reportJSON)})
+		if carried.Confidence == "high" || carried.Confidence == "medium" {
+			_ = w.maybeCreateProposal(ctx, run, carried)
+		}
+		return nil
+	}
 	// 2. 组装 Agent，OnStep 把每一步写库。Seq 在写库时按已有最大序号 +1 算，
 	//    这样即使进程在两步之间崩掉，序号也不会断、不会重。
 	ag := &agent.Agent{Tools: w.Tools, Model: w.Model}
@@ -170,6 +190,64 @@ func (w *Worker) execute(ctx context.Context, run *store.Run) error {
 	return nil
 }
 
+// carriedReport 把 Run 上带过来的建议转成一份报告，不重新诊断。
+// 建议来自对话里用户已经确认的卡（转正式诊断时前端一起传过来），
+// 报告的事实就是“用户确认了这个建议”，原因就是建议里的理由，
+// 置信度 medium：没重新诊断，不敢说 high，但足够生成提案——
+// 提案还要过 ValidatePatch / ValidateCreation 和人工审批两关。
+// 事实去重在 Report.Normalize 里统一做，同一条事实不会出现两次。
+// 两个字段都没有、或解析失败时返回 nil，调用方走正常的 Agent 诊断循环。
+func carriedReport(run *store.Run) *agent.Report {
+	// 创建建议优先：一个任务要么是创建、要么是修复，不会两者都有。
+	if strings.TrimSpace(run.CreationJSON) != "" {
+		var spec store.CreationSpec
+		if err := json.Unmarshal([]byte(run.CreationJSON), &spec); err == nil && spec.Name != "" {
+			spec = *repair.NormalizeCreation(&spec)
+			rep := &agent.Report{
+				Facts:             []string{fmt.Sprintf("用户在对话里已确认创建建议：%s/%s，镜像 %s，%d 个副本", spec.Namespace, spec.Name, spec.Image, spec.Replicas)},
+				Cause:             fmt.Sprintf("用户要求创建 Deployment %s/%s", spec.Namespace, spec.Name),
+				EvidenceIDs:       []string{},
+				Recommendations:   []string{fmt.Sprintf("创建 Deployment %s/%s（镜像 %s），人工审批后执行", spec.Namespace, spec.Name, spec.Image)},
+				OpenQuestions:     []string{},
+				Confidence:        "medium",
+				SuggestedCreation: (*agent.SuggestedCreation)(&spec),
+			}
+			rep.Normalize()
+			return rep
+		}
+	}
+	if strings.TrimSpace(run.SuggestedJSON) != "" {
+		var sr agent.SuggestedRepair
+		if err := json.Unmarshal([]byte(run.SuggestedJSON), &sr); err == nil {
+			sr.Normalize()
+			patches := sr.ToPatches()
+			if len(patches) == 0 {
+				return nil
+			}
+			parts := make([]string, 0, len(patches))
+			for _, p := range patches {
+				parts = append(parts, fmt.Sprintf("%s -> %s", p.Path, agent.PatchValueString(p.Value)))
+			}
+			cause := sr.Reason
+			if strings.TrimSpace(cause) == "" {
+				cause = "按对话里确认的修复建议执行"
+			}
+			rep := &agent.Report{
+				Facts:           []string{fmt.Sprintf("用户在对话里已确认修复建议：%s/%s：%s", sr.Namespace, sr.Deployment, strings.Join(parts, "；"))},
+				Cause:           cause,
+				EvidenceIDs:     []string{},
+				Recommendations: []string{"按建议执行，人工审批后生效"},
+				OpenQuestions:   []string{},
+				Confidence:      "medium",
+				SuggestedRepair: &sr,
+			}
+			rep.Normalize()
+			return rep
+		}
+	}
+	return nil
+}
+
 // maybeCreateProposal 把模型报告里的修复建议转成一份待审批提案。
 // 通用逻辑（Slice 9）：不再只认内存，建议的目标和 Patch 列表
 // 都来自模型报告里的 SuggestedRepair，Worker 只做三件事：
@@ -192,6 +270,13 @@ func (w *Worker) execute(ctx context.Context, run *store.Run) error {
 // 任何一关不过都不生成提案，也不报错让任务失败——
 // 没有提案的诊断本身仍然是完整的，报告已经落盘了。
 func (w *Worker) maybeCreateProposal(ctx context.Context, run *store.Run, report *agent.Report) error {
+	// 创建建议（Slice 10）：和修复建议走同一条“生成提案”入口，
+	// 只是提案类型是 create，执行时走 CreateDeployment 而不是 Patch。
+	// 校验不通过、或目标已存在时不生成提案，
+	// 不会把一个非法或重复的创建变成可审批的东西。
+	if report.SuggestedCreation != nil {
+		return w.maybeCreateCreationProposal(ctx, run, report)
+	}
 	sr := report.SuggestedRepair
 	if sr == nil {
 		return nil
@@ -261,6 +346,42 @@ func (w *Worker) maybeCreateProposal(ctx context.Context, run *store.Run, report
 		RunID: run.ID, Namespace: namespace, Deployment: deployment,
 		Container: container, OldValue: oldValue, NewValue: newValue,
 		Patches: patches, DeploymentUID: uid,
+	})
+	return nil
+}
+
+// maybeCreateCreationProposal 把报告里的创建建议转成一份待审批的创建提案。
+// 通用逻辑（Slice 10）：建议的目标、镜像、副本数、资源都来自
+// 报告里的 SuggestedCreation，Worker 只做三件事：
+// 补默认值（副本数、容器名）、交给 repair.ValidateCreation 做静态校验、
+// 拿集群现状核对目标不存在。校验不通过、目标已存在时不生成提案，
+// 也不会因为没提案就让任务失败——没有提案的诊断本身仍然是完整的，
+// 报告已经落盘了。
+func (w *Worker) maybeCreateCreationProposal(ctx context.Context, run *store.Run, report *agent.Report) error {
+	spec := report.SuggestedCreation
+	if spec == nil {
+		return nil
+	}
+	if run.Kind != "Deployment" {
+		return nil
+	}
+	normalized := repair.NormalizeCreation(spec)
+	if err := repair.ValidateCreation(normalized); err != nil {
+		return nil
+	}
+	// 目标已存在时不生成创建提案：重复创建没有意义，
+	// 执行时也会因为同名已存在而标过期，这里提前拦住。
+	ta, ok := w.Tools.(*ToolsAdapter)
+	if !ok || ta.Kube == nil {
+		return nil
+	}
+	if _, err := ta.Kube.GetDeployment(ctx, normalized.Namespace, normalized.Name); err == nil {
+		return nil
+	}
+	_, _ = repair.CreateProposal(w.Store, &repair.Proposal{
+		RunID: run.ID, Namespace: normalized.Namespace, Deployment: normalized.Name,
+		Container: normalized.Container, OldValue: "", NewValue: normalized.Image,
+		Creation: normalized,
 	})
 	return nil
 }

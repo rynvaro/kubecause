@@ -354,11 +354,16 @@ func (h *Handler) PostConversationMessage(w http.ResponseWriter, r *http.Request
 
 // ConvertRequest 是 POST /api/conversations/{id}/convert 的请求体，
 // 全部字段可选：不填时按会话历史解析目标，解析不到就报错请明确指定。
+// Slice 10 起建议卡上的转换按钮会把卡的目标和 Patches（或创建规格）
+// 一起传过来，后端优先用它们，不再去历史里猜目标。
 type ConvertRequest struct {
-	Namespace string `json:"namespace,omitempty"`
-	Kind      string `json:"kind,omitempty"`
-	Name      string `json:"name,omitempty"`
-	Question  string `json:"question,omitempty"`
+	Namespace string                 `json:"namespace,omitempty"`
+	Kind      string                 `json:"kind,omitempty"`
+	Name      string                 `json:"name,omitempty"`
+	Container string                 `json:"container,omitempty"`
+	Question  string                 `json:"question,omitempty"`
+	Patches   []store.PatchOperation `json:"patches,omitempty"`
+	Creation  *store.CreationSpec    `json:"creation,omitempty"`
 }
 
 // ConvertConversation 处理 POST /api/conversations/{id}/convert，
@@ -371,7 +376,11 @@ func (h *Handler) ConvertConversation(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var req ConvertRequest
 	_ = json.NewDecoder(r.Body).Decode(&req)
-	runID, err := h.Chat.ConvertToRun(r.Context(), id, req.Namespace, req.Kind, req.Name, req.Question)
+	runID, err := h.Chat.ConvertToRun(r.Context(), id, chat.ConvertInput{
+		Namespace: req.Namespace, Kind: req.Kind, Name: req.Name,
+		Container: req.Container, Question: req.Question,
+		Patches: req.Patches, Creation: req.Creation,
+	})
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return

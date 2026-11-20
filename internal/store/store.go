@@ -72,10 +72,20 @@ type Run struct {
 	MaxSteps       int    `json:"maxSteps"`
 	TimeoutSeconds int    `json:"timeoutSeconds"`
 	// ReportJSON 是诊断报告的 JSON，空字符串表示还没有报告。
-	ReportJSON string    `json:"-"`
-	Error      string    `json:"error,omitempty"`
-	CreatedAt  time.Time `json:"createdAt"`
-	UpdatedAt  time.Time `json:"updatedAt"`
+	ReportJSON string `json:"-"`
+	// SuggestedJSON 是对话转正式诊断时带过来的修复建议（Slice 10），
+	// 存 SuggestedRepair 的 JSON。Worker 看到它就直接拿建议去校验、
+	// 生成提案，不用重新诊断一遍——以前重跑 8 步耗尽、置信度 low、
+	// 没有提案，修复任务从来没成功过。空字符串表示没有带建议，
+	// Worker 走正常的 Agent 诊断循环。
+	SuggestedJSON string `json:"-"`
+	// CreationJSON 是对话转正式诊断时带过来的创建建议（Slice 10），
+	// 存 CreationSpec 的 JSON。Worker 看到它就直接校验、生成创建提案，
+	// 同样不用重新诊断。空字符串表示不是创建任务。
+	CreationJSON string    `json:"-"`
+	Error        string    `json:"error,omitempty"`
+	CreatedAt    time.Time `json:"createdAt"`
+	UpdatedAt    time.Time `json:"updatedAt"`
 }
 
 // RunStep 对应 run_steps 表，序号在同一个任务内单调递增，
@@ -115,24 +125,56 @@ type PatchOperation struct {
 	Value any    `json:"value"`
 }
 
+// CreationSpec 是一份创建 Deployment 的建议（Slice 10）。
+// 只有创建才有这个结构：Patch 提案（kind="patch"）不填它。
+// 字段是创建时必须由模型或用户给全的东西：
+// 目标 namespace / Deployment 名 / 镜像 / 副本数，
+// 再加可选的容器名和资源 requests/limits。
+// 注意：只允许创建 Deployment，不直接创建裸 Pod——
+// 裸 Pod 挂了不会自动重建、没有 rollout，
+// 用户说“创建一个 Pod”时也要按 Deployment 给建议，
+// 并在对话里说明原因。这是建议的形状定义，
+// 能不能创建由 repair.ValidateCreation 再校验一遍。
+// 本类型是 agent.SuggestedCreation 的规范定义（见 agent 包的别名），
+// 和 PatchOperation 一样放在 store，避免循环引用。
+type CreationSpec struct {
+	Namespace     string `json:"namespace"`
+	Name          string `json:"name"` // Deployment 名
+	Image         string `json:"image"`
+	Replicas      int    `json:"replicas"`            // 0 表示未指定，校验时默认 1
+	Container     string `json:"container,omitempty"` // 容器名，空时默认 = Name
+	MemoryLimit   string `json:"memoryLimit,omitempty"`
+	MemoryRequest string `json:"memoryRequest,omitempty"`
+	CpuLimit      string `json:"cpuLimit,omitempty"`
+	CpuRequest    string `json:"cpuRequest,omitempty"`
+	Reason        string `json:"reason,omitempty"`
+}
+
 type ChangeRequest struct {
-	ID                 string    `json:"id"`
-	RunID              string    `json:"runId"`
-	Namespace          string    `json:"namespace"`
-	Deployment         string    `json:"deployment"`
-	Container          string    `json:"container"`
-	OldValue           string    `json:"oldValue"`
-	NewValue           string    `json:"newValue"`
-	Patches            []PatchOperation `json:"patches,omitempty"`
-	DeploymentUID      string    `json:"deploymentUid,omitempty"`
-	Status             string    `json:"status"`
-	Approver           string    `json:"approver,omitempty"`
-	ExecutionStatus    string    `json:"executionStatus"`
-	VerificationStatus string    `json:"verificationStatus"`
-	ExecutionDetail    string    `json:"executionDetail,omitempty"`
-	VerificationDetail string    `json:"verificationDetail,omitempty"`
-	CreatedAt          time.Time `json:"createdAt"`
-	UpdatedAt          time.Time `json:"updatedAt"`
+	ID            string           `json:"id"`
+	RunID         string           `json:"runId"`
+	Namespace     string           `json:"namespace"`
+	Deployment    string           `json:"deployment"`
+	Container     string           `json:"container"`
+	OldValue      string           `json:"oldValue"`
+	NewValue      string           `json:"newValue"`
+	Patches       []PatchOperation `json:"patches,omitempty"`
+	DeploymentUID string           `json:"deploymentUid,omitempty"`
+	// Kind 是提案类型（Slice 10）："patch" 是改已有 Deployment 的字段，
+	// "create" 是创建一个新的 Deployment。老提案没有这一列时读出来是 ""，
+	// 按 "patch" 处理，保证向后兼容。
+	Kind string `json:"kind,omitempty"`
+	// Creation 是创建提案的完整规格（Slice 10），只有 kind="create" 时才有，
+	// 库里以 creation_json 存，读出来反序列化。Patch 提案不填它。
+	Creation           *CreationSpec `json:"creation,omitempty"`
+	Status             string        `json:"status"`
+	Approver           string        `json:"approver,omitempty"`
+	ExecutionStatus    string        `json:"executionStatus"`
+	VerificationStatus string        `json:"verificationStatus"`
+	ExecutionDetail    string        `json:"executionDetail,omitempty"`
+	VerificationDetail string        `json:"verificationDetail,omitempty"`
+	CreatedAt          time.Time     `json:"createdAt"`
+	UpdatedAt          time.Time     `json:"updatedAt"`
 }
 
 // Conversation 对应 conversations 表，一次对话会话。
@@ -211,6 +253,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			max_steps INTEGER NOT NULL DEFAULT 8,
 			timeout_seconds INTEGER NOT NULL DEFAULT 60,
 			report_json TEXT NOT NULL DEFAULT '',
+			suggested_json TEXT NOT NULL DEFAULT '',
+			creation_json TEXT NOT NULL DEFAULT '',
 			error TEXT NOT NULL DEFAULT '',
 			created_at DATETIME NOT NULL,
 			updated_at DATETIME NOT NULL
@@ -242,6 +286,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			new_value TEXT NOT NULL,
 			patches_json TEXT NOT NULL DEFAULT '',
 			deployment_uid TEXT NOT NULL DEFAULT '',
+			kind TEXT NOT NULL DEFAULT 'patch',
+			creation_json TEXT NOT NULL DEFAULT '',
 			status TEXT NOT NULL DEFAULT 'pending',
 			approver TEXT NOT NULL DEFAULT '',
 			execution_status TEXT NOT NULL DEFAULT 'not_started',
@@ -285,8 +331,20 @@ func (s *Store) migrate(ctx context.Context) error {
 		{"patches_json", "TEXT NOT NULL DEFAULT ''"},
 		{"execution_detail", "TEXT NOT NULL DEFAULT ''"},
 		{"verification_detail", "TEXT NOT NULL DEFAULT ''"},
+		{"kind", "TEXT NOT NULL DEFAULT 'patch'"},
+		{"creation_json", "TEXT NOT NULL DEFAULT ''"},
 	} {
 		if err := s.ensureColumn(ctx, "change_requests", col.name, col.typ); err != nil {
+			return err
+		}
+	}
+	// runs 表的老库升级（Slice 10）：对话带过来的建议存在这两列，
+	// 老库没有时补上，空字符串表示没有带建议。
+	for _, col := range []struct{ name, typ string }{
+		{"suggested_json", "TEXT NOT NULL DEFAULT ''"},
+		{"creation_json", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := s.ensureColumn(ctx, "runs", col.name, col.typ); err != nil {
 			return err
 		}
 	}
@@ -352,18 +410,18 @@ func (s *Store) CreateRun(ctx context.Context, r *Run) error {
 	r.CreatedAt = now()
 	r.UpdatedAt = r.CreatedAt
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO runs(id, namespace, kind, name, question, status, max_steps, timeout_seconds, report_json, error, created_at, updated_at)
-		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
-		r.ID, r.Namespace, r.Kind, r.Name, r.Question, r.Status, r.MaxSteps, r.TimeoutSeconds, "", "", r.CreatedAt, r.UpdatedAt)
+		`INSERT INTO runs(id, namespace, kind, name, question, status, max_steps, timeout_seconds, report_json, suggested_json, creation_json, error, created_at, updated_at)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		r.ID, r.Namespace, r.Kind, r.Name, r.Question, r.Status, r.MaxSteps, r.TimeoutSeconds, "", r.SuggestedJSON, r.CreationJSON, "", r.CreatedAt, r.UpdatedAt)
 	return err
 }
 
 // GetRun 按 ID 取任务，不存在返回 sql.ErrNoRows。
 func (s *Store) GetRun(ctx context.Context, id string) (*Run, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, namespace, kind, name, question, status, max_steps, timeout_seconds, report_json, error, created_at, updated_at FROM runs WHERE id=?`, id)
+		`SELECT id, namespace, kind, name, question, status, max_steps, timeout_seconds, report_json, suggested_json, creation_json, error, created_at, updated_at FROM runs WHERE id=?`, id)
 	r := &Run{}
-	err := row.Scan(&r.ID, &r.Namespace, &r.Kind, &r.Name, &r.Question, &r.Status, &r.MaxSteps, &r.TimeoutSeconds, &r.ReportJSON, &r.Error, &r.CreatedAt, &r.UpdatedAt)
+	err := row.Scan(&r.ID, &r.Namespace, &r.Kind, &r.Name, &r.Question, &r.Status, &r.MaxSteps, &r.TimeoutSeconds, &r.ReportJSON, &r.SuggestedJSON, &r.CreationJSON, &r.Error, &r.CreatedAt, &r.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -380,10 +438,10 @@ func (s *Store) ClaimNext(ctx context.Context) (*Run, error) {
 	}
 	defer func() { _ = tx.Rollback() }()
 	row := tx.QueryRowContext(ctx,
-		`SELECT id, namespace, kind, name, question, status, max_steps, timeout_seconds, report_json, error, created_at, updated_at
+		`SELECT id, namespace, kind, name, question, status, max_steps, timeout_seconds, report_json, suggested_json, creation_json, error, created_at, updated_at
 		 FROM runs WHERE status='queued' ORDER BY created_at ASC LIMIT 1`)
 	r := &Run{}
-	if err := row.Scan(&r.ID, &r.Namespace, &r.Kind, &r.Name, &r.Question, &r.Status, &r.MaxSteps, &r.TimeoutSeconds, &r.ReportJSON, &r.Error, &r.CreatedAt, &r.UpdatedAt); err != nil {
+	if err := row.Scan(&r.ID, &r.Namespace, &r.Kind, &r.Name, &r.Question, &r.Status, &r.MaxSteps, &r.TimeoutSeconds, &r.ReportJSON, &r.SuggestedJSON, &r.CreationJSON, &r.Error, &r.CreatedAt, &r.UpdatedAt); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
@@ -530,6 +588,28 @@ func unmarshalPatches(patchesJSON, oldValue, newValue string) []PatchOperation {
 	return nil
 }
 
+// marshalCreation 把创建规格序列化成存库的 JSON，空（不是创建提案）存 ""。
+func marshalCreation(c *CreationSpec) string {
+	if c == nil {
+		return ""
+	}
+	b, _ := json.Marshal(c)
+	return string(b)
+}
+
+// unmarshalCreation 把库里的 creation_json 读回创建规格。
+// 空字符串表示 Patch 提案（或 Slice 10 之前的老提案），返回 nil。
+func unmarshalCreation(creationJSON string) *CreationSpec {
+	if strings.TrimSpace(creationJSON) == "" {
+		return nil
+	}
+	var out CreationSpec
+	if err := json.Unmarshal([]byte(creationJSON), &out); err != nil {
+		return nil
+	}
+	return &out
+}
+
 // CreateChangeRequest 创建一份待审批提案，同一任务重复创建时直接返回已有的那份，
 // 保证一个任务最多只有一份有效提案，不会因为 Worker 重试而重复出提案。
 func (s *Store) CreateChangeRequest(ctx context.Context, c *ChangeRequest) (*ChangeRequest, error) {
@@ -544,12 +624,15 @@ func (s *Store) CreateChangeRequest(ctx context.Context, c *ChangeRequest) (*Cha
 	c.Status = ChangePending
 	c.ExecutionStatus = ExecNotStarted
 	c.VerificationStatus = VerifyNotStarted
+	if c.Kind == "" {
+		c.Kind = "patch"
+	}
 	c.CreatedAt = now()
 	c.UpdatedAt = c.CreatedAt
 	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO change_requests(id, run_id, namespace, deployment, container, old_value, new_value, patches_json, deployment_uid, status, approver, execution_status, verification_status, execution_detail, verification_detail, created_at, updated_at)
-		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		c.ID, c.RunID, c.Namespace, c.Deployment, c.Container, c.OldValue, c.NewValue, marshalPatches(c.Patches), c.DeploymentUID, c.Status, "", c.ExecutionStatus, c.VerificationStatus, "", "", c.CreatedAt, c.UpdatedAt)
+		`INSERT INTO change_requests(id, run_id, namespace, deployment, container, old_value, new_value, patches_json, deployment_uid, kind, creation_json, status, approver, execution_status, verification_status, execution_detail, verification_detail, created_at, updated_at)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		c.ID, c.RunID, c.Namespace, c.Deployment, c.Container, c.OldValue, c.NewValue, marshalPatches(c.Patches), c.DeploymentUID, c.Kind, marshalCreation(c.Creation), c.Status, "", c.ExecutionStatus, c.VerificationStatus, "", "", c.CreatedAt, c.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -561,18 +644,20 @@ func (s *Store) CreateChangeRequest(ctx context.Context, c *ChangeRequest) (*Cha
 func scanChangeRequest(row *sql.Row) (*ChangeRequest, error) {
 	c := &ChangeRequest{}
 	var patchesJSON string
-	err := row.Scan(&c.ID, &c.RunID, &c.Namespace, &c.Deployment, &c.Container, &c.OldValue, &c.NewValue, &patchesJSON, &c.DeploymentUID, &c.Status, &c.Approver, &c.ExecutionStatus, &c.VerificationStatus, &c.ExecutionDetail, &c.VerificationDetail, &c.CreatedAt, &c.UpdatedAt)
+	var creationJSON string
+	err := row.Scan(&c.ID, &c.RunID, &c.Namespace, &c.Deployment, &c.Container, &c.OldValue, &c.NewValue, &patchesJSON, &c.DeploymentUID, &c.Kind, &creationJSON, &c.Status, &c.Approver, &c.ExecutionStatus, &c.VerificationStatus, &c.ExecutionDetail, &c.VerificationDetail, &c.CreatedAt, &c.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
 	c.Patches = unmarshalPatches(patchesJSON, c.OldValue, c.NewValue)
+	c.Creation = unmarshalCreation(creationJSON)
 	return c, nil
 }
 
 // GetChangeRequestByRun 取一个任务的提案。
 func (s *Store) GetChangeRequestByRun(ctx context.Context, runID string) (*ChangeRequest, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, run_id, namespace, deployment, container, old_value, new_value, patches_json, deployment_uid, status, approver, execution_status, verification_status, execution_detail, verification_detail, created_at, updated_at
+		`SELECT id, run_id, namespace, deployment, container, old_value, new_value, patches_json, deployment_uid, kind, creation_json, status, approver, execution_status, verification_status, execution_detail, verification_detail, created_at, updated_at
 		 FROM change_requests WHERE run_id=? ORDER BY created_at ASC LIMIT 1`, runID)
 	return scanChangeRequest(row)
 }
@@ -580,7 +665,7 @@ func (s *Store) GetChangeRequestByRun(ctx context.Context, runID string) (*Chang
 // GetChangeRequest 按提案 ID 取。
 func (s *Store) GetChangeRequest(ctx context.Context, id string) (*ChangeRequest, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, run_id, namespace, deployment, container, old_value, new_value, patches_json, deployment_uid, status, approver, execution_status, verification_status, execution_detail, verification_detail, created_at, updated_at
+		`SELECT id, run_id, namespace, deployment, container, old_value, new_value, patches_json, deployment_uid, kind, creation_json, status, approver, execution_status, verification_status, execution_detail, verification_detail, created_at, updated_at
 		 FROM change_requests WHERE id=?`, id)
 	return scanChangeRequest(row)
 }
@@ -624,7 +709,7 @@ func (s *Store) ClaimApprovedChange(ctx context.Context) (*ChangeRequest, error)
 	}
 	defer func() { _ = tx.Rollback() }()
 	row := tx.QueryRowContext(ctx,
-		`SELECT id, run_id, namespace, deployment, container, old_value, new_value, patches_json, deployment_uid, status, approver, execution_status, verification_status, execution_detail, verification_detail, created_at, updated_at
+		`SELECT id, run_id, namespace, deployment, container, old_value, new_value, patches_json, deployment_uid, kind, creation_json, status, approver, execution_status, verification_status, execution_detail, verification_detail, created_at, updated_at
 		 FROM change_requests WHERE status='approved' AND execution_status='not_started' ORDER BY created_at ASC LIMIT 1`)
 	c, err := scanChangeRequest(row)
 	if err != nil {

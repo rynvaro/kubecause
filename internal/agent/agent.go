@@ -77,14 +77,14 @@ type PatchOperation = store.PatchOperation
 // 旧测试和 eval 不用改；新模型应直接给 Patches，
 // 两个都给了时以 Patches 为准。
 type SuggestedRepair struct {
-	Namespace  string            `json:"namespace"`
-	Deployment string            `json:"deployment"`
-	Container  string            `json:"container"`
-	Patches    []PatchOperation  `json:"patches,omitempty"`
-	Field      string            `json:"field,omitempty"` // 旧字段，已废弃，见 Normalize
-	OldValue   string            `json:"oldValue,omitempty"`
-	NewValue   string            `json:"newValue,omitempty"`
-	Reason     string            `json:"reason"`
+	Namespace  string           `json:"namespace"`
+	Deployment string           `json:"deployment"`
+	Container  string           `json:"container"`
+	Patches    []PatchOperation `json:"patches,omitempty"`
+	Field      string           `json:"field,omitempty"` // 旧字段，已废弃，见 Normalize
+	OldValue   string           `json:"oldValue,omitempty"`
+	NewValue   string           `json:"newValue,omitempty"`
+	Reason     string           `json:"reason"`
 }
 
 // legacyFieldPath 把旧字段名映射到通用 Patch 的 path，
@@ -170,6 +170,15 @@ func PatchValueString(v any) string {
 	}
 }
 
+// SuggestedCreation 是模型在诊断报告里可选提出的创建建议（Slice 10）。
+// 它只是一个建议，不是可直接执行的创建：Worker 收到后还要经过
+// repair.ValidateCreation 校验、核对目标不存在、人工审批，
+// 三关都过了才生成创建提案。创建只针对 Deployment，
+// 不直接创建裸 Pod——用户说“创建一个 Pod”时也按 Deployment 给，
+// 并在对话里说明原因。类型是 store.CreationSpec 的别名，
+// 和 PatchOperation 一样，规范定义放在 store，避免循环引用。
+type SuggestedCreation = store.CreationSpec
+
 // Report 是诊断报告，字段和架构文档一致。
 type Report struct {
 	Facts           []string `json:"facts"`
@@ -181,6 +190,33 @@ type Report struct {
 	// SuggestedRepair 是可选的修复建议，模型觉得有把握才给，
 	// 没把握时留空，Worker 不会凭空生成提案。
 	SuggestedRepair *SuggestedRepair `json:"suggestedRepair,omitempty"`
+	// SuggestedCreation 是可选的创建建议（Slice 10），
+	// 只有用户明确要求创建 Deployment 时才给，
+	// 没把握或信息不全时留空，Worker 不会凭空生成创建提案。
+	SuggestedCreation *SuggestedCreation `json:"suggestedCreation,omitempty"`
+}
+
+// dedupeStrings 按顺序去重：同一条事实、建议、待确认、证据 ID
+// 只保留第一次出现。Slice 10 修的 bug：正式诊断里同一条事实
+// 出现了两遍（“Deployment demo-api, container demo-api memory limit 256Mi”
+// 重复），原因是多步工具摘要拼出来的事实本身就有重复，
+// 报告归一化时不去重就原样落盘、原样展示。
+// 去重只在归一化这一层做，不改工具摘要本身，
+// 工具时间线仍能看到每一步的原始记录。
+func dedupeStrings(in []string) []string {
+	if in == nil {
+		return []string{}
+	}
+	seen := map[string]bool{}
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
 }
 
 // Normalize 把 Report 里的切片字段补成空数组而不是 nil。
@@ -206,6 +242,11 @@ func (r *Report) Normalize() {
 	if r.OpenQuestions == nil {
 		r.OpenQuestions = []string{}
 	}
+	// 同一条事实/建议/待确认/证据只保留一次（见 dedupeStrings）。
+	r.Facts = dedupeStrings(r.Facts)
+	r.EvidenceIDs = dedupeStrings(r.EvidenceIDs)
+	r.Recommendations = dedupeStrings(r.Recommendations)
+	r.OpenQuestions = dedupeStrings(r.OpenQuestions)
 	if r.SuggestedRepair != nil {
 		r.SuggestedRepair.Normalize()
 	}
@@ -379,6 +420,15 @@ func ValidateReport(rep *Report, validEvidence map[string]bool) {
 		sr.Normalize()
 		if len(sr.Patches) == 0 {
 			rep.SuggestedRepair = nil
+		}
+	}
+	// 创建建议只做形状检查（Slice 10）：namespace / 名字 / 镜像
+	// 三个缺一不可，缺了说明模型没给全，不能生成创建提案。
+	// 值本身的合法性（镜像格式、副本数、资源上限）是
+	// repair.ValidateCreation 的职责，这里不替校验层做决定。
+	if sc := rep.SuggestedCreation; sc != nil {
+		if strings.TrimSpace(sc.Namespace) == "" || strings.TrimSpace(sc.Name) == "" || strings.TrimSpace(sc.Image) == "" {
+			rep.SuggestedCreation = nil
 		}
 	}
 }

@@ -10,6 +10,7 @@ import { buildBlocks, normalizeReport } from './types'
 import type {
   ChangeRequest,
   ClusterOverview,
+  ConvertPayload,
   DeploymentRow,
   PodRow,
   Report,
@@ -17,6 +18,7 @@ import type {
   RunbookSnippet,
   RunSnapshot,
   RunStep,
+  SuggestedCreation,
   SuggestedRepair,
   ToolCallRecord,
 } from './types'
@@ -467,8 +469,10 @@ export function DeploymentTable({ rows }: { rows: DeploymentRow[] }) {
 
 /** 一个结果块：标题栏永远可见，正文默认按类型折叠一部分。
  * 总览、报告、修复建议默认展开；Pod 表格、事件列表默认展开但内部只显示前几行，
- * 点开看全部。不知道的类型不渲染，直接返回 null，不白屏。 */
-function ResultBlockView({ block, onConvert, converting }: { block: ResultBlock; onConvert?: () => void; converting?: boolean }) {
+ * 点开看全部。不知道的类型不渲染，直接返回 null，不白屏。
+ * onConvert 带可选的转换目标（Slice 10）：建议卡上的按钮把这张卡的
+ * 目标和 Patches（或创建规格）一起传过去，后端优先用它们。 */
+function ResultBlockView({ block, onConvert, converting }: { block: ResultBlock; onConvert?: (payload?: ConvertPayload) => void; converting?: boolean }) {
   // 总览和修复建议是本轮的核心结论，默认展开；长列表默认展开但内部折叠行数。
   const [open, setOpen] = useState(block.kind !== 'events')
   const [showAllEvents, setShowAllEvents] = useState(false)
@@ -532,6 +536,13 @@ function ResultBlockView({ block, onConvert, converting }: { block: ResultBlock;
       body = <RepairSuggestionCard sr={sr} onConvert={onConvert} converting={converting} />
       break
     }
+    case 'creationSuggestion': {
+      const sc = block.data as SuggestedCreation
+      if (!sc || !sc.namespace || !sc.name || !sc.image) return null
+      summary = `${sc.namespace}/${sc.name} · ${sc.image} · ${sc.replicas ?? 1} 个副本`
+      body = <CreationSuggestionCard sc={sc} onConvert={onConvert} converting={converting} />
+      break
+    }
     case 'runbooks': {
       // 参考了哪篇手册：每个片段带标题和关键句，点开看全文要点。
       // runbooks 是 RAG 知识库（runbooks/*.md，FTS5 索引），不是为某个案例写的特例。
@@ -578,7 +589,7 @@ export function StructuredView({
   converting,
 }: {
   structured: Record<string, unknown>
-  onConvert?: () => void
+  onConvert?: (payload?: ConvertPayload) => void
   converting?: boolean
 }) {
   const blocks = buildBlocks(structured)
@@ -661,14 +672,16 @@ export function PatchList({
   )
 }
 
-/** 修复建议卡（对话模式）：只是一张卡，不会自动执行。 */
+/** 修复建议卡（对话模式）：只是一张卡，不会自动执行。
+ * 转换按钮把这张卡的目标和 Patches 一起传过去（Slice 10），
+ * 后端优先用它们建正式诊断，不再去历史里猜目标。 */
 export function RepairSuggestionCard({
   sr,
   onConvert,
   converting,
 }: {
   sr: SuggestedRepair
-  onConvert?: () => void
+  onConvert?: (payload?: ConvertPayload) => void
   converting?: boolean
 }) {
   return (
@@ -685,8 +698,87 @@ export function RepairSuggestionCard({
         生成一份带提案的诊断任务，人工审批后才会执行。
       </p>
       {onConvert && (
-        <button onClick={onConvert} disabled={converting}>
+        <button
+          onClick={() =>
+            onConvert({
+              namespace: sr.namespace,
+              kind: 'Deployment',
+              name: sr.deployment,
+              container: sr.container,
+              patches: sr.patches ?? [],
+            })
+          }
+          disabled={converting}
+        >
           {converting ? '创建中…' : '创建可审批的修复任务'}
+        </button>
+      )}
+    </div>
+  )
+}
+
+/** 创建建议卡（对话模式，Slice 10）：和修复建议卡长得一样，
+ * 只是标题和字段不同，动作从“改”换成“创建”。
+ * 转换按钮把创建规格一起传过去，后端直接校验、生成创建提案，
+ * 不用重新诊断一遍。 */
+export function CreationSuggestionCard({
+  sc,
+  onConvert,
+  converting,
+}: {
+  sc: SuggestedCreation
+  onConvert?: (payload?: ConvertPayload) => void
+  converting?: boolean
+}) {
+  const resources = [
+    sc.memoryLimit ? `内存 limit ${sc.memoryLimit}` : '',
+    sc.memoryRequest ? `内存 request ${sc.memoryRequest}` : '',
+    sc.cpuLimit ? `CPU limit ${sc.cpuLimit}` : '',
+    sc.cpuRequest ? `CPU request ${sc.cpuRequest}` : '',
+  ].filter(Boolean)
+  return (
+    <div className="card repair-card">
+      <h4>创建建议（仅建议，未执行）</h4>
+      <p>
+        目标：{sc.namespace}/{sc.name}
+        <br />
+        镜像：{sc.image}　副本数：{sc.replicas ?? 1}
+        {sc.container && sc.container !== sc.name ? (
+          <>
+            <br />
+            容器：{sc.container}
+          </>
+        ) : null}
+        {resources.length > 0 ? (
+          <>
+            <br />
+            资源：{resources.join('、')}
+          </>
+        ) : null}
+        {sc.reason ? (
+          <>
+            <br />
+            理由：{sc.reason}
+          </>
+        ) : null}
+      </p>
+      <p className="muted small">
+        这只是一张建议卡，不会自动创建。想走正式流程，点“创建可审批的创建任务”，
+        生成一份带提案的创建任务，人工审批后才会执行。
+      </p>
+      {onConvert && (
+        <button
+          onClick={() =>
+            onConvert({
+              namespace: sc.namespace,
+              kind: 'Deployment',
+              name: sc.name,
+              creation: sc,
+            })
+          }
+          disabled={converting}
+        >
+          {converting ? '创建中…' : '创建可审批的创建任务'}
         </button>
       )}
     </div>
@@ -745,11 +837,19 @@ export function ReportView({ report }: { report: Report }) {
       {evidenceIds.length > 0 && (
         <p className="muted small">证据：{evidenceIds.join('、')}</p>
       )}
+      {rep.suggestedCreation && (
+        <p className="muted small">
+          创建建议：{rep.suggestedCreation.namespace}/{rep.suggestedCreation.name}，
+          镜像 {rep.suggestedCreation.image}，{rep.suggestedCreation.replicas ?? 1} 个副本
+        </p>
+      )}
     </div>
   )
 }
 
-/** 审批卡：有提案时才显示，批准/拒绝调审批接口，重复提交返回当前结果。 */
+/** 审批卡：有提案时才显示，批准/拒绝调审批接口，重复提交返回当前结果。
+ * 创建提案（Slice 10）按创建规格展示（镜像、副本数、资源），
+ * 不按 Patch 列表展示——创建没有 Patch，只有要创建的东西。 */
 export function ApprovalCard({
   proposal,
   onDecide,
@@ -760,16 +860,45 @@ export function ApprovalCard({
   deciding: boolean
 }) {
   const pending = proposal.status === 'pending'
+  const isCreate = proposal.kind === 'create' && proposal.creation
+  const creation = proposal.creation
+  const resources = creation
+    ? [
+        creation.memoryLimit ? `内存 limit ${creation.memoryLimit}` : '',
+        creation.memoryRequest ? `内存 request ${creation.memoryRequest}` : '',
+        creation.cpuLimit ? `CPU limit ${creation.cpuLimit}` : '',
+        creation.cpuRequest ? `CPU request ${creation.cpuRequest}` : '',
+      ].filter(Boolean)
+    : []
   return (
     <div className="card approve">
-      <h4>审批卡（人工审批后才执行）</h4>
+      <h4>{isCreate ? '创建审批卡' : '审批卡'}（人工审批后才执行）</h4>
       <p>
-        目标：{proposal.namespace}/{proposal.deployment} 容器 {proposal.container}
+        目标：{proposal.namespace}/{proposal.deployment}
+        {!isCreate && proposal.container ? ` 容器 ${proposal.container}` : ''}
         <br />
         提案状态：{proposal.status}
         {proposal.approver ? `，审批人：${proposal.approver}` : ''}
       </p>
-      <PatchList patches={proposal.patches} oldValue={proposal.oldValue} newValue={proposal.newValue} />
+      {isCreate && creation ? (
+        <p>
+          镜像：{creation.image}　副本数：{creation.replicas ?? 1}
+          {resources.length > 0 ? (
+            <>
+              <br />
+              资源：{resources.join('、')}
+            </>
+          ) : null}
+          {creation.reason ? (
+            <>
+              <br />
+              理由：{creation.reason}
+            </>
+          ) : null}
+        </p>
+      ) : (
+        <PatchList patches={proposal.patches} oldValue={proposal.oldValue} newValue={proposal.newValue} />
+      )}
       <button onClick={() => onDecide('approved')} disabled={!pending || deciding}>
         批准
       </button>{' '}
@@ -797,7 +926,8 @@ export function RepairStatusCard({ snapshot }: { snapshot: RunSnapshot }) {
       </p>
       {exec && (
         <p className="small">
-          写入：{String(exec.beforeValue ?? '')} → {String(exec.afterValue ?? '')}
+          写入：{exec.beforeValue ? `${String(exec.beforeValue)} → ` : ''}
+          {String(exec.afterValue ?? '')}
           {exec.dryRunOk ? '，dry-run 通过' : ''}
           {typeof exec.satisfied === 'boolean' ? (exec.satisfied ? '，读回确认已生效' : '，读回未生效') : ''}
         </p>

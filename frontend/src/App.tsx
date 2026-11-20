@@ -49,7 +49,7 @@ import {
 } from './components'
 import type { ActivityItem } from './components'
 import { parseStructured, parseToolCalls } from './types'
-import type { AppConfig, Conversation, ConversationMessage, RunSnapshot, RunStep } from './types'
+import type { AppConfig, Conversation, ConversationMessage, ConvertPayload, RunSnapshot, RunStep } from './types'
 
 type Mode = 'chat' | 'run'
 
@@ -302,13 +302,22 @@ export default function App() {
     }
   }
 
-  async function convertCurrent() {
+  // 转换时把建议卡的目标和建议一起传过去（Slice 10）：
+  // 修复建议卡传 namespace/kind/name/container/patches，
+  // 创建建议卡传 namespace/kind/name/creation，后端优先用它们建任务，
+  // 不再去历史里猜目标。payload 为空时后端回退到历史猜测（老逻辑兼容）。
+  async function convertCurrent(payload?: ConvertPayload) {
     if (!activeConvId || converting) return
     setConverting(true)
     setChatError('')
     try {
-      const r = await convertConversation(activeConvId)
-      setNotice(`已创建可审批的修复任务，runId：${r.runId}。审批卡在下面聊天里，批准后 Worker 会自动执行并验证。`)
+      const r = await convertConversation(activeConvId, payload)
+      const isCreate = payload?.creation != null
+      setNotice(
+        isCreate
+          ? `已创建可审批的创建任务，runId：${r.runId}。审批卡在下面聊天里，批准后 Worker 会自动创建并验证。`
+          : `已创建可审批的修复任务，runId：${r.runId}。审批卡在下面聊天里，批准后 Worker 会自动执行并验证。`,
+      )
       setRunId(r.runId)
       // 锚定在转换那一刻的最后一条消息后面，审批卡按时间顺序插进消息流，
       // 不再固定在聊天底部，新问题发出去后会出现在它下面。

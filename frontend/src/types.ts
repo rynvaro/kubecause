@@ -25,6 +25,35 @@ export interface SuggestedRepair {
   reason: string
 }
 
+// 创建建议（Slice 10）：和修复建议卡平级，只是动作从“改”换成“创建”。
+// 字段和后端 store.CreationSpec 的 JSON 一一对应。
+export interface SuggestedCreation {
+  namespace: string
+  name: string
+  image: string
+  replicas: number
+  container?: string
+  memoryLimit?: string
+  memoryRequest?: string
+  cpuLimit?: string
+  cpuRequest?: string
+  reason?: string
+}
+
+// 转换时前端传给后端的目标和建议（Slice 10）：
+// 建议卡上的转换按钮把这张卡的目标（namespace/kind/name）和
+// Patches（或创建规格）一起传过去，后端优先用它们，
+// 不再去历史里猜目标——以前只传会话 id，猜到的是最早的 demo-api。
+export interface ConvertPayload {
+  namespace?: string
+  kind?: string
+  name?: string
+  container?: string
+  question?: string
+  patches?: PatchOperation[]
+  creation?: SuggestedCreation
+}
+
 export interface Report {
   facts: string[] | null
   cause: string
@@ -33,6 +62,7 @@ export interface Report {
   openQuestions: string[] | null
   confidence: string
   suggestedRepair?: SuggestedRepair | null
+  suggestedCreation?: SuggestedCreation | null
 }
 
 // 排障手册片段：search_runbooks 返回的 Data 是 {query, snippets}，
@@ -54,6 +84,11 @@ export interface ChangeRequest {
   // 通用 Patch 列表（Slice 9）：审批卡按这个列表展示，
   // 老提案没有它时按 oldValue/newValue 显示一条内存变更。
   patches?: PatchOperation[]
+  // 提案类型（Slice 10）："patch" 是改已有 Deployment 的字段，
+  // "create" 是创建一个新的 Deployment。老提案没有它时按 "patch" 处理。
+  kind?: string
+  // 创建提案的完整规格（Slice 10），只有 kind="create" 时才有。
+  creation?: SuggestedCreation | null
   deploymentUid?: string
   status: string
   approver?: string
@@ -119,6 +154,7 @@ export interface ChatReply {
   toolCalls: ToolCallRecord[]
   structured?: Record<string, unknown>
   suggestedRepair?: SuggestedRepair | null
+  suggestedCreation?: SuggestedCreation | null
 }
 
 export interface ConversationMessage {
@@ -226,6 +262,7 @@ export type ResultBlockKind =
   | 'events'
   | 'report'
   | 'repairSuggestion'
+  | 'creationSuggestion'
   | 'runbooks'
   | 'text'
 
@@ -263,6 +300,7 @@ export function normalizeReport(v: unknown): Report {
     openQuestions: Array.isArray(r.openQuestions) ? r.openQuestions : [],
     confidence: r.confidence ?? 'medium',
     suggestedRepair: r.suggestedRepair ?? null,
+    suggestedCreation: r.suggestedCreation ?? null,
   }
 }
 
@@ -301,6 +339,10 @@ export function buildBlocks(structured: Record<string, unknown> | null | undefin
   }
   if (structured.suggestedRepair && typeof structured.suggestedRepair === 'object') {
     blocks.push({ kind: 'repairSuggestion', title: '修复建议', data: structured.suggestedRepair })
+  }
+  // 创建建议（Slice 10）：和修复建议卡平级，只是动作从“改”换成“创建”。
+  if (structured.suggestedCreation && typeof structured.suggestedCreation === 'object') {
+    blocks.push({ kind: 'creationSuggestion', title: '创建建议', data: structured.suggestedCreation })
   }
   // 排障手册引用：search_runbooks 的 Data 是 {query, snippets}，
   // 每个片段带标题和关键句，渲染成“参考了哪篇手册”，

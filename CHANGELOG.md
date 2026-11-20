@@ -2,6 +2,26 @@
 
 按版本号倒序。每个版本对应一个 git tag，例如 `v0.9.0`。
 
+## v0.10.0（2026-11-20）
+
+v0.10.0 修的是用户在 2026-11-20 反馈的两个问题：**转正式诊断按钮没带目标**（demo-bad-image 换镜像的建议卡，点了“创建可审批的修复任务”，建出来的却是 demo/Deployment/demo-api）和**正式诊断重跑失败**（建出来的 run 自己重新诊断，8 步用完、置信度 low、事实重复、没有提案，修复任务从来没成功过）；另外按用户要求**加了一个通用创建能力**（对话里说“在 demo 空间下创建一个 Pod/Deployment”，现在能走建议卡 → 审批 → 执行 → 验证），以后想改成 manager agent 时复用，不为每个操作单独写一套流程。
+
+### 改了什么
+
+- **转换带目标，不再猜**（`frontend/src/App.tsx`、`frontend/src/components.tsx`、`frontend/src/api.ts`、`frontend/src/types.ts`、`internal/api/api.go`、`internal/chat/chat.go`）：建议卡上的转换按钮把这张卡的目标（namespace/kind/name/container）和 Patches 一起传过去，`POST /api/conversations/{id}/convert` 接受可选的 namespace/kind/name/container/patches/creation；后端 `ConvertToRun` 优先用传来的目标，不再用 `resolveTargetFromHistory` 猜——以前只传会话 id，猜到的是历史里最早的 demo-api。什么都没传时才回退到历史猜测（老客户端兼容）。创建卡的转换按钮传 creation 规格，按钮文案是“创建可审批的创建任务”。
+- **Worker 用带过来的建议直接生成提案，不重新诊断**（`internal/store/store.go`、`internal/run/worker.go`）：`runs` 表加 `suggested_json` / `creation_json` 两列（老库启动时自动补列），`ConvertToRun` 把建议卡的 Patches / 创建规格存在 Run 上；Worker 看到 Run 带建议就跳过 Agent 循环，直接按建议生成一份 medium 置信度的报告（事实是“用户在对话里已确认修复/创建建议：……”），再走原来的 `maybeCreateProposal` 校验、生成提案。提案生成时仍要读集群现状核对（容器下标按容器名重算、改前值按现状读、过 `ValidatePatch` / `ValidatePatchWithCurrent`），校验不过不生成提案。验证：fake+stub 下两轮对话后点 demo-bad-image 的卡（传 nginx:9.9.9-nonexistent → nginx:1.24 的 image Patch），建出 demo/demo-bad-image 的 run，不再是 demo-api；OOM 回归仍给 128Mi→256Mi 内存卡，审批后执行验证通过。
+- **报告事实去重**（`internal/agent/agent.go`）：`Report.Normalize()` 里事实、建议、待确认、证据 ID 各去重一次，顺序不变。以前正式诊断里同一条事实出现了两遍（“Deployment demo-api, container demo-api memory limit 256Mi”重复），原因是多步工具摘要拼出来的事实本身就有重复，归一化时不去重就原样落盘、原样展示。去重只在归一化这一层做，不改工具摘要本身，工具时间线仍能看到每一步的原始记录。
+- **通用创建能力**（新增 `internal/repair/create.go`，改 `internal/agent/agent.go`、`internal/model/model.go`、`internal/chat/chat.go`、`internal/chat/stub.go`、`internal/chat/real.go`、`internal/run/worker.go`、`internal/repair/repair.go`、`internal/kube/client.go`、`internal/store/store.go`、前端）：建议卡新增一种创建类型（`SuggestedCreation`，即 `store.CreationSpec`：namespace、name、image、replicas、container、内存/CPU 的 requests/limits、reason），和修复建议卡平级。模型流程：用户说“在 demo 空间下创建一个 Pod/Deployment”，模型先问缺什么（命名空间、名字、镜像，副本数默认 1 不用问），问全了直接给一张创建建议卡，不用先做故障诊断；用户说创建 Pod 时也按 Deployment 给卡，并在回复里说明裸 Pod 不会自动重建、建议用 Deployment；用户分几轮给的信息（名字、镜像）靠会话历史拼在一起解析，不用重说一遍。`submit_diagnosis` 加 `suggestedCreation` 字段，对话和单次诊断的提示词各加一句创建规则，不写“不要调 xxx”这种禁止句。提案分两种：`change_requests` 表加 `kind`（`patch` / `create`，老提案读出来是 `patch`）和 `creation_json` 两列，`ChangeRequest` 加 `Kind` / `Creation` 字段；创建提案走同一套审批 / 执行 / 验证流程，只是执行动作从 Patch 换成 `RepairClient.CreateDeployment`（Real 用 client-go Create，Fake 在内存里模拟 + 复用 `simulateRollout`），验证共用同一套 rollout 验证（observedGeneration、新 Pod Ready、重启次数不增长）。创建校验 `ValidateCreation` 复用 Patch 的思路：只允许创建 Deployment、系统命名空间拒绝、镜像名合法、副本数 1–10、内存/CPU 在上限内（复用 `repair.maxMemoryMi` / `repair.maxRatio` 的配置）；执行前再查一次目标不存在才能创建，已存在且配置一致视为已创建（幂等），已存在且配置不一致标过期。前端：创建建议卡和 Patch 建议卡长得一样，只是标题和字段不同，按钮文案是“创建可审批的创建任务”；审批卡按 kind 分两种展示，创建提案显示镜像、副本数、资源，不按 Patch 列表展示。
+- **回归**：`go vet ./...` 通过，`go test ./...` 全部通过（含新增的转换带目标、Worker 用自带 Patch/创建建议生成提案、创建校验、Fake 创建+验证全流程、Stub 创建多轮、报告去重、提案 kind/创建规格持久化测试），`go run ./cmd/eval` 仍 3/3 通过；fake+stub 下 curl 验证三段全通（OOM 回归转换 → 提案 → 批准 → 执行验证通过；demo-bad-image 目标转换 → 建出 demo-bad-image 的任务；创建 web-demo → 创建提案 → 批准 → 执行验证通过，总览 Deployment 数 1 → 2）。
+
+### 未实现（仍未做）
+
+- 对话历史摘要（现在是截断，TODO 在代码和 README 里写清了）
+- 云端部署、鉴权、监控
+- 白名单做成可配置（用户说复杂先不做）
+- op 只支持 replace：add/remove 以后需要时再加，现在不做，避免删字段
+- command/args、hostNetwork、privileged 这些字段先禁掉，以后用户明确要求时再放开
+
 ## v0.9.0（2026-11-20）
 
 v0.9.0 修的是用户在 2026-11-20 反馈的三个问题：**整页滚动**（输入框还是被顶走，时间线看不到）、**只有 OOM 能出修复建议**（ImagePullBackOff 没有卡）、**每个故障都要单独写代码吗**（执行器只认内存）。核心是两件事：**布局锁死一屏**（`.app` 从 `min-height:100vh` 改成 `height:100vh; overflow:hidden`，三栏各自内部滚动）和**执行器改成通用 Patch**（建议卡、校验、执行、提案、审批卡全部按 op/path/value 走，不再按故障类型分分支，OOM、ImagePullBackOff、主动换镜像版本都走同一套流程）。

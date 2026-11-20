@@ -36,7 +36,8 @@ const chatSystemPrompt = `你是 Kubernetes 故障诊断助手，正在和用户
 6. 如果证据或用户明确要求指向一次具体变更，可以在回答最后给出修复建议（目标、要改的字段、新值、理由），并提醒用户：这只是建议，要创建可审批的修复任务、人工审批后才会执行。
 7. 修复建议必须通过 submit_diagnosis 的 suggestedRepair 结构化字段返回，不要只在自由文本里提一句。suggestedRepair 里用 patches 列表描述要改的字段，每个 Patch 是 op/path/value：op 只支持 replace；path 是白名单里的字段，例如改镜像 /spec/template/spec/containers/0/image、改内存 limit /spec/template/spec/containers/0/resources/limits/memory、改副本数 /spec/replicas；value 是合法的新值。用户如果明确说了要改成什么值（例如“换成 nginx:1.25”、“增加 128Mi”、“调到 256Mi”），按用户说的算新值：先查当前值，再按用户说的增量或目标值算，不要默认翻倍。没有用户明确要求时，也按证据算一个合理的新值，不要只会翻倍。用户上一轮已经明确说了新值时，直接用那个值生成结构化 Patch，不要再问一遍。
 8. 修复决策只能由你做：后端只做校验，不会替你合成建议。如果你给不出结构化建议，就老实说证据不足、还需要补查什么，不要编一个建议。
-9. 用户明确说了要改成什么值时（例如“帮我把 demo-api 的镜像换成 nginx:1.26”），不用先做故障诊断：先查当前值确认一下，再直接给出 Patch 建议。Pod 现在是健康的也不用先找故障，主动变更和故障修复走同一套 Patch 流程。`
+9. 用户明确说了要改成什么值时（例如“帮我把 demo-api 的镜像换成 nginx:1.26”），不用先做故障诊断：先查当前值确认一下，再直接给出 Patch 建议。Pod 现在是健康的也不用先找故障，主动变更和故障修复走同一套 Patch 流程。
+10. 用户明确说要创建 Deployment 或 Pod 时，先问缺的信息（命名空间、名字、镜像、副本数），问全了直接在 submit_diagnosis 的 suggestedCreation 里给出创建建议，不用先做故障诊断。用户说创建 Pod 时也按 Deployment 给建议，并在回答里说明裸 Pod 不会自动重建、建议用 Deployment。`
 
 // runReal 是真模型的对话循环：
 // 每轮最多调 s.maxSteps() 次工具（默认 12，配置中心可改），每次问模型一步，
@@ -85,6 +86,7 @@ func (s *Service) runReal(ctx context.Context, conversationID, text string, hist
 		if st.IsFinal {
 			replyText := st.Content
 			var sr *agent.SuggestedRepair
+			var sc *agent.SuggestedCreation
 			if st.Report != nil {
 				// 报告刚拿到就归一化：缺失的切片字段补成空数组，
 				// 否则落盘再序列化成 null，前端读 .length 会白屏。
@@ -92,13 +94,23 @@ func (s *Service) runReal(ctx context.Context, conversationID, text string, hist
 				replyText = formatReportReply(st.Report)
 				structured["report"] = st.Report
 				sr = st.Report.SuggestedRepair
+				sc = st.Report.SuggestedCreation
 			}
-			if sr == nil && !askedForStructured {
+			if sr == nil && sc == nil && !askedForStructured {
 				// 模型给了最终回答但没有结构化修复建议：追问一次，
 				// 让它用 submit_diagnosis 把建议补回来，而不是由后端合成。
 				askedForStructured = true
-				msgs = append(msgs, model.ChatMessage{Role: "user", Content: "如果你认为需要修复，请调用 submit_diagnosis 提交结构化诊断报告，并在 suggestedRepair 里用 patches 列表给出要改的字段（每个 Patch 是 op/path/value，op 只支持 replace，path 是白名单里的字段，value 是合法的新值；用户如果明确说了新值，按用户说的算）。如果证据不足以给修复建议，请直接说明还需要补查什么，不要编一个建议。"})
+				msgs = append(msgs, model.ChatMessage{Role: "user", Content: "如果你认为需要修复，请调用 submit_diagnosis 提交结构化诊断报告，并在 suggestedRepair 里用 patches 列表给出要改的字段（每个 Patch 是 op/path/value，op 只支持 replace，path 是白名单里的字段，value 是合法的新值；用户如果明确说了新值，按用户说的算）。如果用户明确要求创建 Deployment，请在 suggestedCreation 里给出创建建议（namespace、name、image、replicas）。如果证据不足以给修复建议，请直接说明还需要补查什么，不要编一个建议。"})
 				continue
+			}
+			if sc != nil {
+				structured["suggestedCreation"] = sc
+				replicas := sc.Replicas
+				if replicas <= 0 {
+					replicas = 1
+				}
+				replyText += fmt.Sprintf("\n创建建议：%s/%s，镜像 %s，%d 个副本。这只是一张建议卡，不会自动执行——想走正式流程可以点“创建可审批的创建任务”，生成提案后人工审批再执行。",
+					sc.Namespace, sc.Name, sc.Image, replicas)
 			}
 			if sr != nil {
 				structured["suggestedRepair"] = sr
@@ -115,7 +127,7 @@ func (s *Service) runReal(ctx context.Context, conversationID, text string, hist
 				replyText += fmt.Sprintf("\n修复建议：%s/%s 容器 %s：%s（%s）。这只是一张建议卡，不会自动执行——想走正式流程可以点“创建可审批的修复任务”，生成提案后人工审批再执行。",
 					sr.Namespace, sr.Deployment, sr.Container, summary, sr.Reason)
 			}
-			return &Reply{Reply: replyText, ToolCalls: recs, Structured: structured, SuggestedRepair: sr}, nil
+			return &Reply{Reply: replyText, ToolCalls: recs, Structured: structured, SuggestedRepair: sr, SuggestedCreation: sc}, nil
 		}
 		if st.ToolCall == nil {
 			return nil, fmt.Errorf("模型既没有调工具也没有返回文本")

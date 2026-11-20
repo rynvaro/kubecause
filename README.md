@@ -1,14 +1,16 @@
 # KubeCause — Kubernetes 故障诊断 Agent
 
-当前版本：v0.9.0。更新记录见 [CHANGELOG.md](CHANGELOG.md)。
+当前版本：v0.10.0。更新记录见 [CHANGELOG.md](CHANGELOG.md)。
 
-KubeCause 是一个 Kubernetes 故障诊断 Agent。用户选定 namespace 和 Pod 或 Deployment，描述故障现象，Agent 自主选择只读工具收集证据，检索排障手册，输出诊断结论和建议。演示环境支持人工审批后的变更：用一组通用 Patch 改指定 Deployment 的白名单字段（镜像、内存 limit/request、CPU limit/request、副本数），并验证变更后的运行状态。
+KubeCause 是一个 Kubernetes 故障诊断 Agent。用户选定 namespace 和 Pod 或 Deployment，描述故障现象，Agent 自主选择只读工具收集证据，检索排障手册，输出诊断结论和建议。演示环境支持人工审批后的变更：用一组通用 Patch 改指定 Deployment 的白名单字段（镜像、内存 limit/request、CPU limit/request、副本数），并验证变更后的运行状态；也可以在对话里直接创建一个新的 Deployment，同样走建议卡 → 人工审批 → 执行 → 验证 rollout 这条线。
 
 ## 功能
 
 - **对话诊断**：选定 namespace 和 Pod 或 Deployment，描述故障现象，Agent 自主选择只读工具收集证据，检索排障手册（`runbooks/*.md`，SQLite FTS5 索引），输出诊断结论和修复建议。支持多轮追问，指代消解靠最近 10 条历史。
 - **单次诊断**：`POST /api/runs` 创建一个有 runId 的正式诊断任务，有步骤时间线、诊断报告、提案、审批、执行和验证，全程可审计，重启后可恢复。
 - **通用 Patch 修复**：修复建议是一组通用 Patch（`{op, path, value}`），只改白名单字段（镜像、内存/CPU 的 limit/request、副本数），不按故障类型分分支。人工审批后才执行，执行前 dry-run、核对 resourceVersion，执行后逐条读回确认，再做 rollout 验证。
+- **创建 Deployment**：对话里说“在 demo 空间下创建一个 Deployment，镜像 nginx:1.25”，Agent 先问缺的信息（命名空间、名字、镜像、副本数），问全了给一张创建建议卡，点“创建可审批的创建任务”后走同一套审批 → 执行 → 验证 rollout 的线。只创建 Deployment，不直接创建裸 Pod（Pod 挂了不会自动重建，也没有 rollout）；创建校验和 Patch 共用同一套安全思路（系统命名空间拒绝、镜像合法、副本数 1–10、内存/CPU 在上限内）。
+- **转换带目标**：建议卡上的转换按钮把这张卡的目标（namespace/kind/name）和 Patches 一起传给后端，Worker 直接拿建议校验、生成提案，不用重新诊断一遍。以前只传会话 id，后端去历史里猜目标，会猜错（demo-bad-image 的卡转出来却是 demo-api 的任务），重跑 8 步耗尽、置信度 low、没有提案。
 - **发现工具**：`list_namespaces`、`list_deployments`、`list_problem_pods`、`get_cluster_overview`，全部只读，结构化返回，前端渲染成卡片和表格。系统命名空间可查不可改。
 - **配置中心**：`config.yaml` + 环境变量覆盖 + `GET/POST /api/config` 热加载，前端“设置”页能改，不用重启。`MODEL_API_KEY` 只从环境变量读，绝不进配置。
 - **离线评估**：`go run ./cmd/eval` 跑 OOM、镜像、探针三个用例，输出命中率、引用准确性、步数和耗时。
@@ -44,7 +46,18 @@ op 只支持 `replace`。明确拒绝：hostNetwork、hostPID、privileged、met
 # 主动变更：健康 Pod 换镜像版本，不用先诊断
 # 问“把 demo-api 的镜像换成 nginx:1.26”
 #   → Agent 先查当前镜像，再直接给一张 Patch 建议卡
+
+# 创建 Deployment：不用先诊断，缺信息先问
+# 第一轮：问“在 demo 空间下创建一个 Deployment，镜像 nginx:1.25”
+#   → Agent 问“还缺名字”
+# 第二轮：回“叫 web-demo”
+#   → Agent 给一张创建建议卡，点“创建可审批的创建任务”走审批执行
+# 说“创建一个 Pod”时也按 Deployment 给卡，并说明裸 Pod 不会自动重建
 ```
+
+## 创建提案的校验
+
+创建只针对 Deployment，不直接创建裸 Pod。校验不过不生成提案：系统命名空间（kube-system / kube-public / kube-node-lease）拒绝；镜像名必须合法；副本数 1–10（没说默认 1）；内存 limit/request 有值时必须是 Mi/Gi 结尾且不超过 `repair.maxMemoryMi`（默认 4Gi，配置中心可调），request 不超过同类 limit；CPU limit/request 有值时必须是合法数量且大于 0。执行前再查一次目标不存在才能创建：已存在且配置一致视为已创建（幂等），已存在且配置不一致标过期，不覆盖别人的 Deployment。执行后验证和 Patch 提案共用同一套 rollout 验证（observedGeneration、新 Pod Ready、重启次数不增长）。
 
 ## 配置中心
 

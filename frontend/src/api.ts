@@ -6,6 +6,7 @@ import type {
   ChatReply,
   Conversation,
   ConversationMessage,
+  ConvertPayload,
   RunSnapshot,
   RunStep,
 } from './types'
@@ -68,12 +69,17 @@ export async function postChatMessage(conversationId: string, content: string): 
   })
 }
 
+// 转换时把建议卡的目标和建议一起传过去（Slice 10）：
+// 修复建议卡传 namespace/kind/name/container/patches，
+// 创建建议卡传 namespace/kind/name/creation，后端优先用它们，
+// 不再去历史里猜目标。什么都不传时后端回退到历史猜测（老客户端兼容）。
 export async function convertConversation(
   conversationId: string,
+  body?: ConvertPayload,
 ): Promise<{ runId: string; conversationId: string }> {
   return request<{ runId: string; conversationId: string }>(
     `/api/conversations/${conversationId}/convert`,
-    { method: 'POST', body: '{}' },
+    { method: 'POST', body: JSON.stringify(body ?? {}) },
   )
 }
 

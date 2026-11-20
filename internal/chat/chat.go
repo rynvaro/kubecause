@@ -59,10 +59,11 @@ type ToolCallRecord struct {
 // Reply 是一轮对话的返回：给用户看的文本、调过的工具、
 // 结构化结果（前端渲染表格/卡片用）、可选的修复建议卡。
 type Reply struct {
-	Reply           string                 `json:"reply"`
-	ToolCalls       []ToolCallRecord       `json:"toolCalls"`
-	Structured      map[string]any         `json:"structured,omitempty"`
-	SuggestedRepair *agent.SuggestedRepair `json:"suggestedRepair,omitempty"`
+	Reply             string                   `json:"reply"`
+	ToolCalls         []ToolCallRecord         `json:"toolCalls"`
+	Structured        map[string]any           `json:"structured,omitempty"`
+	SuggestedRepair   *agent.SuggestedRepair   `json:"suggestedRepair,omitempty"`
+	SuggestedCreation *agent.SuggestedCreation `json:"suggestedCreation,omitempty"`
 }
 
 // Service 持有对话所需的依赖：存储、只读工具、模型。
@@ -174,6 +175,13 @@ func (s *Service) RunMessage(ctx context.Context, conversationID, text string) (
 			reply.Structured = map[string]any{}
 		}
 		reply.Structured["suggestedRepair"] = reply.SuggestedRepair
+	}
+	// 创建建议卡也一样：不写进 Structured，前端刷新会话就丢了卡、按钮也没了。
+	if reply.SuggestedCreation != nil {
+		if reply.Structured == nil {
+			reply.Structured = map[string]any{}
+		}
+		reply.Structured["suggestedCreation"] = reply.SuggestedCreation
 	}
 	toolCallsJSON, _ := json.Marshal(reply.ToolCalls)
 	structuredJSON, _ := json.Marshal(reply.Structured)
@@ -312,11 +320,31 @@ func (s *Service) resolveNamespace(ctx context.Context, text string, history []s
 
 var nsJSONRe = regexp.MustCompile(`"namespace"\s*:\s*"([^"]+)"`)
 
+// ConvertInput 是转正式诊断时前端传来的目标和建议（Slice 10）。
+// 建议卡上的转换按钮把这张卡的目标（namespace/kind/name）和
+// Patches（或创建规格）一起传过来，后端优先用它们，
+// 不再去历史里猜目标——以前只传会话 id，后端去历史里猜，
+// 猜到的是最早的 demo-api，demo-bad-image 的卡转出来
+// 却是 demo-api 的任务。什么都没传时才回退到历史猜测（老客户端兼容）。
+type ConvertInput struct {
+	Namespace string
+	Kind      string // Pod 或 Deployment
+	Name      string
+	Container string // 建议卡指明的容器名，生成提案时按它重算 Patch 下标
+	Question  string
+	// Patches 是建议卡上的通用 Patch 列表：带过来存在 Run 上，
+	// Worker 看到它就直接校验、生成提案，不用重新诊断一遍。
+	Patches []store.PatchOperation
+	// Creation 是创建建议卡上的创建规格：带过来存在 Run 上，
+	// Worker 看到它就直接校验、生成创建提案，同样不用重新诊断。
+	Creation *store.CreationSpec
+}
+
 // ConvertToRun 把一次对话转成正式诊断任务（前端按钮叫“创建可审批的修复任务”）：
-// 按参数或会话历史解析出目标（namespace / kind / name / 问题），
+// 按前端传来的目标和建议、或会话历史解析出目标（namespace / kind / name / 问题），
 // 创建 /api/runs 的任务并返回 runId。转换本身不执行修复，
 // 修复还是要走提案 + 人工审批 + 执行验证那条线。
-func (s *Service) ConvertToRun(ctx context.Context, conversationID, namespace, kind, name, question string) (string, error) {
+func (s *Service) ConvertToRun(ctx context.Context, conversationID string, in ConvertInput) (string, error) {
 	if _, err := s.Store.GetConversation(ctx, conversationID); err != nil {
 		return "", fmt.Errorf("会话不存在: %w", err)
 	}
@@ -324,13 +352,35 @@ func (s *Service) ConvertToRun(ctx context.Context, conversationID, namespace, k
 	if err != nil {
 		return "", err
 	}
+	// 创建建议优先：目标就是要创建的 Deployment，问题也按创建来写。
+	// 创建规格先过一遍校验，校验不过直接报错，不建一个注定没提案的任务。
+	if in.Creation != nil {
+		spec := repair.NormalizeCreation(in.Creation)
+		if err := repair.ValidateCreation(spec); err != nil {
+			return "", fmt.Errorf("创建建议校验没通过: %w", err)
+		}
+		question := in.Question
+		if question == "" {
+			question = fmt.Sprintf("创建 Deployment %s/%s（镜像 %s，%d 个副本）", spec.Namespace, spec.Name, spec.Image, spec.Replicas)
+		}
+		creationJSON, _ := json.Marshal(spec)
+		r := &store.Run{Namespace: spec.Namespace, Kind: "Deployment", Name: spec.Name, Question: question, CreationJSON: string(creationJSON)}
+		if err := s.Store.CreateRun(ctx, r); err != nil {
+			return "", err
+		}
+		return r.ID, nil
+	}
+	namespace := in.Namespace
 	if namespace == "" {
 		namespace = s.resolveNamespace(ctx, lastUserText(history), history)
 	}
 	if namespace == "" {
 		return "", fmt.Errorf("解析不到目标 namespace，请在转换时明确指定 namespace")
 	}
+	kind, name := in.Kind, in.Name
 	if name == "" || kind == "" {
+		// 只有前端什么都没传时才回退到历史猜测（老客户端兼容），
+		// 传了目标的以传来的为准，不再猜。
 		k, n := resolveTargetFromHistory(ctx, s, history, namespace)
 		if kind == "" {
 			kind = k
@@ -345,6 +395,7 @@ func (s *Service) ConvertToRun(ctx context.Context, conversationID, namespace, k
 	if name == "" {
 		return "", fmt.Errorf("解析不到目标名称，请在转换时明确指定 name")
 	}
+	question := in.Question
 	if question == "" {
 		question = lastUserText(history)
 		if question == "" {
@@ -352,6 +403,17 @@ func (s *Service) ConvertToRun(ctx context.Context, conversationID, namespace, k
 		}
 	}
 	r := &store.Run{Namespace: namespace, Kind: kind, Name: name, Question: question}
+	// 建议卡的 Patches 跟着任务走：Worker 看到它就直接校验、生成提案，
+	// 不用重新诊断一遍（以前重跑 8 步耗尽、置信度 low、没有提案）。
+	if len(in.Patches) > 0 {
+		sr := &agent.SuggestedRepair{
+			Namespace: namespace, Deployment: name, Container: in.Container,
+			Patches: in.Patches,
+		}
+		sr.Normalize()
+		b, _ := json.Marshal(sr)
+		r.SuggestedJSON = string(b)
+	}
 	if err := s.Store.CreateRun(ctx, r); err != nil {
 		return "", err
 	}

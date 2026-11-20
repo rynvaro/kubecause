@@ -433,6 +433,12 @@ type RepairClient interface {
 	// 重读一次核对版本，见 repair.executePatch 的注释；
 	// dryRun 为真时只校验不落盘。
 	PatchDeployment(ctx context.Context, namespace, name string, patchJSON []byte, resourceVersion string, dryRun bool) (*appsv1.Deployment, error)
+	// CreateDeployment 是创建入口（Slice 10）：创建一个新的 Deployment。
+	// 只创建 Deployment，不直接创建裸 Pod（调用方保证这一点）；
+	// dryRun 为真时只校验不落盘。Fake 收到创建后也要模拟控制器行为
+	// （generation、status、新 ReplicaSet / 新 Pod），否则 rollout 验证过不了，
+	// 和 PatchDeployment 的模拟是同一套逻辑。
+	CreateDeployment(ctx context.Context, deployment *appsv1.Deployment, dryRun bool) (*appsv1.Deployment, error)
 	// ListPodsForRepair 按标签列 Pod，供 rollout 验证区分新旧 Pod。
 	ListPodsForRepair(ctx context.Context, namespace string, labels map[string]string) ([]corev1.Pod, error)
 }
@@ -484,6 +490,18 @@ func (r *Real) PatchDeployment(ctx context.Context, namespace, name string, patc
 		opts.DryRun = []string{metav1.DryRunAll}
 	}
 	return r.client.AppsV1().Deployments(namespace).Patch(ctx, name, types.JSONPatchType, patchJSON, opts)
+}
+
+// CreateDeployment 创建一个 Deployment（Slice 10）。
+// dryRun 时只让 API Server 校验，不落盘。
+// 注意：这里只负责发请求，目标不存在、镜像合法这些校验
+// 都在 repair 层做过，见 repair.ValidateCreation / executeCreate。
+func (r *Real) CreateDeployment(ctx context.Context, deployment *appsv1.Deployment, dryRun bool) (*appsv1.Deployment, error) {
+	opts := metav1.CreateOptions{}
+	if dryRun {
+		opts.DryRun = []string{metav1.DryRunAll}
+	}
+	return r.client.AppsV1().Deployments(deployment.Namespace).Create(ctx, deployment, opts)
 }
 
 // genericPatchOp 是 JSONPatch 里的一条操作，Fake 在内存里应用它。
@@ -604,6 +622,30 @@ func (f *Fake) PatchDeployment(ctx context.Context, namespace, name string, patc
 	}
 	f.simulateRollout(ctx, cp, "")
 	return f.GetDeployment(ctx, namespace, name)
+}
+
+// CreateDeployment 是 Fake 的创建实现（Slice 10）。
+// dryRun 时只返回拼好的对象，不落盘、不模拟 rollout。
+// 真实创建时先写进 clientset，再模拟控制器行为：
+// fake clientset 没有 Deployment 控制器，不会自动建 ReplicaSet / Pod、
+// 也不会推进 observedGeneration，不模拟的话 rollout 验证永远过不了。
+// 所以这里复用 Patch 用的 simulateRollout：generation +1、status 置为
+// 已更新且可用、建一个带新 pod-template-hash 的 ReplicaSet 和一个
+// Ready 的新 Pod。这只是 fake 的模拟，Real 不走这条路，
+// 生产集群由真正的控制器完成 rollout。
+func (f *Fake) CreateDeployment(ctx context.Context, deployment *appsv1.Deployment, dryRun bool) (*appsv1.Deployment, error) {
+	if deployment == nil {
+		return nil, fmt.Errorf("创建的 Deployment 为空")
+	}
+	if dryRun {
+		return deployment.DeepCopy(), nil
+	}
+	created, err := f.client.AppsV1().Deployments(deployment.Namespace).Create(ctx, deployment, metav1.CreateOptions{})
+	if err != nil {
+		return nil, err
+	}
+	f.simulateRollout(ctx, created, "")
+	return f.GetDeployment(ctx, deployment.Namespace, deployment.Name)
 }
 
 func (f *Fake) GetDeploymentForRepair(ctx context.Context, namespace, name string) (*appsv1.Deployment, error) {

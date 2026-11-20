@@ -333,12 +333,12 @@ func (s *Stub) buildReport(in agent.ModelInput) *agent.Report {
 			sr.Normalize()
 		}
 		return &agent.Report{
-			Facts:       facts,
-			Cause:       "镜像拉取失败，Pod 卡在 ImagePullBackOff，容器一直没起来",
-			EvidenceIDs: ids,
+			Facts:           facts,
+			Cause:           "镜像拉取失败，Pod 卡在 ImagePullBackOff，容器一直没起来",
+			EvidenceIDs:     ids,
 			Recommendations: recs,
-			OpenQuestions: []string{"镜像仓库的访问凭证是否正确，仍需进一步确认"},
-			Confidence:    "high",
+			OpenQuestions:   []string{"镜像仓库的访问凭证是否正确，仍需进一步确认"},
+			Confidence:      "high",
 			SuggestedRepair: sr,
 		}
 	case seenProbe:
@@ -571,6 +571,23 @@ func toolDefs() []chatToolDef {
 					"value": map[string]any{"description": "新值，例如 nginx:1.25、256Mi、3"},
 				}}},
 			}},
+			// 创建建议是可选的（Slice 10）：只有用户明确要求创建
+			// Deployment 时才给，用 namespace / name / image / replicas
+			// 等字段描述要创建的 Deployment，不用先做故障诊断。
+			// 用户说创建 Pod 时也按 Deployment 给。
+			// 没问全信息（缺名字或镜像）时不要给这个字段，先问用户。
+			"suggestedCreation": map[string]any{"type": "object", "description": "可选的创建建议：只有用户明确要求创建 Deployment 时才给，描述要创建的 Deployment，不用先做故障诊断；用户说创建 Pod 时也按 Deployment 给；信息没问全时不要给，先问用户", "properties": map[string]any{
+				"namespace":     map[string]any{"type": "string", "description": "命名空间"},
+				"name":          map[string]any{"type": "string", "description": "要创建的 Deployment 名"},
+				"image":         map[string]any{"type": "string", "description": "镜像，例如 nginx:1.25"},
+				"replicas":      map[string]any{"type": "number", "description": "副本数，1-10，默认 1"},
+				"container":     map[string]any{"type": "string", "description": "容器名，默认和 Deployment 名相同"},
+				"memoryLimit":   map[string]any{"type": "string", "description": "容器内存 limit，例如 128Mi，不填也可以"},
+				"memoryRequest": map[string]any{"type": "string", "description": "容器内存 request，例如 64Mi，不填也可以"},
+				"cpuLimit":      map[string]any{"type": "string", "description": "容器 CPU limit，例如 500m，不填也可以"},
+				"cpuRequest":    map[string]any{"type": "string", "description": "容器 CPU request，例如 100m，不填也可以"},
+				"reason":        map[string]any{"type": "string"},
+			}},
 		}, []string{"facts", "cause", "evidenceIds", "confidence"}),
 	}
 }
@@ -595,7 +612,8 @@ const realSystemPrompt = `你是 Kubernetes 故障诊断助手。任务是根据
 4. 提交诊断必须调用 submit_diagnosis，evidenceIds 只能引用工具结果里已经出现过的 ID。
 5. 原因按证据自己判断。需要修复时，在 submit_diagnosis 的 suggestedRepair 里用 patches 列表给一个修复建议（op 只支持 replace，path 是白名单里的字段：镜像、内存、副本数，value 是合法的新值）；其他原因给不出具体变更时不要给修复建议。
 6. 你只能诊断、不能执行任何修改：修复建议只是建议，是否执行由人工审批决定。
-7. 用户如果明确说了要改成什么值（例如“换成 nginx:1.25”、“增加 128Mi”、“调到 256Mi”），按用户说的算新值：先查当前值，再按用户说的增量或目标值算，不要默认翻倍。用户上一轮已经明确说了新值时，直接用那个值生成结构化 Patch，不要再问一遍。`
+7. 用户如果明确说了要改成什么值（例如“换成 nginx:1.25”、“增加 128Mi”、“调到 256Mi”），按用户说的算新值：先查当前值，再按用户说的增量或目标值算，不要默认翻倍。用户上一轮已经明确说了新值时，直接用那个值生成结构化 Patch，不要再问一遍。
+8. 用户明确说要创建 Deployment 或 Pod 时，先问缺的信息（命名空间、名字、镜像、副本数），问全了直接调用 submit_diagnosis，在 suggestedCreation 里给出创建建议，不用先做故障诊断。用户说创建 Pod 时也按 Deployment 给，并在报告里说明裸 Pod 不会自动重建、建议用 Deployment。`
 
 // Next 问一次真模型，返回一步工具调用或最终报告。
 func (r *Real) Next(ctx context.Context, in agent.ModelInput) (agent.ModelStep, error) {
@@ -825,6 +843,20 @@ func parseDiagnosisArgs(raw string) (*agent.Report, error) {
 				Value any    `json:"value"`
 			} `json:"patches"`
 		} `json:"suggestedRepair"`
+		// 创建建议（Slice 10）：只有用户明确要求创建 Deployment 时模型才给，
+		// 字段缺一不可（namespace / name / image），缺了后面校验会清掉。
+		SuggestedCreation *struct {
+			Namespace     string  `json:"namespace"`
+			Name          string  `json:"name"`
+			Image         string  `json:"image"`
+			Replicas      float64 `json:"replicas"`
+			Container     string  `json:"container"`
+			MemoryLimit   string  `json:"memoryLimit"`
+			MemoryRequest string  `json:"memoryRequest"`
+			CpuLimit      string  `json:"cpuLimit"`
+			CpuRequest    string  `json:"cpuRequest"`
+			Reason        string  `json:"reason"`
+		} `json:"suggestedCreation"`
 	}
 	if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &v); err != nil {
 		return nil, err
@@ -856,6 +888,16 @@ func parseDiagnosisArgs(raw string) (*agent.Report, error) {
 		// 只有旧字段时转成通用 Patch，有 Patches 的直接保留。
 		sr.Normalize()
 		rep.SuggestedRepair = sr
+	}
+	if v.SuggestedCreation != nil {
+		rep.SuggestedCreation = &agent.SuggestedCreation{
+			Namespace: v.SuggestedCreation.Namespace, Name: v.SuggestedCreation.Name,
+			Image: v.SuggestedCreation.Image, Replicas: int(v.SuggestedCreation.Replicas),
+			Container:   v.SuggestedCreation.Container,
+			MemoryLimit: v.SuggestedCreation.MemoryLimit, MemoryRequest: v.SuggestedCreation.MemoryRequest,
+			CpuLimit: v.SuggestedCreation.CpuLimit, CpuRequest: v.SuggestedCreation.CpuRequest,
+			Reason: v.SuggestedCreation.Reason,
+		}
 	}
 	return rep, nil
 }

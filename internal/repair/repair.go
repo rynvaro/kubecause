@@ -40,6 +40,12 @@ import (
 // OldValue / NewValue 只保留做展示用，取第一个 Patch 的改前/改后值；
 // 执行时以 Patches 为准。老提案没有 Patches 时，
 // CreateProposal 会从 OldValue / NewValue 反推一条内存 Patch。
+//
+// Slice 10 起提案分两种：Kind="patch"（默认，改已有 Deployment 的字段），
+// Kind="create"（创建提案，Creation 里是完整规格，Patches 为空）。
+// 两种提案走同一套审批 / 执行 / 验证流程：建议卡 → 创建可审批任务 →
+// 人工审批 → Worker 执行 → 验证 rollout，不为创建单独写一套流程，
+// 以后改成 manager agent 时创建能力可以直接复用。
 type Proposal struct {
 	RunID         string
 	Namespace     string
@@ -49,12 +55,28 @@ type Proposal struct {
 	NewValue      string // 例如 256Mi（展示用，第一个 Patch 的新值）
 	Patches       []store.PatchOperation
 	DeploymentUID string // 提案生成时绑定的目标 UID，空表示老提案未绑定
+	// Creation 是创建提案的规格（Slice 10），只有 Kind="create" 时才填：
+	// 填了它就表示这是一份创建提案，执行时走 CreateDeployment 而不是 Patch。
+	Creation *store.CreationSpec
 }
 
 // CreateProposal 生成一份待审批提案，写入 change_requests 表。
 // 提案一旦生成就不可变：改目标、改前后值都要生成新提案，
 // 不能原地改旧提案，这样审批时看到的东西和执行时用的东西才一致。
 func CreateProposal(s *store.Store, p *Proposal) (*store.ChangeRequest, error) {
+	// 创建提案（Slice 10）：规格先补默认值、再过 ValidateCreation，
+	// 校验不过不生成提案。创建没有旧值，NewValue 存镜像做展示用。
+	if p.Creation != nil {
+		spec := NormalizeCreation(p.Creation)
+		if err := ValidateCreation(spec); err != nil {
+			return nil, err
+		}
+		return s.CreateChangeRequest(context.Background(), &store.ChangeRequest{
+			RunID: p.RunID, Namespace: spec.Namespace, Deployment: spec.Name,
+			Container: spec.Container, OldValue: "", NewValue: spec.Image,
+			Kind: "create", Creation: spec,
+		})
+	}
 	patches := p.Patches
 	if len(patches) == 0 {
 		// 老调用方只给了 old/new 值：按旧字段反推一条内存 limit 的 Patch，
@@ -267,6 +289,7 @@ func validatePatchValue(kind string, value any) error {
 //   - 每个 Patch 的值格式要合法，不合法就拒绝整个建议，
 //     不给一张半合法的卡；
 //   - 系统命名空间一律拒绝。
+//
 // 和集群现状有关的检查（容器下标越界、内存倍数）不在这里，
 // 在 ValidatePatchWithCurrent 里，调用方读到现状后再调它。
 func ValidatePatch(namespace, deployment string, patches []store.PatchOperation) error {
@@ -445,19 +468,22 @@ func ValidatePatchSpec(namespace, deployment, container, oldValue, newValue stri
 // OldPodTemplateHash 是 Patch 前旧 Pod 的 pod-template-hash，
 // 验证阶段用它区分新旧 Pod。
 type ExecutionResult struct {
-	Status             string                  `json:"status"`
-	DryRunOK           bool                    `json:"dryRunOk"`
-	UID                string                  `json:"uid,omitempty"`
-	ResourceVersion    string                  `json:"resourceVersion,omitempty"`
-	BeforeValue        string                  `json:"beforeValue,omitempty"`
-	AfterValue         string                  `json:"afterValue,omitempty"`
-	Patches            []store.PatchOperation  `json:"patches,omitempty"`
-	Satisfied          bool                    `json:"satisfied"`
-	Unknown            bool                    `json:"unknown"`
-	AlreadyApplied     bool                    `json:"alreadyApplied,omitempty"`
-	OldPodTemplateHash string                  `json:"oldPodTemplateHash,omitempty"`
-	PatchTime          time.Time               `json:"patchTime,omitempty"`
-	Error              string                  `json:"error,omitempty"`
+	Status             string                 `json:"status"`
+	DryRunOK           bool                   `json:"dryRunOk"`
+	UID                string                 `json:"uid,omitempty"`
+	ResourceVersion    string                 `json:"resourceVersion,omitempty"`
+	BeforeValue        string                 `json:"beforeValue,omitempty"`
+	AfterValue         string                 `json:"afterValue,omitempty"`
+	Patches            []store.PatchOperation `json:"patches,omitempty"`
+	Satisfied          bool                   `json:"satisfied"`
+	Unknown            bool                   `json:"unknown"`
+	AlreadyApplied     bool                   `json:"alreadyApplied,omitempty"`
+	OldPodTemplateHash string                 `json:"oldPodTemplateHash,omitempty"`
+	PatchTime          time.Time              `json:"patchTime,omitempty"`
+	Error              string                 `json:"error,omitempty"`
+	// Kind 是执行类型（Slice 10）："patch" 或 "create"，和提案的 Kind 一致，
+	// 前端和时间线摘要据此区分“改了什么”和“创建了什么”。
+	Kind string `json:"kind,omitempty"`
 }
 
 func (r ExecutionResult) toJSON() string {
@@ -566,6 +592,24 @@ func (e *Executor) Execute(ctx context.Context, changeID string) (*ExecutionResu
 	if c.Status != store.ChangeApproved {
 		return nil, nil, fmt.Errorf("提案 %s 未批准（状态 %s），不能执行", changeID, c.Status)
 	}
+	// 创建提案（Slice 10）：和 Patch 提案走同一条审批后的执行线，
+	// 只是执行动作从 Patch 换成 CreateDeployment，验证还是同一套 rollout 验证。
+	// 校验不通过的创建提案直接标过期，不碰集群。
+	if c.Kind == "create" {
+		if c.Creation == nil {
+			reason := "创建提案缺少创建规格"
+			_ = e.Store.SetChangeExpired(ctx, changeID, reason)
+			e.appendStep(ctx, c.RunID, "创建被拒绝（缺少创建规格）："+reason, "", reason)
+			return &ExecutionResult{Status: store.ExecExpired, Kind: "create", Error: reason}, nil, nil
+		}
+		if err := ValidateCreation(c.Creation); err != nil {
+			_ = e.Store.SetChangeExpired(ctx, changeID, err.Error())
+			e.appendStep(ctx, c.RunID, "创建被拒绝（校验失败）："+err.Error(), "", err.Error())
+			return &ExecutionResult{Status: store.ExecExpired, Kind: "create", Error: err.Error()}, nil, nil
+		}
+		execRes := e.executeCreate(ctx, c)
+		return e.finishExecution(ctx, c, execRes)
+	}
 	// 兜底：Patches 为空的老提案（直接写库、没走 CreateProposal 的），
 	// 从 old/new 值反推一条内存 Patch，和读库时的反推保持一致。
 	if len(c.Patches) == 0 && c.OldValue != "" && c.NewValue != "" {
@@ -583,15 +627,21 @@ func (e *Executor) Execute(ctx context.Context, changeID string) (*ExecutionResu
 	}
 
 	execRes := e.executePatch(ctx, c)
-	// 执行结果先落盘，再跑验证，两者分开存。
-	_ = e.Store.SetExecution(ctx, changeID, execRes.Status, execRes.toJSON())
-	e.appendStep(ctx, c.RunID, e.execSummary(execRes), execRes.toJSON(), execRes.Error)
+	return e.finishExecution(ctx, c, execRes)
+}
+
+// finishExecution 是 Patch 和创建共用的执行收尾：
+// 执行结果先落盘，再跑验证，两者分开存。
+// 没写成功就不用验证 rollout，验证保持 not_started。
+func (e *Executor) finishExecution(ctx context.Context, c *store.ChangeRequest, execRes *ExecutionResult) (*ExecutionResult, *VerificationResult, error) {
+	_ = e.Store.SetExecution(ctx, c.ID, execRes.Status, execRes.toJSON())
+	e.appendStep(ctx, c.RunID, e.execSummary(c, execRes), execRes.toJSON(), execRes.Error)
 	if execRes.Status != store.ExecExecuted {
 		// 没写成功就不用验证 rollout，验证保持 not_started。
 		return execRes, nil, nil
 	}
 	verRes := e.Verify(ctx, c, execRes)
-	_ = e.Store.SetVerification(ctx, changeID, verRes.Status, verRes.toJSON())
+	_ = e.Store.SetVerification(ctx, c.ID, verRes.Status, verRes.toJSON())
 	e.appendStep(ctx, c.RunID, e.verifySummary(verRes), verRes.toJSON(), verRes.Error)
 	return execRes, verRes, nil
 }
@@ -611,7 +661,23 @@ func patchSummary(patches []store.PatchOperation, before map[string]string) stri
 	return strings.Join(parts, "；")
 }
 
-func (e *Executor) execSummary(r *ExecutionResult) string {
+func (e *Executor) execSummary(c *store.ChangeRequest, r *ExecutionResult) string {
+	// 创建提案的摘要（Slice 10）：说清楚创建了什么，而不是按 Patch 的写法说“修复已写入”。
+	if c != nil && c.Kind == "create" {
+		switch r.Status {
+		case store.ExecExecuted:
+			if r.AlreadyApplied {
+				return fmt.Sprintf("Deployment %s/%s 已存在且配置一致，视为已创建", c.Namespace, c.Deployment)
+			}
+			return fmt.Sprintf("已创建 Deployment %s/%s（镜像 %s，%d 个副本），读回确认已生效", c.Namespace, c.Deployment, r.AfterValue, replicasOf(c))
+		case store.ExecExpired:
+			return "创建过期未执行：" + r.Error
+		case store.ExecUnknown:
+			return "创建执行结果未知：" + r.Error
+		default:
+			return "创建执行失败：" + r.Error
+		}
+	}
 	switch r.Status {
 	case store.ExecExecuted:
 		if r.AlreadyApplied {
@@ -629,6 +695,14 @@ func (e *Executor) execSummary(r *ExecutionResult) string {
 	default:
 		return "修复执行失败：" + r.Error
 	}
+}
+
+// replicasOf 从创建提案里读副本数，读不到默认 1，只做摘要展示用。
+func replicasOf(c *store.ChangeRequest) int {
+	if c != nil && c.Creation != nil && c.Creation.Replicas > 0 {
+		return c.Creation.Replicas
+	}
+	return 1
 }
 
 func (e *Executor) verifySummary(r *VerificationResult) string {

@@ -115,6 +115,18 @@ func (s *Service) runStub(ctx context.Context, conversationID, text string, hist
 		strings.Contains(text, "如何")
 	ns := s.resolveNamespace(ctx, text, history)
 
+	// 创建 Deployment / Pod（Slice 10）：用户明确说要创建时，
+	// 先问缺的信息（命名空间、名字、镜像），问全了直接给一张创建建议卡，
+	// 不用先做故障诊断。裸 Pod 不直接创建，按 Deployment 给卡，
+	// 并在回复里说明原因。放在镜像变更分支之前：
+	// “创建……换成 nginx:1.25”首先是创建意图，不能当成换镜像处理。
+	// 上一轮刚问过创建缺什么信息时，本轮即便只回了名字或镜像
+	// （例如只回一句“叫 web-demo”），也是创建的继续，
+	// 不能当成一个新问题去查故障。
+	if isCreateIntent(text) || continuesCreation(history) {
+		return s.runStubCreate(ctx, conversationID, text, history)
+	}
+
 	// 主动变更 / 多轮追问选镜像（Slice 9）：用户明确说了要换成哪个镜像，
 	// 不用先做故障诊断，直接查当前镜像、给一张 Patch 建议卡。
 	// Pod 是健康的也不用先找故障：主动变更和故障修复走同一套 Patch 流程。
@@ -252,6 +264,224 @@ func (s *Service) runStub(ctx context.Context, conversationID, text string, hist
 		reply.WriteString("\n目前没有明确的修复建议，需要更多证据才能下结论。")
 	}
 	return &Reply{Reply: reply.String(), ToolCalls: recs, Structured: structured, SuggestedRepair: sr}, nil
+}
+
+// ---------------------------------------------------------------------------
+// 创建意图（Slice 10，Stub 的确定性规则，真模型路径不走这里，见 real.go）
+// ---------------------------------------------------------------------------
+
+// isCreateIntent 判断用户这轮是不是在说“创建 Deployment / Pod”：
+// 消息里要有“创建”，并且提到 Deployment、部署或 Pod。
+// “创建可审批的修复任务”是按钮文案，不是创建意图，
+// 它不含 Deployment / Pod，不会误触发。
+func isCreateIntent(text string) bool {
+	if !strings.Contains(text, "创建") {
+		return false
+	}
+	return strings.Contains(text, "Deployment") || strings.Contains(text, "部署") ||
+		strings.Contains(text, "Pod") || strings.Contains(text, "pod")
+}
+
+// continuesCreation 判断本轮是不是上一轮创建追问的继续：
+// 上一轮助手刚问过“创建一个 Deployment 还缺这些信息”，
+// 用户本轮只回了名字或镜像（例如只回一句“叫 web-demo”），
+// 消息里没有“创建”二字，也要走创建分支，不能当成新问题去查故障。
+func continuesCreation(history []store.ConversationMessage) bool {
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].Role == "assistant" {
+			return strings.Contains(history[i].Content, "创建一个 Deployment 还缺这些信息")
+		}
+	}
+	return false
+}
+
+var (
+	// 名字：用户明说的叫法，例如“叫 web-demo”、“名字是 web”。
+	createNameRe = regexp.MustCompile(`(?:叫|名字(?:是|叫)?|名称(?:是|叫)?)\s*([a-z0-9][a-z0-9-]*)`)
+	// 名字：跟在类型后面的名字，例如“创建 Deployment web”。
+	createNameAfterKindRe = regexp.MustCompile(`(?:Deployment|部署|Pod|pod)\s+([a-z0-9][a-z0-9-]*)`)
+	// 副本数：例如“3 个副本”、“副本数 3”。
+	createReplicasRe = regexp.MustCompile(`(\d+)\s*个(?:副本|实例)|副本(?:数)?\s*[:：]?\s*(\d+)`)
+	// 镜像：明说的镜像字段，例如“镜像 nginx:1.25”、“镜像是 nginx”。
+	createImageFieldRe = regexp.MustCompile(`(?:镜像|image)\s*[:：是]?\s*([a-z0-9][a-z0-9._/-]+)`)
+	// 镜像：用户只回了一个裸镜像名，例如上一轮刚问过“用什么镜像”，这轮只回“nginx:1.25”。
+	createBareImageRe = regexp.MustCompile(`^([a-z0-9][a-z0-9._/-]+)$`)
+	// 镜像：类型前面的带路径镜像，例如“创建一个 docker.io/library/nginx Deployment”。
+	createImageBeforeKindRe = regexp.MustCompile(`([a-z0-9][a-z0-9._/-]*[/.][a-z0-9._/-]*)\s*(?:Deployment|部署|Pod|pod)`)
+)
+
+// parseCreateName 从合并后的用户消息里解析要创建的 Deployment 名字。
+// 注意：类型前面的词不算名字——“创建一个 nginx Deployment”里的 nginx
+// 是镜像不是名字，名字必须明说（“叫 web-demo”）或跟在类型后面
+// （“创建 Deployment web”），否则宁可问用户，也不要把镜像当成名字。
+func parseCreateName(all string) string {
+	if m := createNameRe.FindStringSubmatch(all); m != nil {
+		return m[1]
+	}
+	if m := createNameAfterKindRe.FindStringSubmatch(all); m != nil {
+		return m[1]
+	}
+	return ""
+}
+
+// parseCreateImage 从合并后的用户消息里解析镜像，优先级：
+// 带 tag 的镜像名 > 明说的镜像字段 > 上一轮问过镜像后只回的裸镜像名 >
+// 类型前面的带路径镜像。都不中时返回 ""，调用方问用户。
+func parseCreateImage(all, text string, history []store.ConversationMessage) string {
+	if m := imageTokenRe.FindStringSubmatch(all); m != nil {
+		return m[1]
+	}
+	if m := createImageFieldRe.FindStringSubmatch(all); m != nil {
+		return m[1]
+	}
+	askedImage := false
+	for _, h := range history {
+		if h.Role == "assistant" && strings.Contains(h.Content, "镜像") {
+			askedImage = true
+		}
+	}
+	if askedImage {
+		if m := createBareImageRe.FindStringSubmatch(strings.TrimSpace(text)); m != nil {
+			return m[1]
+		}
+	}
+	if m := createImageBeforeKindRe.FindStringSubmatch(all); m != nil {
+		return m[1]
+	}
+	return ""
+}
+
+// parseCreateReplicas 从合并后的用户消息里解析副本数，没说时返回 0，
+// 调用方默认 1，不用为副本数多问一轮。
+func parseCreateReplicas(all string) int {
+	m := createReplicasRe.FindStringSubmatch(all)
+	if m == nil {
+		return 0
+	}
+	for _, g := range m[1:] {
+		if g == "" {
+			continue
+		}
+		n := 0
+		for _, c := range g {
+			if c < '0' || c > '9' {
+				return 0
+			}
+			n = n*10 + int(c-'0')
+		}
+		return n
+	}
+	return 0
+}
+
+// deploymentExists 看 list_deployments 的结构化结果里是否已有同名 Deployment。
+func deploymentExists(data any, name string) bool {
+	b, _ := json.Marshal(data)
+	var v struct {
+		Deployments []struct {
+			Name string `json:"name"`
+		} `json:"deployments"`
+	}
+	if err := json.Unmarshal(b, &v); err != nil {
+		return false
+	}
+	for _, d := range v.Deployments {
+		if d.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// runStubCreate 是 Stub 的创建路径：确定性规则，不调真模型。
+// 流程：先把本轮和历史里的用户消息拼在一起解析（多轮追问的记忆），
+// 缺命名空间、名字、镜像时先问，不猜；问全了查一下同名是否已存在，
+// 再过 ValidateCreation，最后直接给一张创建建议卡，
+// 不用先做故障诊断——要创建的东西本来就没有故障可诊。
+// 裸 Pod 不直接创建：用户说“创建一个 Pod”时也按 Deployment 给卡，
+// 并在回复里说明原因（Pod 挂了不会自动重建，也没有 rollout）。
+func (s *Service) runStubCreate(ctx context.Context, conversationID, text string, history []store.ConversationMessage) (*Reply, error) {
+	var recs []ToolCallRecord
+	structured := map[string]any{}
+
+	call := func(name string, args map[string]string) (agent.ToolOutput, error) {
+		if args == nil {
+			args = map[string]string{}
+		}
+		tc := &agent.ToolCall{ID: fmt.Sprintf("chat-call-%d", len(recs)+1), Name: name, Args: args}
+		start := time.Now()
+		out, err := s.executeChatTool(ctx, tc)
+		rec := ToolCallRecord{ID: tc.ID, Name: name, Args: args, DurationMs: time.Since(start).Milliseconds()}
+		if err != nil {
+			rec.Error = err.Error()
+			rec.Summary = "工具执行失败：" + err.Error()
+			recs = append(recs, rec)
+			s.recordTool(ctx, conversationID, rec, agent.ToolOutput{Summary: rec.Summary})
+			return agent.ToolOutput{}, err
+		}
+		rec.Summary = out.Summary
+		recs = append(recs, rec)
+		s.recordTool(ctx, conversationID, rec, out)
+		return out, nil
+	}
+
+	// 多轮追问的记忆：用户分几轮给的信息（名字、镜像）都在历史的用户消息里，
+	// 拼在一起解析，不用用户把整句话重说一遍。工具消息不拼进来，
+	// 它的 JSON 里也有 name / image 字段，会误解析。
+	var userTexts []string
+	for _, h := range history {
+		if h.Role == "user" {
+			userTexts = append(userTexts, h.Content)
+		}
+	}
+	userTexts = append(userTexts, text)
+	all := strings.Join(userTexts, " ")
+	ns := s.resolveNamespace(ctx, all, history)
+	name := parseCreateName(all)
+	image := parseCreateImage(all, text, history)
+	replicas := parseCreateReplicas(all)
+
+	// 缺信息时先问，不猜：名字、镜像、命名空间缺哪个问哪个，
+	// 副本数默认 1，不用问。
+	var missing []string
+	if ns == "" {
+		missing = append(missing, "命名空间")
+	}
+	if name == "" {
+		missing = append(missing, "名字")
+	}
+	if image == "" {
+		missing = append(missing, "镜像")
+	}
+	if len(missing) > 0 {
+		reply := fmt.Sprintf("创建一个 Deployment 还缺这些信息：%s。请告诉我，例如：命名空间 demo，名字叫 web-demo，镜像 nginx:1.25。", strings.Join(missing, "、"))
+		return &Reply{Reply: reply, ToolCalls: recs, Structured: structured}, nil
+	}
+
+	spec := repair.NormalizeCreation(&agent.SuggestedCreation{
+		Namespace: ns, Name: name, Image: image, Replicas: replicas,
+		Reason: "用户要求创建 Deployment " + name,
+	})
+	// 同名已存在时不给卡：直接告诉用户已存在，建议改它而不是重复创建。
+	if out, err := call("list_deployments", map[string]string{"namespace": ns}); err == nil {
+		structured["deployments"] = out.Data
+		if deploymentExists(out.Data, name) {
+			reply := fmt.Sprintf("%s 命名空间下已经有一个同名的 Deployment %s，不用重复创建。如果你想改它（换镜像、调副本数），直接告诉我改成什么。", ns, name)
+			return &Reply{Reply: reply, ToolCalls: recs, Structured: structured}, nil
+		}
+	}
+	if err := repair.ValidateCreation(spec); err != nil {
+		reply := "这个创建请求校验没通过：" + err.Error()
+		return &Reply{Reply: reply, ToolCalls: recs, Structured: structured}, nil
+	}
+	structured["suggestedCreation"] = spec
+	var b strings.Builder
+	// 用户说的是 Pod 不是 Deployment：按 Deployment 给卡，并说明原因。
+	if (strings.Contains(text, "Pod") || strings.Contains(text, "pod")) && !strings.Contains(text, "Deployment") && !strings.Contains(text, "部署") {
+		b.WriteString("直接创建裸 Pod 不推荐：Pod 挂了不会自动重建，也没有 rollout；下面这张卡是按 Deployment 给的，同样一个容器、同一个镜像，Deployment 会帮你管着 Pod。\n")
+	}
+	b.WriteString(fmt.Sprintf("可以创建：%s/%s，镜像 %s，%d 个副本。这只是一张建议卡，不会自动执行——如果你想走正式流程，可以点“创建可审批的创建任务”，生成提案后人工审批再执行。", spec.Namespace, spec.Name, spec.Image, spec.Replicas))
+	return &Reply{Reply: b.String(), ToolCalls: recs, Structured: structured, SuggestedCreation: spec}, nil
 }
 
 // countOf 从工具返回的 Data 里读 count 字段。

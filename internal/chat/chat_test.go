@@ -460,7 +460,7 @@ func TestChatConvertToRun(t *testing.T) {
 	if _, err := svc.RunMessage(ctx, conv, "demo 那个一直重启的是怎么回事"); err != nil {
 		t.Fatalf("第二轮失败: %v", err)
 	}
-	runID, err := svc.ConvertToRun(ctx, conv, "", "", "", "")
+	runID, err := svc.ConvertToRun(ctx, conv, ConvertInput{})
 	if err != nil {
 		t.Fatalf("转正式诊断失败: %v", err)
 	}

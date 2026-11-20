@@ -1,1 +1,1 @@
-{"caseName":"oom-restart","expectContain":"内存","kind":"Deployment","name":"demo-api","namespace":"demo","question":"demo-api 为什么一直重启"}
+{"caseName":"oom-restart","expectContain":"内存","kind":"Deployment","name":"demo-api","namespace":"demo","question":"demo-api 为什么一直重启","scenario":"oom"}

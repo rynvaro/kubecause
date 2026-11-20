@@ -1,0 +1,54 @@
+# KubeCause kind 演示：demo-api 真实 OOM 场景
+# 用法（Mac 上，kind 集群已建好）：
+#   bash scripts/kind/setup-demo.sh
+#   # 或手动：
+#   kubectl apply -f scripts/kind/demo-api.yaml
+#
+# 设计说明：
+# - 不需要自己构建镜像，直接用公开的 python:3.12-slim，
+#   容器启动后不断分配内存（每次 1MiB），很快超过 128Mi 的 limit，
+#   被内核 OOMKilled，重启后继续分配，进入 CrashLoopBackOff。
+#   这正是 KubeCause 演示要的“为什么一直重启”场景。
+# - 不要给它加 livenessProbe，否则重启原因会被探针混淆。
+# - limit 128Mi 和 Slice 1 fake 数据一致，诊断结论和提案
+#   （128Mi -> 256Mi）才能对上。
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-api
+  namespace: demo
+  labels:
+    app: demo-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: demo-api
+  template:
+    metadata:
+      labels:
+        app: demo-api
+    spec:
+      containers:
+        - name: demo-api
+          image: python:3.12-slim
+          command: ["python3", "-c"]
+          args:
+            - |
+              import time
+              data = []
+              while True:
+                  data.append(b"x" * 1024 * 1024)
+                  time.sleep(0.05)
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "100m"
+            limits:
+              memory: "128Mi"
+              cpu: "500m"

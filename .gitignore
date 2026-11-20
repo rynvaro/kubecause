@@ -3,5 +3,6 @@
 *.db-shm
 kubecause
 kubecause-server
+.env
 /bin/
 /dist/

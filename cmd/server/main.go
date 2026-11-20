@@ -5,7 +5,9 @@
 //   KUBE_MODE=fake（默认）  用 client-go fake clientset，预置 demo-api 数据
 //   KUBE_MODE=kind          用真 client-go 读 ~/.kube/config 或 KUBECONFIG
 //   MODEL_MODE=stub（默认） 用桩模型，确定性走完工具调用
-//   MODEL_MODE=real         Slice 1 未实现，会明确报错
+//   MODEL_MODE=real         Slice 2 真模型，Key 从 MODEL_API_KEY 读，
+//                           缺失时启动报错；BaseURL 默认 DeepSeek，
+//                           可用 MODEL_BASE_URL / MODEL_NAME 切换厂商
 //   DB_PATH                 SQLite 文件路径，默认 ./kubecause.db
 //   ADDR                    监听地址，默认 :8080
 package main
@@ -23,6 +25,7 @@ import (
 
 	"kubecause/internal/agent"
 	"kubecause/internal/api"
+	"kubecause/internal/knowledge"
 	"kubecause/internal/kube"
 	"kubecause/internal/model"
 	"kubecause/internal/run"
@@ -42,7 +45,7 @@ func main() {
 	kubeMode := strings.ToLower(env("KUBE_MODE", "fake"))
 	modelMode := strings.ToLower(env("MODEL_MODE", "stub"))
 
-	log.Printf("KubeCause Slice 1 启动：KUBE_MODE=%s MODEL_MODE=%s DB_PATH=%s ADDR=%s", kubeMode, modelMode, dbPath, addr)
+	log.Printf("KubeCause Slice 2 启动：KUBE_MODE=%s MODEL_MODE=%s DB_PATH=%s ADDR=%s", kubeMode, modelMode, dbPath, addr)
 
 	// 1. 打开 SQLite，启动时自动执行迁移。
 	st, err := store.Open(dbPath)
@@ -78,19 +81,41 @@ func main() {
 	}
 
 	// 4. 按 MODEL_MODE 组装模型。
+	// Slice 2：real 从环境变量读 Key / BaseURL / ModelName，
+	// Key 缺失时启动就明确报错，不让服务带着调不通的模型跑起来。
 	var m agent.Model
 	switch modelMode {
 	case "stub":
 		m = model.NewStub()
 	case "real":
-		// Real.Next 会明确报错，不做假调用。
-		m = model.NewReal(os.Getenv("MODEL_API_KEY"))
+		real, err := model.NewRealFromEnv()
+		if err != nil {
+			log.Fatalf("MODEL_MODE=real 但无法创建真模型: %v", err)
+		}
+		m = real
+		log.Printf("使用真模型：base_url=%s model=%s（Key 只从环境变量读，不写进文件）", env("MODEL_BASE_URL", "https://api.deepseek.com/v1"), env("MODEL_NAME", "deepseek-chat"))
 	default:
 		log.Fatalf("MODEL_MODE 非法: %q，只能是 stub 或 real", modelMode)
 	}
 
+	// 4b. 建 FTS5 索引：runbooks 目录按运行位置可能在不同层级，
+	// 依次试几个候选，找不到就回退到关键词检索并记日志。
+	// 索引建失败不让服务启动失败，检索仍可用，这是 Slice 2 的回退设计。
+	kbIdx := knowledge.NewIndex(st.DB())
+	built := false
+	for _, dir := range []string{"runbooks", "../runbooks", "../../runbooks"} {
+		if err := kbIdx.Build(ctx, dir); err == nil {
+			log.Printf("FTS5 索引已建成，来源目录 %s", dir)
+			built = true
+			break
+		}
+	}
+	if !built {
+		log.Printf("FTS5 索引未建成（找不到 runbooks 目录），search_runbooks 将回退到关键词检索")
+	}
+
 	// 5. 组装工具、Worker、API。
-	tools := &run.ToolsAdapter{Kube: kc}
+	tools := &run.ToolsAdapter{Kube: kc, KB: kbIdx}
 	worker := run.NewWorker(st, tools, m)
 	go worker.RunLoop(ctx)
 

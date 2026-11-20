@@ -269,13 +269,18 @@ func (a *Agent) Run(ctx context.Context, run *store.Run, priorSteps []store.RunS
 		// 先校验，再执行，顺序不能反。
 		if err := ValidateToolCall(run.Namespace, call); err != nil {
 			// 校验失败记一步错误，不执行，继续让模型换个合法调用。
-			if a.OnStep != nil {
-				_ = a.OnStep(ctx, &store.RunStep{
-					RunID: run.ID, Kind: "tool_result", ToolName: call.Name,
-					CallID: call.ID, ArgsJSON: mustJSON(call.Args),
-					Summary: "工具调用被拒绝：" + err.Error(), Error: err.Error(),
-				})
+			// 关键修复：错误步也要追加进 priorSteps，否则模型下一次
+			// 看到的历史还是空的，会重复调同一个非法调用，把 8 步烧光。
+			// 之前真模型在 kind 上就是这样连调 8 次 list_workload_pods 的。
+			errStep := &store.RunStep{
+				RunID: run.ID, Kind: "tool_result", ToolName: call.Name,
+				CallID: call.ID, ArgsJSON: mustJSON(call.Args),
+				Summary: "工具调用被拒绝：" + err.Error(), Error: err.Error(),
 			}
+			if a.OnStep != nil {
+				_ = a.OnStep(ctx, errStep)
+			}
+			priorSteps = append(priorSteps, *errStep)
 			continue
 		}
 		// 重启恢复：指纹命中说明这一步已经提交过，直接跳过不重复调。
@@ -289,14 +294,19 @@ func (a *Agent) Run(ctx context.Context, run *store.Run, priorSteps []store.RunS
 		evidenceID := fmt.Sprintf("ev-%d", nextEvidenceSeq)
 		nextEvidenceSeq++
 		if execErr != nil {
-			if a.OnStep != nil {
-				_ = a.OnStep(ctx, &store.RunStep{
-					RunID: run.ID, Kind: "tool_result", ToolName: call.Name,
-					CallID: call.ID, ArgsJSON: mustJSON(call.Args),
-					Summary: "工具执行失败：" + execErr.Error(), Error: execErr.Error(),
-					DurationMs: duration.Milliseconds(),
-				})
+			// 工具失败也要把错误步追加进 priorSteps，让模型下一次能看到
+			// “这个工具刚才失败了，原因是什么”，从而换个工具重试，
+			// 而不是原地重复调同一个失败的工具。
+			errStep := &store.RunStep{
+				RunID: run.ID, Kind: "tool_result", ToolName: call.Name,
+				CallID: call.ID, ArgsJSON: mustJSON(call.Args),
+				Summary: "工具执行失败：" + execErr.Error(), Error: execErr.Error(),
+				DurationMs: duration.Milliseconds(),
 			}
+			if a.OnStep != nil {
+				_ = a.OnStep(ctx, errStep)
+			}
+			priorSteps = append(priorSteps, *errStep)
 			// 工具失败不让整个任务崩掉，继续循环，模型可以换工具重试。
 			continue
 		}
@@ -307,8 +317,8 @@ func (a *Agent) Run(ctx context.Context, run *store.Run, priorSteps []store.RunS
 		evidenceSummary[evidenceID] = out.Summary
 		evidenceSummary[call.ID] = out.Summary
 		usedToolFingerprints[fingerprint] = true
+		resultJSON, _ := json.Marshal(out.Data)
 		if a.OnStep != nil {
-			resultJSON, _ := json.Marshal(out.Data)
 			if err := a.OnStep(ctx, &store.RunStep{
 				RunID: run.ID, Kind: "tool_result", ToolName: call.Name,
 				CallID: call.ID, ArgsJSON: mustJSON(call.Args),
@@ -319,9 +329,14 @@ func (a *Agent) Run(ctx context.Context, run *store.Run, priorSteps []store.RunS
 			}
 		}
 		// 把这一步的结果追加进 priorSteps，让桩模型能按顺序推进。
+		// Slice 2 补上 ResultJSON：Stub 和真模型都靠历史里的结果
+		// 判断场景（例如 ImagePullBackOff 只在 Events / 日志的
+		// ResultJSON 里出现，Summary 里不一定有），不带它
+		// imagepull / probe 用例会识别不到信号。
 		priorSteps = append(priorSteps, store.RunStep{
 			RunID: run.ID, Kind: "tool_result", ToolName: call.Name,
 			CallID: call.ID, ArgsJSON: mustJSON(call.Args), Summary: out.Summary,
+			ResultJSON: string(resultJSON),
 		})
 		lastReport = nil
 	}

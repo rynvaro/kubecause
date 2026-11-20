@@ -17,6 +17,9 @@ import (
 // 模型能看懂的摘要和结构化证据，并在这里截断日志。
 type ToolsAdapter struct {
 	Kube kube.KubeClient
+	// KB 是 Slice 2 的 FTS5 索引，为 nil 时回退到内存关键词检索。
+	// 这样 Slice 1 的调用方不用改，传了索引才走 FTS5。
+	KB *knowledge.Index
 }
 
 // GetPod 返回 Pod 的状态、重启次数和上一次终止原因。
@@ -27,10 +30,14 @@ func (t *ToolsAdapter) GetPod(ctx context.Context, namespace, name string) (agen
 	}
 	restarts := 0
 	lastReason := ""
+	waitingReason := ""
 	for _, cs := range pod.Status.ContainerStatuses {
 		restarts += int(cs.RestartCount)
 		if cs.LastTerminationState.Terminated != nil {
 			lastReason = cs.LastTerminationState.Terminated.Reason
+		}
+		if cs.State.Waiting != nil && cs.State.Waiting.Reason != "" {
+			waitingReason = cs.State.Waiting.Reason
 		}
 	}
 	data := map[string]any{
@@ -42,6 +49,11 @@ func (t *ToolsAdapter) GetPod(ctx context.Context, namespace, name string) (agen
 	if lastReason == "" {
 		summary = fmt.Sprintf("Pod %s 状态 %s，重启 %d 次，无终止记录", pod.Name, pod.Status.Phase, restarts)
 	}
+	// 等待原因要写进摘要：ImagePullBackOff 只在这里和 Events 里出现，
+	// 不写摘要模型在下一步选 search_runbooks 关键词时会看不到信号。
+	if waitingReason != "" {
+		summary += fmt.Sprintf("，容器等待原因 %s", waitingReason)
+	}
 	return agent.ToolOutput{Summary: summary, Data: data}, nil
 }
 
@@ -50,7 +62,21 @@ func (t *ToolsAdapter) GetPod(ctx context.Context, namespace, name string) (agen
 func (t *ToolsAdapter) ListWorkloadPods(ctx context.Context, namespace, deployment string) (agent.ToolOutput, error) {
 	dep, err := t.Kube.GetDeployment(ctx, namespace, deployment)
 	if err != nil {
-		return agent.ToolOutput{}, err
+		// 容错：如果 Deployment 查不到（比如已被删、或服务端连的是另一个集群），
+		// 不要直接报错让模型原地重试 8 次，改按 app=<deployment> 标签直接列 Pod，
+		// 孤儿 Pod 也能被发现，诊断还能继续。拿不到 Pod 时再返回原错误。
+		pods, listErr := t.Kube.ListPodsByLabels(ctx, namespace, map[string]string{"app": deployment})
+		if listErr != nil || len(pods) == 0 {
+			return agent.ToolOutput{}, err
+		}
+		names := make([]string, 0, len(pods))
+		for _, p := range pods {
+			names = append(names, p.Name)
+		}
+		return agent.ToolOutput{
+			Summary: fmt.Sprintf("Deployment %s 查不到（%v），但按标签 app=%s 找到 %d 个 Pod：%s", deployment, err, deployment, len(names), strings.Join(names, ", ")),
+			Data:    map[string]any{"deployment": deployment, "pods": names, "count": len(names), "deploymentNotFound": true},
+		}, nil
 	}
 	labels := map[string]string{}
 	if dep.Spec.Selector != nil {
@@ -115,6 +141,12 @@ func (t *ToolsAdapter) GetPodLogs(ctx context.Context, namespace, pod, container
 	if strings.Contains(raw, "OOMKilled") || strings.Contains(raw, "out of memory") {
 		summary += "，日志中出现 OOMKilled / out of memory"
 	}
+	if strings.Contains(raw, "Failed to pull image") || strings.Contains(raw, "ImagePullBackOff") {
+		summary += "，日志中出现 Failed to pull image / ImagePullBackOff"
+	}
+	if strings.Contains(raw, "liveness probe failed") || strings.Contains(raw, "Liveness probe failed") {
+		summary += "，日志中出现 Liveness probe failed"
+	}
 	if wasTruncated {
 		summary += "，日志已按 100 行 / 64KB 截断"
 	}
@@ -144,8 +176,18 @@ func (t *ToolsAdapter) GetDeployment(ctx context.Context, namespace, name string
 }
 
 // SearchRunbooks 调知识库，返回带来源的片段。
+// 优先走 FTS5，FTS5 未启用、出错或查不到时回退到关键词检索，
+// 并在日志里说明回退原因，保证检索永远有结果可回。
 func (t *ToolsAdapter) SearchRunbooks(ctx context.Context, query string) (agent.ToolOutput, error) {
-	snippets := knowledge.Search(query)
+	var snippets []knowledge.Snippet
+	if t.KB != nil {
+		if out, err := t.KB.Search(ctx, query); err == nil && len(out) > 0 {
+			snippets = out
+		}
+	}
+	if len(snippets) == 0 {
+		snippets = knowledge.Search(query)
+	}
 	if len(snippets) == 0 {
 		return agent.ToolOutput{Summary: fmt.Sprintf("检索 %q 未命中相关手册", query), Data: map[string]any{"query": query, "snippets": []any{}}}, nil
 	}

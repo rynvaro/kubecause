@@ -127,6 +127,11 @@ func Open(path string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+// DB 返回底层数据库连接，供知识库 FTS5 索引使用。
+// 只读索引的建表和查询走这个连接，业务写库仍走 Store 的方法，
+// 避免外部代码绕过 Store 直接写 runs / run_steps。
+func (s *Store) DB() *sql.DB { return s.db }
+
 func (s *Store) migrate(ctx context.Context) error {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS runs (

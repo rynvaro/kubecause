@@ -46,9 +46,73 @@ const (
 // Fake 是 fake clientset 实现，预置演示数据。
 // 它还记录每个方法的调用次数，供测试验证“重启恢复不重复执行”。
 type Fake struct {
-	client   *fake.Clientset
-	Logs     map[string]string // pod 名 -> 日志内容
+	client    *fake.Clientset
+	Logs      map[string]string // pod 名 -> 日志内容
 	CallCount map[string]int
+	Scenario  string // oom / imagepull / probe，eval 用它区分用例
+}
+
+// NewFakeWithScenario 按场景预置不同的 Pod / Events / 日志。
+// oom 是 Slice 1 的默认场景；imagepull 和 probe 是 Slice 2 给 eval 加的，
+// 这样三个用例不用共用同一份 OOM 数据，评估才有意义。
+// 实现上先复用 NewFake 的 OOM 底子，再按场景替换 Pod 状态、
+// Events 和日志，避免把整套 Deployment / ReplicaSet 再写一遍。
+func NewFakeWithScenario(scenario string) *Fake {
+	f := NewFake()
+	f.Scenario = scenario
+	if scenario == "" || scenario == "oom" {
+		return f
+	}
+	ctx := context.Background()
+	// 先清掉 OOM 的 Events，否则 Stub 会优先命中 OOM，掩盖本场景的信号。
+	if list, err := f.client.CoreV1().Events(DemoNamespace).List(ctx, metav1.ListOptions{}); err == nil {
+		for _, e := range list.Items {
+			_ = f.client.CoreV1().Events(DemoNamespace).Delete(ctx, e.Name, metav1.DeleteOptions{})
+		}
+	}
+	switch scenario {
+	case "imagepull":
+		// Deployment 的镜像改成一个不存在的 tag，Pod 卡在拉取阶段。
+		if dep, err := f.client.AppsV1().Deployments(DemoNamespace).Get(ctx, DemoDeployment, metav1.GetOptions{}); err == nil {
+			dep.Spec.Template.Spec.Containers[0].Image = "demo-api:bad-tag"
+			_, _ = f.client.AppsV1().Deployments(DemoNamespace).Update(ctx, dep, metav1.UpdateOptions{})
+		}
+		if pod, err := f.client.CoreV1().Pods(DemoNamespace).Get(ctx, DemoPod, metav1.GetOptions{}); err == nil {
+			pod.Status.Phase = corev1.PodPending
+			pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+				Name: DemoContainer, Ready: false, RestartCount: 0,
+				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ImagePullBackOff", Message: "Back-off pulling image \"demo-api:bad-tag\""}},
+			}}
+			_, _ = f.client.CoreV1().Pods(DemoNamespace).UpdateStatus(ctx, pod, metav1.UpdateOptions{})
+		}
+		for _, e := range []corev1.Event{
+			{ObjectMeta: metav1.ObjectMeta{Name: "demo-api-pull.1", Namespace: DemoNamespace}, Reason: "Failed", Message: "Failed to pull image \"demo-api:bad-tag\": rpc error: code = NotFound desc = manifest unknown", InvolvedObject: corev1.ObjectReference{Kind: "Pod", Name: DemoPod, Namespace: DemoNamespace}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "demo-api-pull.2", Namespace: DemoNamespace}, Reason: "BackOff", Message: "Back-off pulling image \"demo-api:bad-tag\"", InvolvedObject: corev1.ObjectReference{Kind: "Pod", Name: DemoPod, Namespace: DemoNamespace}},
+		} {
+			ev := e
+			_, _ = f.client.CoreV1().Events(DemoNamespace).Create(ctx, &ev, metav1.CreateOptions{})
+		}
+		f.Logs[DemoPod] = "2026-11-20T10:00:01Z demo-api pulling image demo-api:bad-tag\n2026-11-20T10:00:02Z Failed to pull image \"demo-api:bad-tag\": manifest unknown\n2026-11-20T10:00:03Z Pod demo-api-7d9f6c4b5-xk2v9 is in ImagePullBackOff\n"
+	case "probe":
+		if pod, err := f.client.CoreV1().Pods(DemoNamespace).Get(ctx, DemoPod, metav1.GetOptions{}); err == nil {
+			pod.Status.Phase = corev1.PodRunning
+			pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+				Name: DemoContainer, Ready: false, RestartCount: 3,
+				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+				LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{Reason: "Error", ExitCode: 1, Message: "liveness probe failed"}},
+			}}
+			_, _ = f.client.CoreV1().Pods(DemoNamespace).UpdateStatus(ctx, pod, metav1.UpdateOptions{})
+		}
+		for _, e := range []corev1.Event{
+			{ObjectMeta: metav1.ObjectMeta{Name: "demo-api-probe.1", Namespace: DemoNamespace}, Reason: "Unhealthy", Message: "Liveness probe failed: HTTP probe failed with statuscode: 500", InvolvedObject: corev1.ObjectReference{Kind: "Pod", Name: DemoPod, Namespace: DemoNamespace}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "demo-api-probe.2", Namespace: DemoNamespace}, Reason: "Unhealthy", Message: "Readiness probe failed: HTTP probe failed with statuscode: 500", InvolvedObject: corev1.ObjectReference{Kind: "Pod", Name: DemoPod, Namespace: DemoNamespace}},
+		} {
+			ev := e
+			_, _ = f.client.CoreV1().Events(DemoNamespace).Create(ctx, &ev, metav1.CreateOptions{})
+		}
+		f.Logs[DemoPod] = "2026-11-20T10:00:01Z demo-api starting, listening on :8080\n2026-11-20T10:00:12Z liveness probe failed: HTTP probe failed with statuscode: 500\n2026-11-20T10:00:13Z container demo-api restarted, restartCount=3\n"
+	}
+	return f
 }
 
 // NewFake 预置 demo-api 的 Deployment、ReplicaSet、Pod、Events 和日志。
@@ -128,7 +192,7 @@ func NewFake() *Fake {
 			"2026-11-20T10:00:31Z container demo-api terminated, reason OOMKilled, exit code 137\n" +
 			"2026-11-20T10:01:05Z demo-api starting again after restart, restartCount=5\n",
 	}
-	return &Fake{client: cs, Logs: logs, CallCount: map[string]int{}}
+	return &Fake{client: cs, Logs: logs, CallCount: map[string]int{}, Scenario: "oom"}
 }
 
 func (f *Fake) inc(name string) { f.CallCount[name]++ }

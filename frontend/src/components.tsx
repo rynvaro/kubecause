@@ -1,15 +1,19 @@
 // 展示组件：工具时间线、结构化结果（卡片 / 表格）、
-// 修复建议卡、审批卡、修复执行与验证卡。
-// 规则：结构化结果一律渲染成表格和卡片，不要直接贴 JSON；
+// 修复建议卡、审批卡、修复执行与验证卡、右侧活动面板。
+// 规则：结构化结果一律按类型渲染成表格和卡片，不要直接贴 JSON，
+// 也不要靠猜 JSON 的形状（见 types.buildBlocks）；
 // 系统命名空间的行带“系统”徽章；工具失败要显示失败原因，不要吞掉。
 
+import { useState } from 'react'
 import type { ReactNode } from 'react'
+import { buildBlocks } from './types'
 import type {
   ChangeRequest,
   ClusterOverview,
   DeploymentRow,
   PodRow,
   Report,
+  ResultBlock,
   RunSnapshot,
   RunStep,
   SuggestedRepair,
@@ -52,6 +56,7 @@ export function ToolTimeline({
             <div className="tl-head">
               <code>{c.name}</code>
               <span className="tl-args">{argsText(c.args)}</span>
+              <span className="tl-dur">{c.durationMs > 0 ? `${c.durationMs}ms` : '—'}</span>
             </div>
             <div className="tl-summary">{c.error ? `失败：${c.error}` : c.summary}</div>
           </div>
@@ -143,6 +148,90 @@ export function RunTimeline({ steps, running }: { steps: RunStep[]; running: boo
   )
 }
 
+/** 聊天里的一行工具摘要：只留一行，不把完整时间线贴进聊天。
+ * 点一下展开看完整时间线，或去右侧活动面板看卡片。 */
+export function ToolSummary({ calls, running }: { calls: ToolCallRecord[]; running?: boolean }) {
+  const [open, setOpen] = useState(false)
+  const done = calls.length
+  const totalMs = calls.reduce((s, c) => s + (c.durationMs > 0 ? c.durationMs : 0), 0)
+  const failed = calls.filter((c) => c.error).length
+  if (done === 0 && !running) return null
+  return (
+    <div className="tool-summary">
+      <button className="tool-summary-btn" onClick={() => setOpen(!open)}>
+        {running ? '◌ 正在执行工具…' : `查了 ${done} 个工具`}
+        {totalMs > 0 ? ` · 总耗时 ${totalMs}ms` : ' · 耗时 —'}
+        {failed > 0 ? ` · ${failed} 个失败` : ''}
+        <span className="muted"> {open ? '收起 ▲' : '展开 ▼'}</span>
+      </button>
+      {open && <ToolTimeline calls={calls} running={running} />}
+    </div>
+  )
+}
+
+/** 右侧活动面板用的一条记录：对话的工具调用和单次诊断的步骤统一成这种形状。 */
+export interface ActivityItem {
+  id: string
+  name: string
+  args?: Record<string, string>
+  summary: string
+  error?: string
+  durationMs: number
+  running?: boolean
+}
+
+export function formatDuration(ms: number): string {
+  return ms > 0 ? `${ms}ms` : '—'
+}
+
+/** 右侧“Agent 活动”面板：每一步工具一张卡片，可点开展开看详情。
+ * 正在执行的卡片高亮带转圈；失败的卡片标红并显示失败原因。 */
+export function ActivityPanel({ items, running }: { items: ActivityItem[]; running?: boolean }) {
+  const [openIds, setOpenIds] = useState<Record<string, boolean>>({})
+  if (items.length === 0 && !running) {
+    return (
+      <p className="muted small">
+        还没有工具调用。问一句“当前状态怎么样”，这里会实时显示 Agent 正在调哪个工具。
+      </p>
+    )
+  }
+  const toggle = (id: string) => setOpenIds((p) => ({ ...p, [id]: !p[id] }))
+  return (
+    <div className="activity-list">
+      {items.map((it) => {
+        const open = !!openIds[it.id]
+        return (
+          <div
+            key={it.id}
+            className={`act-card ${it.error ? 'act-error' : ''} ${it.running ? 'act-running' : ''}`}
+          >
+            <button className="act-head" onClick={() => toggle(it.id)}>
+              <span className={`tl-dot ${it.running ? 'spin' : ''}`}>{it.error ? '✕' : it.running ? '◌' : '✓'}</span>
+              <code>{it.name}</code>
+              <span className="tl-dur">{formatDuration(it.durationMs)}</span>
+              <span className="muted">{open ? '▲' : '▼'}</span>
+            </button>
+            {open && (
+              <div className="act-body">
+                {it.args && <div className="tl-args">{argsText(it.args)}</div>}
+                <div className="tl-summary">{it.error ? `失败：${it.error}` : it.summary}</div>
+              </div>
+            )}
+          </div>
+        )
+      })}
+      {running && (
+        <div className="act-card act-running">
+          <div className="act-head">
+            <span className="tl-dot spin">◌</span>
+            <span>正在执行工具…</span>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function SystemBadge() {
   return <span className="badge-sys">系统</span>
 }
@@ -177,37 +266,47 @@ export function OverviewCards({ overview }: { overview: ClusterOverview }) {
 }
 
 export function PodTable({ rows }: { rows: PodRow[] }) {
+  // 长列表默认只显示前 10 行，点开看全部：聊天里先给摘要，不把整张表一次性顶上去。
+  const [showAll, setShowAll] = useState(false)
   if (rows.length === 0) return <p className="muted">没有符合条件的 Pod。</p>
+  const shown = showAll ? rows : rows.slice(0, 10)
   return (
-    <table className="tbl">
-      <thead>
-        <tr>
-          <th>NAME</th>
-          <th>NS</th>
-          <th>READY</th>
-          <th>STATUS</th>
-          <th>RESTARTS</th>
-          <th>原因</th>
-        </tr>
-      </thead>
-      <tbody>
-        {rows.map((r) => (
-          <tr key={`${r.namespace}/${r.name}`}>
-            <td>
-              <code>{r.name}</code>
-              {r.deployment && <div className="muted small">{r.deployment}</div>}
-            </td>
-            <td>
-              {r.namespace} {r.isSystem && <SystemBadge />}
-            </td>
-            <td>{r.ready}</td>
-            <td>{r.phase}</td>
-            <td>{r.restarts}</td>
-            <td>{r.lastTerminationReason || r.waitingReason || '—'}</td>
+    <>
+      <table className="tbl">
+        <thead>
+          <tr>
+            <th>NAME</th>
+            <th>NS</th>
+            <th>READY</th>
+            <th>STATUS</th>
+            <th>RESTARTS</th>
+            <th>原因</th>
           </tr>
-        ))}
-      </tbody>
-    </table>
+        </thead>
+        <tbody>
+          {shown.map((r) => (
+            <tr key={`${r.namespace}/${r.name}`}>
+              <td>
+                <code>{r.name}</code>
+                {r.deployment && <div className="muted small">{r.deployment}</div>}
+              </td>
+              <td>
+                {r.namespace} {r.isSystem && <SystemBadge />}
+              </td>
+              <td>{r.ready}</td>
+              <td>{r.phase}</td>
+              <td>{r.restarts}</td>
+              <td>{r.lastTerminationReason || r.waitingReason || '—'}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {rows.length > 10 && (
+        <button className="link-btn" onClick={() => setShowAll(!showAll)}>
+          {showAll ? '收起' : `展开全部 ${rows.length} 行 ▼`}
+        </button>
+      )}
+    </>
   )
 }
 
@@ -243,7 +342,87 @@ export function DeploymentTable({ rows }: { rows: DeploymentRow[] }) {
   )
 }
 
-/** 结构化结果渲染：overview / problemPods / pods / deployments / events / runbooks / report。 */
+/** 一个结果块：标题栏永远可见，正文默认按类型折叠一部分。
+ * 总览、报告、修复建议默认展开；Pod 表格、事件列表默认展开但内部只显示前几行，
+ * 点开看全部。不知道的类型不渲染，直接返回 null，不白屏。 */
+function ResultBlockView({ block, onConvert, converting }: { block: ResultBlock; onConvert?: () => void; converting?: boolean }) {
+  // 总览和修复建议是本轮的核心结论，默认展开；长列表默认展开但内部折叠行数。
+  const [open, setOpen] = useState(block.kind !== 'events')
+  const [showAllEvents, setShowAllEvents] = useState(false)
+  let body: ReactNode = null
+  let summary = ''
+  switch (block.kind) {
+    case 'overview':
+      body = <OverviewCards overview={block.data as ClusterOverview} />
+      summary = '集群状态总览'
+      break
+    case 'podList': {
+      const pods = (block.data as { pods?: PodRow[] }).pods ?? []
+      summary = `有问题 Pod ${pods.length} 个`
+      body = <PodTable rows={pods} />
+      break
+    }
+    case 'deploymentList': {
+      const deps = (block.data as { deployments?: DeploymentRow[] }).deployments ?? []
+      summary = `${deps.length} 个 Deployment`
+      body = <DeploymentTable rows={deps} />
+      break
+    }
+    case 'events': {
+      const evs = (block.data as { events?: Array<{ reason: string; message: string; object: string }> }).events ?? []
+      summary = `${evs.length} 条相关事件`
+      const shown = showAllEvents ? evs : evs.slice(0, 5)
+      body = (
+        <>
+          <ul className="ev-list">
+            {shown.map((e, i) => (
+              <li key={i}>
+                <b>{e.reason}</b> {e.message}
+                {e.object && <span className="muted">（{e.object}）</span>}
+              </li>
+            ))}
+          </ul>
+          {evs.length > 5 && (
+            <button className="link-btn" onClick={() => setShowAllEvents(!showAllEvents)}>
+              {showAllEvents ? '收起' : `展开全部 ${evs.length} 条 ▼`}
+            </button>
+          )}
+        </>
+      )
+      break
+    }
+    case 'report':
+      body = <ReportView report={block.data as Report} />
+      summary = (block.data as Report).cause
+      break
+    case 'repairSuggestion': {
+      const sr = block.data as SuggestedRepair
+      summary = `${sr.namespace}/${sr.deployment} ${sr.oldValue} → ${sr.newValue}`
+      body = <RepairSuggestionCard sr={sr} onConvert={onConvert} converting={converting} />
+      break
+    }
+    case 'text':
+      body = <p>{String(block.data)}</p>
+      summary = String(block.data).slice(0, 40)
+      break
+    default:
+      return null
+  }
+  return (
+    <div className="result-block">
+      <button className="result-head" onClick={() => setOpen(!open)}>
+        <b>{block.title}</b>
+        <span className="muted small">{summary}</span>
+        <span className="muted">{open ? '▲' : '▼'}</span>
+      </button>
+      {open && <div className="result-body">{body}</div>}
+    </div>
+  )
+}
+
+/** 结构化结果渲染：先按类型包成结果块（types.buildBlocks），再按块渲染。
+ * 审批卡、修复建议卡的“转成正式诊断”按钮只要有建议卡就一直显示，
+ * 不只在最新一条消息上才显示，翻历史、刷新后按钮还在。 */
 export function StructuredView({
   structured,
   onConvert,
@@ -253,61 +432,15 @@ export function StructuredView({
   onConvert?: () => void
   converting?: boolean
 }) {
-  const blocks: ReactNode[] = []
-  if (structured.overview && typeof structured.overview === 'object') {
-    blocks.push(
-      <div key="overview">
-        <h4>集群总览</h4>
-        <OverviewCards overview={structured.overview as ClusterOverview} />
-      </div>,
-    )
-  }
-  const podData = (structured.problemPods ?? structured.pods) as { pods?: PodRow[] } | undefined
-  if (podData?.pods) {
-    blocks.push(
-      <div key="pods">
-        <h4>有问题的 Pod</h4>
-        <PodTable rows={podData.pods} />
-      </div>,
-    )
-  }
-  const depData = structured.deployments as { deployments?: DeploymentRow[] } | undefined
-  if (depData?.deployments) {
-    blocks.push(
-      <div key="deps">
-        <h4>Deployment</h4>
-        <DeploymentTable rows={depData.deployments} />
-      </div>,
-    )
-  }
-  const evData = structured.events as { events?: Array<{ reason: string; message: string; object: string }> } | undefined
-  if (evData?.events && evData.events.length > 0) {
-    blocks.push(
-      <div key="events">
-        <h4>相关事件</h4>
-        <ul className="ev-list">
-          {evData.events.map((e, i) => (
-            <li key={i}>
-              <b>{e.reason}</b> {e.message}
-              {e.object && <span className="muted">（{e.object}）</span>}
-            </li>
-          ))}
-        </ul>
-      </div>,
-    )
-  }
-  if (structured.suggestedRepair && typeof structured.suggestedRepair === 'object') {
-    blocks.push(
-      <RepairSuggestionCard
-        key="repair"
-        sr={structured.suggestedRepair as SuggestedRepair}
-        onConvert={onConvert}
-        converting={converting}
-      />,
-    )
-  }
+  const blocks = buildBlocks(structured)
   if (blocks.length === 0) return null
-  return <div className="structured">{blocks}</div>
+  return (
+    <div className="structured">
+      {blocks.map((b, i) => (
+        <ResultBlockView key={`${b.kind}-${i}`} block={b} onConvert={onConvert} converting={converting} />
+      ))}
+    </div>
+  )
 }
 
 /** 修复建议卡（对话模式）：只是一张卡，不会自动执行。 */

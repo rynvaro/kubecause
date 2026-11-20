@@ -476,7 +476,9 @@ func toolDefs() []chatToolDef {
 			"confidence":      map[string]any{"type": "string", "enum": []string{"high", "medium", "low"}},
 			// 修复建议是可选的：只有证据明确指向内存 limit 过低时才给，
 			// field 目前只支持 memoryLimit，旧值必须和查到的现状一致，
-			// 新值要合理（一般是旧值翻倍）。没把握时不要给这个字段，
+			// 新值由你按证据和用户要求算出来（例如用户说“增加 128Mi”就按当前值加 128Mi，
+			// 用户说“调到 256Mi”就按 256Mi）；没有用户明确要求时也按证据算一个合理的新值，
+			// 不要默认翻倍。没把握时不要给这个字段，
 			// 后端不会凭空生成修复提案。
 			"suggestedRepair": map[string]any{"type": "object", "description": "可选的修复建议，只有内存 limit 过低这一种情况才给", "properties": map[string]any{
 				"namespace":  map[string]any{"type": "string"},
@@ -510,7 +512,8 @@ const realSystemPrompt = `你是 Kubernetes 故障诊断助手。任务是根据
 3. 证据不足时不要硬编结论，调用 submit_diagnosis 时把 confidence 写成 low，并写清还需要补查什么。
 4. 提交诊断必须调用 submit_diagnosis，evidenceIds 只能引用工具结果里已经出现过的 ID。
 5. 不要预设故障类型：原因要按证据自己判断，不要默认是内存、镜像或探针问题。只有证据明确指向容器内存 limit 过低时，才可以在 submit_diagnosis 的 suggestedRepair 里给一个修复建议（field 只能是 memoryLimit，oldValue 必须和查到的现状一致）；其他原因不要给修复建议。
-6. 你只能诊断、不能执行任何修改：修复建议只是建议，是否执行由人工审批决定。`
+6. 你只能诊断、不能执行任何修改：修复建议只是建议，是否执行由人工审批决定。
+7. 用户如果明确说了增加量（例如“增加 128Mi”、“调到 256Mi”），按用户说的算新值：先查当前值，再按用户说的增量或目标值算，不要默认翻倍。`
 
 // Next 问一次真模型，返回一步工具调用或最终报告。
 func (r *Real) Next(ctx context.Context, in agent.ModelInput) (agent.ModelStep, error) {

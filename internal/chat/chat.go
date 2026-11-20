@@ -39,12 +39,16 @@ const MaxChatSteps = 8
 
 // ToolCallRecord 是一轮对话里调过的一个工具，
 // 存进 messages.tool_calls，前端能看到每一步调了什么。
+// DurationMs 是本次工具调用的耗时（毫秒），由调用方在执行前后计时；
+// 工具极快导致计时为 0 时前端显示“—”，不编一个数字。
+// 字段不用 omitempty：0 本身就是一个明确的值（快到不足 1ms）。
 type ToolCallRecord struct {
-	ID      string            `json:"id"`
-	Name    string            `json:"name"`
-	Args    map[string]string `json:"args"`
-	Summary string            `json:"summary"`
-	Error   string            `json:"error,omitempty"`
+	ID         string            `json:"id"`
+	Name       string            `json:"name"`
+	Args       map[string]string `json:"args"`
+	Summary    string            `json:"summary"`
+	Error      string            `json:"error,omitempty"`
+	DurationMs int64             `json:"durationMs"`
 }
 
 // Reply 是一轮对话的返回：给用户看的文本、调过的工具、
@@ -115,6 +119,18 @@ func (s *Service) RunMessage(ctx context.Context, conversationID, text string) (
 	}
 	if err != nil {
 		return nil, err
+	}
+	// 建议卡持久化（Slice 6 修的 bug）：修复建议必须和 Structured 一起落盘，
+	// 不能只放在 Reply 顶层。以前这里只存了 ToolCalls 和 Structured，
+	// runStub 返回的 SuggestedRepair 只在 Reply 顶层，前端重新拉会话时就丢了，
+	// 按钮也没了。runReal 是把 sr 放进 structured 里才留住的，两边不一致。
+	// 现在统一在这里做：只要本轮给了建议，就写进 Structured，
+	// stub 和 real 两条路都走同一个保存逻辑。
+	if reply.SuggestedRepair != nil {
+		if reply.Structured == nil {
+			reply.Structured = map[string]any{}
+		}
+		reply.Structured["suggestedRepair"] = reply.SuggestedRepair
 	}
 	toolCallsJSON, _ := json.Marshal(reply.ToolCalls)
 	structuredJSON, _ := json.Marshal(reply.Structured)
@@ -357,7 +373,10 @@ func resolveTargetFromHistory(ctx context.Context, s *Service, history []store.C
 	return "", ""
 }
 
-// synthesizeRepair 从已收集的工具结果里合成一张修复建议卡：
+// synthesizeRepair 从已收集的工具结果里合成一张修复建议卡。
+// 注意：这只是桩模型（Stub）测试路径用的确定性规则，不是产品逻辑。
+// 真模型路径（runReal）不调它：修复决策只能由模型做，后端只做校验。
+// 即便有 OOM 这个案例，也不要为了演示写死——规则合成永远只是测试替身。
 // 只有证据明确指向 OOMKilled、且能读到 Deployment 的当前内存 limit 时才给，
 // 新值是旧值翻倍（封顶 4Gi），再过一次 ValidatePatchSpec，
 // 不通过就不给卡。合成的卡和模型直接给的卡一样，

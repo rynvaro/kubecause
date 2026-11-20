@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"kubecause/internal/agent"
 	"kubecause/internal/store"
@@ -33,8 +34,9 @@ func (s *Service) runStub(ctx context.Context, conversationID, text string, hist
 			args = map[string]string{}
 		}
 		tc := &agent.ToolCall{ID: fmt.Sprintf("chat-call-%d", len(recs)+1), Name: name, Args: args}
+		start := time.Now()
 		out, err := s.executeChatTool(ctx, tc)
-		rec := ToolCallRecord{ID: tc.ID, Name: name, Args: args}
+		rec := ToolCallRecord{ID: tc.ID, Name: name, Args: args, DurationMs: time.Since(start).Milliseconds()}
 		if err != nil {
 			// 工具失败也要记下来并回传给下一轮规则：
 			// 规则层看到失败会换个工具重试，而不是原地重复调同一个。
@@ -128,11 +130,15 @@ func (s *Service) runStub(ctx context.Context, conversationID, text string, hist
 		reply.WriteString("\n" + rb.Summary + "。")
 	}
 	// 修复建议卡：证据指向 OOM 时才给，只是一张卡，不执行、不生成提案。
+	// 注意：这里调 synthesizeRepair 是桩模型测试路径的确定性规则，
+	// 真模型路径不走这条路（见 real.go）。建议卡同时写进 Structured，
+	// 这样 RunMessage 落盘后刷新会话也不会丢（和 real 路径一致）。
 	var sr *agent.SuggestedRepair
 	if deployment != "" {
 		sr = synthesizeRepair(ctx, s, outputs, ns, deployment)
 	}
 	if sr != nil {
+		structured["suggestedRepair"] = sr
 		reply.WriteString(fmt.Sprintf("\n初步判断是容器内存限制过低，建议把 %s 容器的内存 limit 从 %s 调到 %s。这只是一张建议卡，不会自动执行——如果你想走正式流程，可以点“转成正式诊断”，生成提案后人工审批再执行。", sr.Container, sr.OldValue, sr.NewValue))
 	} else {
 		reply.WriteString("\n目前没有明确的修复建议，需要更多证据才能下结论。")

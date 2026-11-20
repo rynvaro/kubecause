@@ -1,15 +1,26 @@
-// KubeCause 前端主界面（Slice 5）。
+// KubeCause 前端主界面（Slice 6）。
 //
-// 布局：左侧会话列表，中间聊天 / 单次诊断，右侧详情。
+// 布局：左侧会话列表，中间聊天 / 单次诊断，右侧“Agent 活动”面板。
 // 两种模式共用同一套后端：对话模式是一问一答（只读），
 // 单次诊断是填表单、等报告、可审批、可执行、可验证。
+//
+// Slice 6 的布局原则：
+//   - 详情结果属于结果，回聊天区：回答文字下面直接跟按类型渲染的结果块
+//     （总览卡片、Pod 表格、事件、诊断报告、修复建议卡、审批卡），
+//     默认折叠一部分，不把整张表一次性顶上去；
+//   - 右侧不再放详情，只放工具执行过程（活动面板），每一步一张卡片，
+//     带耗时；聊天里只留一行工具摘要，点开看完整时间线；
+//   - 修复建议卡上的“转成正式诊断”按钮只要有建议卡就一直显示，
+//     翻历史、刷新后还在；点了之后审批卡直接出现在聊天里，
+//     不绕过审批，聊天里永远不给直接“执行”按钮。
 //
 // 实时显示用轮询，不用 WebSocket：
 //   - 对话：POST /messages 在服务端跑整轮，期间 tool 消息会陆续落盘，
 //     前端每 800ms 轮询一次会话，就能实时看到“正在执行哪个工具”；
 //   - 单次诊断：每 900ms 轮询 /api/runs/{id}/events?after=N 追加时间线，
 //     同时刷新任务快照看状态、报告和提案。
-// 轮询比 WebSocket 简单，够用；后端不用为实时显示改协议。
+// 滚动控制：只有用户已经在最底下时才跟着滚到底，否则显示“有新消息”提示，
+// 不把正在往上翻历史的用户拽下来。
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
@@ -24,17 +35,16 @@ import {
   postChatMessage,
 } from './api'
 import {
+  ActivityPanel,
   ApprovalCard,
   RepairStatusCard,
   ReportView,
   RunTimeline,
   StructuredView,
-  ToolTimeline,
+  ToolSummary,
 } from './components'
-import {
-  parseStructured,
-  parseToolCalls,
-} from './types'
+import type { ActivityItem } from './components'
+import { parseStructured, parseToolCalls } from './types'
 import type { Conversation, ConversationMessage, RunSnapshot, RunStep } from './types'
 
 type Mode = 'chat' | 'run'
@@ -47,6 +57,56 @@ function runStillActive(snap: RunSnapshot | null): boolean {
   const p = snap.proposal
   if (p && (p.executionStatus === 'executing' || p.verificationStatus === 'verifying')) return true
   return false
+}
+
+/** 从会话消息里汇总本轮调过的工具：tool 消息和助手消息里都存了同一份调用，
+ * 按“消息 id + 调用 id”去重——桩模型每轮的调用 id 会从 1 重新编号，
+ * 只按调用 id 去重会把第二轮的调用吞掉。 */
+function chatActivityItems(msgs: ConversationMessage[]): ActivityItem[] {
+  const byKey = new Map<string, ActivityItem>()
+  for (const m of msgs) {
+    for (const c of parseToolCalls(m)) {
+      const key = `${m.id}:${c.id || c.name}`
+      if (!byKey.has(key)) {
+        byKey.set(key, {
+          id: key,
+          name: c.name,
+          args: c.args,
+          summary: c.summary,
+          error: c.error,
+          durationMs: c.durationMs ?? 0,
+        })
+      }
+    }
+  }
+  return [...byKey.values()]
+}
+
+/** 单次诊断的步骤转成活动面板的卡片：报告和修复是里程碑，也各占一张卡。 */
+function runActivityItems(steps: RunStep[]): ActivityItem[] {
+  return steps.map((s) => {
+    let name = s.toolName || s.kind
+    if (s.kind === 'report') name = '诊断报告'
+    if (s.kind === 'repair') name = '修复'
+    if (s.kind === 'error') name = '出错'
+    let args: Record<string, string> | undefined
+    try {
+      if (s.args) {
+        const v = JSON.parse(s.args) as unknown
+        if (v && typeof v === 'object' && !Array.isArray(v)) args = v as Record<string, string>
+      }
+    } catch {
+      // args 不是 JSON 就不解析，摘要里已有文字。
+    }
+    return {
+      id: `step-${s.seq}`,
+      name,
+      args,
+      summary: s.error ? `失败：${s.error}` : s.summary || '',
+      error: s.error,
+      durationMs: s.durationMs,
+    }
+  })
 }
 
 export default function App() {
@@ -70,12 +130,14 @@ export default function App() {
   const [runBusy, setRunBusy] = useState(false)
   const [deciding, setDeciding] = useState(false)
   const [runError, setRunError] = useState('')
+  const [runTimelineOpen, setRunTimelineOpen] = useState(false)
+  const [hasNewBelow, setHasNewBelow] = useState(false)
 
   const afterRef = useRef(0)
   const chatPollRef = useRef<number | null>(null)
   const runPollRef = useRef<number | null>(null)
-  const messagesRef = useRef<ConversationMessage[]>([])
-  messagesRef.current = messages
+  const messagesWrapRef = useRef<HTMLDivElement>(null)
+  const nearBottomRef = useRef(true)
 
   const refreshConversations = useCallback(async () => {
     try {
@@ -96,9 +158,40 @@ export default function App() {
     }
   }, [])
 
+  // 滚动控制：只有已经在最底下时才跟着滚到底；用户往上翻历史时，
+  // 新消息来了只显示“有新消息”按钮，不把人拽下来。
+  function onMessagesScroll() {
+    const el = messagesWrapRef.current
+    if (!el) return
+    const near = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+    nearBottomRef.current = near
+    if (near) setHasNewBelow(false)
+  }
+
+  useEffect(() => {
+    if (mode !== 'chat') return
+    const el = messagesWrapRef.current
+    if (!el) return
+    if (nearBottomRef.current) {
+      el.scrollTop = el.scrollHeight
+      setHasNewBelow(false)
+    } else {
+      setHasNewBelow(true)
+    }
+  }, [messages, chatBusy, snapshot, mode])
+
+  function scrollToBottom() {
+    const el = messagesWrapRef.current
+    if (!el) return
+    el.scrollTop = el.scrollHeight
+    nearBottomRef.current = true
+    setHasNewBelow(false)
+  }
+
   async function openConversation(id: string) {
     setActiveConvId(id)
     setChatError('')
+    setSnapshot(null)
     try {
       const d = await getConversation(id)
       setMessages(d.messages)
@@ -113,6 +206,7 @@ export default function App() {
       const c = await createConversation()
       setActiveConvId(c.id)
       setMessages([])
+      setSnapshot(null)
       await refreshConversations()
     } catch (e) {
       setChatError(e instanceof Error ? e.message : '创建会话失败')
@@ -134,7 +228,7 @@ export default function App() {
         await refreshConversations()
       }
       // POST 在服务端跑整轮：先轮询会话，tool 消息落盘后立刻显示，
-      // 用户能看到 Agent 正在执行哪个工具，不用等整轮结束。
+      // 用户能在右侧活动面板实时看到 Agent 正在执行哪个工具，不用等整轮结束。
       chatPollRef.current = window.setInterval(() => {
         void getConversation(convId)
           .then((d) => setMessages(d.messages))
@@ -164,10 +258,11 @@ export default function App() {
     setChatError('')
     try {
       const r = await convertConversation(activeConvId)
-      setNotice(`已转成正式诊断，runId：${r.runId}。下面可以审批和执行。`)
+      setNotice(`已转成正式诊断，runId：${r.runId}。审批卡在下面聊天里，批准后 Worker 会自动执行并验证。`)
       setRunId(r.runId)
-      setMode('run')
+      // 转换后留在对话模式：审批卡和修复验证直接出现在聊天里，不切走。
       await loadRun(r.runId, true)
+      startRunPolling(r.runId)
     } catch (e) {
       setChatError(e instanceof Error ? e.message : '转换失败')
     } finally {
@@ -262,7 +357,11 @@ export default function App() {
     }
   }
 
-  const lastAssistant = [...messages].reverse().find((m) => m.role === 'assistant')
+  // 右侧活动面板的内容：对话模式汇总会话里所有工具调用，
+  // 单次诊断模式用当前任务的步骤；正在执行时另加一行转圈提示。
+  const activityItems = mode === 'chat' ? chatActivityItems(messages) : runActivityItems(events)
+  const activityRunning = mode === 'chat' ? chatBusy : snapshot ? runStillActive(snapshot) : false
+  const runTotalMs = events.reduce((s, e) => s + (e.durationMs > 0 ? e.durationMs : 0), 0)
 
   return (
     <div className="app">
@@ -320,7 +419,7 @@ export default function App() {
           </div>
         </aside>
 
-        <main className="main">
+        <main className="main" ref={messagesWrapRef} onScroll={onMessagesScroll}>
           {mode === 'chat' ? (
             <>
               {messages.length === 0 ? (
@@ -340,7 +439,10 @@ export default function App() {
                 </div>
               ) : (
                 <div className="messages">
-                  {messages.map((m, i) => {
+                  {messages.map((m) => {
+                    // tool 消息不单独占一楼：它的调用已经汇总到右侧活动面板，
+                    // 聊天里只在助手消息下留一行工具摘要。
+                    if (m.role === 'tool') return null
                     if (m.role === 'user') {
                       return (
                         <div key={m.id} className="msg msg-user">
@@ -348,26 +450,15 @@ export default function App() {
                         </div>
                       )
                     }
-                    if (m.role === 'tool') {
-                      const calls = parseToolCalls(m)
-                      const isLast = i === messages.length - 1
-                      return (
-                        <div key={m.id} className="msg msg-tool">
-                          <ToolTimeline calls={calls} running={chatBusy && isLast} />
-                          <div className="tl-summary">{m.content}</div>
-                        </div>
-                      )
-                    }
                     const calls = parseToolCalls(m)
                     const structured = parseStructured(m)
-                    const isLatest = lastAssistant?.id === m.id
                     return (
                       <div key={m.id} className="msg msg-assistant">
                         <div className="msg-text">{m.content}</div>
-                        <ToolTimeline calls={calls} />
+                        <ToolSummary calls={calls} running={chatBusy} />
                         <StructuredView
                           structured={structured}
-                          onConvert={isLatest ? convertCurrent : undefined}
+                          onConvert={convertCurrent}
                           converting={converting}
                         />
                       </div>
@@ -376,11 +467,31 @@ export default function App() {
                   {chatBusy && (
                     <div className="msg msg-assistant">
                       <div className="msg-text">
-                        <span className="spin">◌</span> Agent 正在执行工具…
+                        <span className="spin">◌</span> Agent 正在执行工具，右侧活动面板实时显示…
                       </div>
                     </div>
                   )}
+                  {snapshot && (
+                    <div className="card run-result">
+                      <h3>正式诊断 · {snapshot.id}</h3>
+                      <p>
+                        任务 {snapshot.namespace}/{snapshot.kind}/{snapshot.name} 状态：
+                        <b>{snapshot.status}</b>
+                        {snapshot.error && <span className="error-text">　{snapshot.error}</span>}
+                      </p>
+                      {snapshot.report && <ReportView report={snapshot.report} />}
+                      {snapshot.proposal && (
+                        <ApprovalCard proposal={snapshot.proposal} onDecide={decide} deciding={deciding} />
+                      )}
+                      <RepairStatusCard snapshot={snapshot} />
+                    </div>
+                  )}
                 </div>
+              )}
+              {hasNewBelow && (
+                <button className="new-below" onClick={scrollToBottom}>
+                  ↓ 有新消息
+                </button>
               )}
               {chatError && <div className="error">{chatError}</div>}
               <div className="composer">
@@ -441,40 +552,32 @@ export default function App() {
                     任务 <code>{snapshot.id}</code> 状态：<b>{snapshot.status}</b>
                     {snapshot.error && <span className="error-text">　{snapshot.error}</span>}
                   </p>
-                  <h3>工具执行时间线</h3>
-                  <RunTimeline steps={events} running={runStillActive(snapshot)} />
+                  <div className="tool-summary">
+                    <button className="tool-summary-btn" onClick={() => setRunTimelineOpen(!runTimelineOpen)}>
+                      {runStillActive(snapshot)
+                        ? '◌ 正在执行工具…'
+                        : `已执行 ${events.length} 步${runTotalMs > 0 ? ` · 总耗时 ${runTotalMs}ms` : ' · 耗时 —'}`}
+                      <span className="muted"> {runTimelineOpen ? '收起 ▲' : '在右侧活动面板查看 ▼'}</span>
+                    </button>
+                    {runTimelineOpen && <RunTimeline steps={events} running={runStillActive(snapshot)} />}
+                  </div>
                   {snapshot.report && <ReportView report={snapshot.report} />}
+                  {snapshot.proposal && (
+                    <ApprovalCard proposal={snapshot.proposal} onDecide={decide} deciding={deciding} />
+                  )}
+                  <RepairStatusCard snapshot={snapshot} />
                 </>
               )}
             </div>
           )}
         </main>
 
-        <aside className="detail">
-          <h3>详情</h3>
-          {snapshot ? (
-            <>
-              <p className="small">
-                任务 {snapshot.id}
-                <br />
-                {snapshot.namespace}/{snapshot.kind}/{snapshot.name}
-                <br />
-                状态：<b>{snapshot.status}</b>
-              </p>
-              {snapshot.report && <ReportView report={snapshot.report} />}
-              {snapshot.proposal && (
-                <ApprovalCard proposal={snapshot.proposal} onDecide={decide} deciding={deciding} />
-              )}
-              <RepairStatusCard snapshot={snapshot} />
-            </>
-          ) : (
-            <p className="muted small">
-              这里显示当前任务的诊断报告、审批卡和修复验证结果。
-              <br />
-              <br />
-              在对话里点“转成正式诊断”，或在“单次诊断”里提交一个任务，这里就会出现详情。
-            </p>
-          )}
+        <aside className="activity">
+          <h3>Agent 活动</h3>
+          <p className="muted small">
+            每一步工具一张卡片，可点开展开看参数和结果。正在执行的卡片高亮。
+          </p>
+          <ActivityPanel items={activityItems} running={activityRunning} />
         </aside>
       </div>
     </div>

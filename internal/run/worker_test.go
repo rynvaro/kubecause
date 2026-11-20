@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"kubecause/internal/agent"
 	"kubecause/internal/kube"
 	"kubecause/internal/model"
 	"kubecause/internal/repair"
@@ -178,5 +179,37 @@ func TestWorkerRepairRejectedNoWrite(t *testing.T) {
 	dep, _ := fake.GetDeployment(ctx, "demo", "demo-api")
 	if dep.Spec.Template.Spec.Containers[0].Resources.Limits.Memory().String() != "128Mi" {
 		t.Fatalf("拒绝后 limit 应仍为 128Mi")
+	}
+}
+
+// TestWorkerNoProposalWhenNewValueMissing 覆盖 Slice 6 的“模型没给新值就不生成提案”：
+// 模型报告里给了修复建议但 NewValue 为空时，Worker 不再按旧值翻倍兜底，
+// 不生成任何提案。修复决策只能由模型做，后端只做校验。
+func TestWorkerNoProposalWhenNewValueMissing(t *testing.T) {
+	ctx := context.Background()
+	s, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("打开内存库失败: %v", err)
+	}
+	defer s.Close()
+	fake := kube.NewFake()
+	w := NewWorker(s, &ToolsAdapter{Kube: fake}, model.NewStub())
+	r := &store.Run{Namespace: "demo", Kind: "Deployment", Name: "demo-api", Question: "demo-api 为什么一直重启", MaxSteps: 8, TimeoutSeconds: 60}
+	if err := s.CreateRun(ctx, r); err != nil {
+		t.Fatalf("创建任务失败: %v", err)
+	}
+	report := &agent.Report{
+		Confidence: "high",
+		SuggestedRepair: &agent.SuggestedRepair{
+			Namespace: "demo", Deployment: "demo-api", Container: "demo-api",
+			Field: "memoryLimit", OldValue: "128Mi", NewValue: "",
+			Reason: "容器内存限制过低",
+		},
+	}
+	if err := w.maybeCreateProposal(ctx, r, report); err != nil {
+		t.Fatalf("maybeCreateProposal 不应报错: %v", err)
+	}
+	if p, err := s.GetChangeRequestByRun(ctx, r.ID); err == nil && p != nil {
+		t.Fatalf("模型没给新值时不应生成提案，得到 %+v", p)
 	}
 }

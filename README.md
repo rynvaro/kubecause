@@ -1,10 +1,20 @@
-# KubeCause — Kubernetes 故障诊断 Agent（Slice 5）
+# KubeCause — Kubernetes 故障诊断 Agent（Slice 6）
 
 KubeCause 是一个 Kubernetes 故障诊断 Agent。用户选定 namespace 和 Pod 或 Deployment，描述故障现象，Agent 自主选择只读工具收集证据，检索排障手册，输出诊断结论和建议。演示环境支持一类人工审批后的变更，即调整指定 Deployment 的容器内存限制，并验证变更后的运行状态。
 
-Slice 5 在 Slice 4 的基础上做了两件事：**完整 React 前端**和**系统命名空间读放开**。前端用 Vite + React + TypeScript 重写，左边会话列表、中间聊天、右边详情，工具执行过程用轮询实时显示成时间线，结构化结果渲染成卡片和表格，不再贴 JSON；构建产物用 `go:embed` 打进 Go 二进制，部署还是一个进程。系统命名空间改成读放开、写挡住：发现工具和对话都能查 kube-system，行里打“系统”标记，修复校验仍然拒绝系统命名空间。
+Slice 6 在 Slice 5 的基础上做了两件事：**前端布局打磨**和**修复决策只走模型单一路**。工具执行过程从聊天区移到右侧“Agent 活动”面板，每一步一张卡片、带耗时；详情结果全部回聊天区，按类型渲染成结果块，默认折叠；修复决策不再有规则合成兜底，真模型跑的时候只认模型给的结构化建议，后端只做校验。用户明确说了增加量（例如“增加 128Mi”）时，模型按用户说的算新值，不再默认翻倍。
 
-Slice 1/2/3/4 已有的东西没有重写：SQLite 表、HTTP 接口、Worker 状态机、Agent 循环的校验和恢复、fake 客户端、桩模型、真模型适配器、FTS5 检索、条件 Patch 与 rollout 验证、对话会话、发现工具，全部保留并做了回归。
+Slice 1/2/3/4/5 已有的东西没有重写：SQLite 表、HTTP 接口、Worker 状态机、Agent 循环的校验和恢复、fake 客户端、桩模型、真模型适配器、FTS5 检索、条件 Patch 与 rollout 验证、对话会话、发现工具、React 前端，全部保留并做了回归。
+
+## Slice 6 改了什么
+
+- **工具时间线移到右侧活动面板**（`frontend/src/App.tsx`、`frontend/src/components.tsx`）：布局改成左侧会话列表、中间聊天、右侧“Agent 活动”面板。右侧不再放诊断报告、审批卡、修复验证，只放工具执行过程：每一步一张卡片，显示工具名、参数摘要、状态（进行中带转圈高亮 / 成功打勾 / 失败打叉标红）、结果摘要、耗时，卡片可点开展开看详情。聊天里不再贴完整时间线，只留一行摘要，例如“查了 6 个工具 · 总耗时 12ms”，点一下展开看完整时间线。单次诊断也一样：任务区只留一行摘要，完整时间线在右侧面板。
+- **工具调用带耗时**（`internal/chat/`）：对话的 `ToolCallRecord` 新增 `durationMs` 字段，调工具时记开始和结束时间算出来再返回；单次诊断的 step 里本来就有 `durationMs`，直接用。工具极快导致耗时为 0 时前端显示“—”，不编一个数字。字段不用 omitempty，0 本身就是一个明确的值。
+- **滚动控制**（`frontend/src/App.tsx`）：聊天只有用户已经在最底下时才跟着滚到底，否则显示“↓ 有新消息”按钮，不把正在往上翻历史的用户拽下来。
+- **详情结果全部回聊天区，按类型渲染**（`frontend/src/types.ts` 的 `buildBlocks`、`frontend/src/components.tsx` 的 `ResultBlockView`）：后端返回的结构化结果先按 key 映射成带类型的结果块再渲染，类型有 overview（集群总览卡片）、podList（Pod 表格）、deploymentList（Deployment 表格）、events（事件时间线）、report（诊断报告卡）、repairSuggestion（修复建议卡）、text（纯文本）。工具名原样当 key 的原始结果（如 get_pod）是 canonical key 的重复，不再单独成块，避免同一份数据出现两次。不知道的类型不渲染，不白屏。每个结果块默认折叠一部分：Pod 表格先显示前 10 行，点开看全部；事件先显示前 5 条，点开看全部；修复建议卡只显示一行摘要，点开看详情。审批卡、修复执行和验证结果也在聊天区作为结果块出现：点了“转成正式诊断”后留在对话模式，审批卡直接出现在聊天里，不用再去右侧找。
+- **修复决策只走模型单一路**（`internal/chat/real.go`、`internal/run/worker.go`、`internal/model/model.go`）：真模型路径去掉 `synthesizeRepair` 兜底。模型给了最终回答但没有结构化修复建议时，不再由后端按 OOM 证据合成一张卡，而是再问模型一次，让它用 `submit_diagnosis` 把 `suggestedRepair` 补回来；补不回来就老实说还没法下结论、需要更多证据，不要编一张卡。正式诊断的 Worker 也一样：模型报告里没给新值就不生成提案，不再按旧值翻倍兜底。系统提示词（对话和单次诊断两处）都加了一句：用户明确说了增加量（例如“增加 128Mi”、“调到 256Mi”）时，模型按用户说的算新值，不要默认翻倍；解析用户的话是模型的事，后端不做正则解析，只校验模型算出来的数。桩模型（Stub）的 `synthesizeRepair` 调用留着，但明确标注只是测试路径的确定性规则，不是产品逻辑；离线评估（`go run ./cmd/eval`）走桩模型，仍 3/3 通过。
+- **修复建议卡丢失 bug 修复**（`internal/chat/chat.go` 的 `RunMessage`）：根因是保存助手消息时只存了 ToolCalls 和 Structured，没存 SuggestedRepair；runStub 返回的建议只在 Reply 顶层，前端重新拉会话时就丢了，按钮也没了。现在统一在 `RunMessage` 里做：只要本轮给了建议，就写进 `Structured["suggestedRepair"]`，stub 和 real 两条路都走同一个保存逻辑。runStub 里也同步把建议写进 Structured，两边一致。前端的“转成正式诊断”按钮只要有建议卡就一直显示，不只在最新一条消息上才显示，翻历史、刷新后按钮还在。安全流程不变：聊天里不给直接“执行”按钮，修复还是要走“转成正式诊断 → 人工审批 → 执行验证”那条线，不绕过审批。
+- **回归**：`go test ./...` 全部通过（含新增的建议卡持久化、工具耗时、真模型无合成卡、Worker 缺新值不生成提案四个测试），`go run ./cmd/eval` 仍 3/3 通过；对话两轮能接上文、转正式诊断后审批执行验证全部回归通过。
 
 ## Slice 5 改了什么
 
@@ -18,7 +28,7 @@ Slice 1/2/3/4 已有的东西没有重写：SQLite 表、HTTP 接口、Worker �
 
 - **通用 Agent**（`internal/agent/`、`internal/model/`、`internal/run/worker.go`）：报告里新增可选的 `suggestedRepair` 字段（目标 namespace / Deployment / 容器、字段、旧值、新值、理由），字段目前只支持 `memoryLimit`，别的字段会被校验层清掉。Stub 的修复建议从已查到的 Deployment 结果里算出来（容器名、旧值来自证据，新值是旧值翻倍封顶 4Gi），不再写死 demo-api / 128Mi；真模型的 `submit_diagnosis` 也加了 `suggestedRepair` 字段，系统提示词里明确“不要预设故障类型，按证据自己判断”。
 - **通用修复白名单**（`internal/repair.ValidatePatchSpec`）：任意 namespace / Deployment / 容器都可以提修复建议，但只允许改内存 limit，值必须是 Mi / Gi 结尾，新值必须大于旧值、不超过旧值的 4 倍、不超过 4Gi，系统命名空间一律拒绝。旧值和集群现状是否一致仍由执行前校验重新读目标时核对（旧值不匹配标为过期，不 Patch）。
-- **通用提案生成**（`internal/run/worker.go`）：Worker 不再看原因里有没有 OOM，而是看报告里有没有 `suggestedRepair`；容器名没给时读 Deployment 的第一个容器，旧值以集群现状为准（建议里的旧值和现状不一致就放弃），新值没给时按旧值翻倍。校验不通过就不生成提案，诊断报告本身仍然完整。
+- **通用提案生成**（`internal/run/worker.go`）：Worker 不再看原因里有没有 OOM，而是看报告里有没有 `suggestedRepair`；容器名没给时读 Deployment 的第一个容器，旧值以集群现状为准（建议里的旧值和现状不一致就放弃），新值必须由模型给，没给就不生成提案（Slice 6 去掉了以前“新值缺失时按旧值翻倍”的兜底，修复决策只能由模型做）。校验不通过就不生成提案，诊断报告本身仍然完整。
 - **KUBE_MODE 通用化**（`cmd/server/main.go`）：`fake | kubeconfig`，`kind` 是 `kubeconfig` 的别名，做兼容保留。kind、k3s、云厂商集群都读 kubeconfig，不再为每种集群写一套客户端；k3s 的 kubeconfig 在 `/etc/rancher/k3s/k3s.yaml`，用 `KUBECONFIG` 指过去即可。
 - **发现工具**（`internal/run/tools.go`、`internal/kube/client.go`）：新增 4 个只读工具，注册进 Agent 工具表，模型在对话里能自主调用：`list_namespaces`、`list_deployments`（namespace 为空查全部）、`list_problem_pods`（非 Running、未 Ready、重启过、有等待原因）、`get_cluster_overview`（节点数、namespace 数、Deployment 数、Pod 数、有问题 Pod 数）。返回的都是结构化 JSON，前端渲染成表格和卡片。注意：Slice 4 时系统命名空间的结果会被过滤掉，Slice 5 已改成读放开、写挡住，系统行带 `isSystem: true` 标记，见上文 Slice 5。
 - **对话会话**（`internal/chat/`、`internal/store/`）：SQLite 新增 `conversations` 和 `messages` 两张表（role 分 user / assistant / tool）。新 API：`POST /api/conversations`、`GET /api/conversations`、`GET /api/conversations/{id}`、`POST /api/conversations/{id}/messages`、`POST /api/conversations/{id}/convert`。每次调用模型带最近 10 条消息，超出截断，数据库里全量保留；TODO 是以后对 10 条之前的历史做摘要，现在不做假的摘要。指代消解靠历史实现：系统提示词写清“这个 ns / 刚才那个 Pod 要按最近提到的目标理解，理解不了就主动问，不要猜”。

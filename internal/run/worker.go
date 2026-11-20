@@ -174,7 +174,10 @@ func (w *Worker) execute(ctx context.Context, run *store.Run) error {
 //   - 容器名：建议里没给时读 Deployment 的第一个容器；
 //   - 旧值：以集群现状为准，建议里给的旧值和现状不一致时放弃
 //     （说明建议的前提已经变了）；
-//   - 新值：建议里没给时按旧值翻倍（封顶 4Gi）。
+//   - 新值：必须由模型给，模型没给新值就不生成提案。
+//     以前这里新值缺失时按旧值翻倍，那是规则合成在替模型做决策，
+//     Slice 6 去掉了：即便有 OOM 这个案例，也不要为了演示写死，
+//     修复决策只能由模型做，后端只做校验。
 //
 // 最后统一过 ValidatePatchSpec（CreateProposal 内部会再校验一次），
 // 任何一关不过都不生成提案，也不报错让任务失败——
@@ -237,10 +240,9 @@ func (w *Worker) maybeCreateProposal(ctx context.Context, run *store.Run, report
 	}
 	newValue := sr.NewValue
 	if newValue == "" {
-		newValue = repair.DoubleMemory(current, repair.MaxMemoryMi)
-		if newValue == "" {
-			return nil
-		}
+		// 模型没给新值就不生成提案，不再按旧值翻倍兜底：
+		// 新值是修复决策的一部分，只能由模型定。
+		return nil
 	}
 	_, _ = repair.CreateProposal(w.Store, &repair.Proposal{
 		RunID: run.ID, Namespace: namespace, Deployment: deployment,

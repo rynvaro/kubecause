@@ -84,6 +84,9 @@ export interface ToolCallRecord {
   args: Record<string, string>
   summary: string
   error?: string
+  // 本次工具调用的耗时（毫秒），后端执行前后计时；0 表示快到不足 1ms，
+  // 前端显示“—”，不编一个数字。
+  durationMs: number
 }
 
 export interface ChatReply {
@@ -168,4 +171,82 @@ export function parseStructured(msg: ConversationMessage): Record<string, unknow
   const v = parseJSONLoose(msg.structured)
   if (v && typeof v === 'object' && !Array.isArray(v)) return v as Record<string, unknown>
   return {}
+}
+
+// ---------------------------------------------------------------------------
+// 结果块（Slice 6）：后端返回的结构化结果按类型包一层再渲染。
+//
+// 为什么要包一层：大模型返回是会变的，有时是列表（Pod 表格），
+// 有时是一个对象（集群总览），有时是一段文字。前端不能靠猜 JSON 的形状
+// 来渲染，猜错了就显示不出来。做法是按 key 映射到一个固定类型，
+// 每种类型对应一个渲染组件；不知道的类型不渲染成表格，只 fallback 成文字，
+// 绝不白屏。工具名原样当 key 的原始结果（如 get_pod、get_events）
+// 是 canonical key 的重复，不再单独成块，避免同一份数据出现两次。
+// ---------------------------------------------------------------------------
+
+export type ResultBlockKind =
+  | 'overview'
+  | 'podList'
+  | 'deploymentList'
+  | 'events'
+  | 'report'
+  | 'repairSuggestion'
+  | 'text'
+
+export interface ResultBlock {
+  kind: ResultBlockKind
+  title: string
+  data: unknown
+}
+
+function asPods(v: unknown): PodRow[] | null {
+  if (!v || typeof v !== 'object') return null
+  const o = v as { pods?: unknown }
+  if (!Array.isArray(o.pods)) return null
+  return o.pods as PodRow[]
+}
+
+function asDeployments(v: unknown): DeploymentRow[] | null {
+  if (!v || typeof v !== 'object') return null
+  const o = v as { deployments?: unknown }
+  if (!Array.isArray(o.deployments)) return null
+  return o.deployments as DeploymentRow[]
+}
+
+/** 把后端 Structured 的 key 映射成带类型的结果块列表。 */
+export function buildBlocks(structured: Record<string, unknown>): ResultBlock[] {
+  const blocks: ResultBlock[] = []
+  if (structured.overview && typeof structured.overview === 'object') {
+    blocks.push({ kind: 'overview', title: '集群总览', data: structured.overview })
+  }
+  const podData = (structured.problemPods ?? structured.pods) as unknown
+  const pods = asPods(podData)
+  if (pods) {
+    blocks.push({ kind: 'podList', title: '有问题的 Pod', data: { pods } })
+  } else if (structured.pod && typeof structured.pod === 'object') {
+    // 单个 Pod（桩模型深挖路径）：包成一行表格，不再单独写一套展示。
+    blocks.push({ kind: 'podList', title: 'Pod', data: { pods: [structured.pod as PodRow] } })
+  }
+  const depData = structured.deployments as unknown
+  const deps = asDeployments(depData)
+  if (deps) {
+    blocks.push({ kind: 'deploymentList', title: 'Deployment', data: { deployments: deps } })
+  } else if (structured.deployment && typeof structured.deployment === 'object') {
+    blocks.push({
+      kind: 'deploymentList',
+      title: 'Deployment',
+      data: { deployments: [structured.deployment as DeploymentRow] },
+    })
+  }
+  const evData = structured.events as { events?: unknown } | undefined
+  if (evData && Array.isArray(evData.events) && evData.events.length > 0) {
+    blocks.push({ kind: 'events', title: '相关事件', data: evData })
+  }
+  if (structured.report && typeof structured.report === 'object') {
+    blocks.push({ kind: 'report', title: '诊断报告', data: structured.report })
+  }
+  if (structured.suggestedRepair && typeof structured.suggestedRepair === 'object') {
+    blocks.push({ kind: 'repairSuggestion', title: '修复建议', data: structured.suggestedRepair })
+  }
+  return blocks
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"kubecause/internal/agent"
 	"kubecause/internal/model"
@@ -27,7 +28,9 @@ const chatSystemPrompt = `你是 Kubernetes 故障诊断助手，正在和用户
 3. 指代消解：用户说的“这个命名空间”、“刚才那个 Pod”、“它”、“那个一直重启的”要按会话历史里的最近提到的目标来理解。如果历史里没有明确的目标，或者有多个可能的目标，不要猜，直接问用户是哪个命名空间、哪个 Pod。
 4. 系统命名空间可以查、可以诊断，但不要把它当成用户业务下结论：如果查到的有问题 Pod 在 kube-system 等系统命名空间里，要明确说明这是系统组件，并且不要给它出修复建议——修复校验本来就会拒绝系统命名空间的修改。
 5. 证据不足时不要硬编结论，要说还需要补查什么。回答用中文，简明扼要，先给结论再给依据。
-6. 如果证据明确指向容器内存 limit 过低，可以在回答最后给出修复建议（目标、旧值、新值、理由），并提醒用户：这只是建议，要走正式诊断、人工审批后才会执行。`
+6. 如果证据明确指向容器内存 limit 过低，可以在回答最后给出修复建议（目标、旧值、新值、理由），并提醒用户：这只是建议，要走正式诊断、人工审批后才会执行。
+7. 修复建议必须通过 submit_diagnosis 的 suggestedRepair 结构化字段返回，不要只在自由文本里提一句。用户如果明确说了增加量（例如“增加 128Mi”、“调到 256Mi”），按用户说的算新值：先查当前值，再按用户说的增量或目标值算，不要默认翻倍。没有用户明确要求时，也按证据算一个合理的新值，不要只会翻倍。
+8. 修复决策只能由你做：后端只做校验，不会替你合成建议。如果你给不出结构化建议，就老实说证据不足、还需要补查什么，不要编一个建议。`
 
 // runReal 是真模型的对话循环：
 // 每轮最多调 MaxChatSteps 次工具，每次问模型一步，
@@ -55,6 +58,12 @@ func (s *Service) runReal(ctx context.Context, conversationID, text string, hist
 	var outputs []agent.ToolOutput
 	structured := map[string]any{}
 	lastNS := s.resolveNamespace(ctx, text, history)
+	// askedForStructured 标记是否已经向模型追问过一次结构化建议。
+	// 真模型路径的修复决策只走模型单一路：模型没给结构化建议时，
+	// 不调 synthesizeRepair 去合成一张卡（那是桩模型测试用的规则，
+	// 真模型跑时不用）。做法是再问模型一次，让它把 suggestedRepair
+	// 补回来；补不回来就老实说还没法下结论，不要编一张卡。
+	askedForStructured := false
 
 	for step := 0; step < MaxChatSteps; step++ {
 		st, err := m.Chat(ctx, msgs)
@@ -69,13 +78,12 @@ func (s *Service) runReal(ctx context.Context, conversationID, text string, hist
 				structured["report"] = st.Report
 				sr = st.Report.SuggestedRepair
 			}
-			if sr == nil {
-				// 模型没直接给建议卡时，按证据合成一张：
-				// 只有 OOM 证据明确且能读到当前 limit 时才给。
-				ns, dep := lastTargetFromOutputs(outputs, lastNS)
-				if dep != "" {
-					sr = synthesizeRepair(ctx, s, outputs, ns, dep)
-				}
+			if sr == nil && !askedForStructured {
+				// 模型给了最终回答但没有结构化修复建议：追问一次，
+				// 让它用 submit_diagnosis 把建议补回来，而不是由后端合成。
+				askedForStructured = true
+				msgs = append(msgs, model.ChatMessage{Role: "user", Content: "如果你认为需要修复，请调用 submit_diagnosis 提交结构化诊断报告，并在 suggestedRepair 里给出目标、旧值、新值和理由（用户如果明确说了增加量，按用户说的算）。如果证据不足以给修复建议，请直接说明还需要补查什么，不要编一个建议。"})
+				continue
 			}
 			if sr != nil {
 				structured["suggestedRepair"] = sr
@@ -101,8 +109,9 @@ func (s *Service) runReal(ctx context.Context, conversationID, text string, hist
 		if ns := tc.Args["namespace"]; ns != "" {
 			lastNS = ns
 		}
+		start := time.Now()
 		out, err := s.executeChatTool(ctx, tc)
-		rec := ToolCallRecord{ID: tc.ID, Name: tc.Name, Args: tc.Args}
+		rec := ToolCallRecord{ID: tc.ID, Name: tc.Name, Args: tc.Args, DurationMs: time.Since(start).Milliseconds()}
 		if err != nil {
 			rec.Error = err.Error()
 			rec.Summary = "工具执行失败：" + err.Error()
@@ -152,26 +161,6 @@ func formatReportReply(rep *agent.Report) string {
 		}
 	}
 	return strings.TrimSpace(b.String())
-}
-
-// lastTargetFromOutputs 从已收集的工具结果里找最近的目标，
-// 供修复建议卡合成时用。
-func lastTargetFromOutputs(outputs []agent.ToolOutput, fallbackNS string) (string, string) {
-	for i := len(outputs) - 1; i >= 0; i-- {
-		b, _ := json.Marshal(outputs[i].Data)
-		var v struct {
-			Deployment string `json:"deployment"`
-			Namespace  string `json:"namespace"`
-		}
-		if err := json.Unmarshal(b, &v); err == nil && v.Deployment != "" {
-			ns := v.Namespace
-			if ns == "" {
-				ns = fallbackNS
-			}
-			return ns, v.Deployment
-		}
-	}
-	return fallbackNS, ""
 }
 
 func mustJSON(v any) string {

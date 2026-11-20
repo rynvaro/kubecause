@@ -3,6 +3,9 @@ package chat
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -83,6 +86,18 @@ func TestChatTwoTurnsCoreference(t *testing.T) {
 	// 对话只读：不能生成任何 change_requests，也不能改 Deployment。
 	if _, err := s.GetChangeRequestByRun(ctx, "nonexistent"); err == nil {
 		t.Fatalf("不应有提案被创建")
+	}
+	// 工具调用必须带耗时字段：fake 工具极快，耗时可能为 0ms，
+	// 但字段必须明确存在（JSON 里有 "durationMs"），前端据此显示数字或“—”，
+	// 不能靠缺失字段去猜。
+	for _, tc := range r2.ToolCalls {
+		if tc.DurationMs < 0 {
+			t.Fatalf("工具耗时不能为负: %+v", tc)
+		}
+	}
+	bDur, _ := json.Marshal(r2.ToolCalls)
+	if !strings.Contains(string(bDur), `"durationMs"`) {
+		t.Fatalf("工具调用 JSON 里应明确包含 durationMs 字段，得到 %s", bDur)
 	}
 	dep, _ := svc.Tools.GetDeployment(ctx, "demo", "demo-api")
 	if dep.Data == nil {
@@ -165,6 +180,92 @@ func TestChatSystemNamespaceReadable(t *testing.T) {
 	// extractNamespace 也要能提出 kube-system，这样对话才能接上文。
 	if got := extractNamespace(`{"namespace":"kube-system"}`); got != "kube-system" {
 		t.Fatalf("extractNamespace 应提出 kube-system，得到 %q", got)
+	}
+}
+
+// TestChatRepairPersistsAfterReload 覆盖 Slice 6 修的建议卡丢失 bug：
+// 第二轮返回的修复建议卡，必须和 Structured 一起落盘，
+// 重新 GET 会话后最后一条助手消息里仍有 suggestedRepair，
+// 前端刷新后“转成正式诊断”按钮才不会丢。
+func TestChatRepairPersistsAfterReload(t *testing.T) {
+	ctx := context.Background()
+	svc, s := newTestService(t)
+	conv := newConversation(t, svc)
+	if _, err := svc.RunMessage(ctx, conv, "当前状态怎么样"); err != nil {
+		t.Fatalf("第一轮失败: %v", err)
+	}
+	if _, err := svc.RunMessage(ctx, conv, "demo 那个一直重启的是怎么回事"); err != nil {
+		t.Fatalf("第二轮失败: %v", err)
+	}
+	msgs, err := s.ListMessages(ctx, conv)
+	if err != nil {
+		t.Fatalf("读会话历史失败: %v", err)
+	}
+	var lastAssistant *store.ConversationMessage
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "assistant" {
+			lastAssistant = &msgs[i]
+			break
+		}
+	}
+	if lastAssistant == nil {
+		t.Fatalf("历史里应有助手消息")
+	}
+	var structured map[string]any
+	if err := json.Unmarshal([]byte(lastAssistant.Structured), &structured); err != nil {
+		t.Fatalf("助手消息的 Structured 应是合法 JSON: %v", err)
+	}
+	sr, ok := structured["suggestedRepair"].(map[string]any)
+	if !ok {
+		t.Fatalf("刷新后 Structured 里仍应有 suggestedRepair，得到 %v", structured)
+	}
+	if sr["oldValue"] != "128Mi" || sr["newValue"] != "256Mi" {
+		t.Fatalf("持久化后的建议卡新旧值不对: %+v", sr)
+	}
+}
+
+// TestRealNoSyntheticRepair 覆盖 Slice 6 的“修复决策只走模型单一路”：
+// 用 mock 模型服务返回纯文本最终回答（只在文字里提修复，不给结构化字段），
+// 真模型路径追问一次后仍拿不到结构化建议时，必须返回无卡，
+// 不能调规则合成一张卡出来。
+func TestRealNoSyntheticRepair(t *testing.T) {
+	// mock 模型：每次都返回一段纯文本，不调任何工具、不提交诊断报告。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"初步判断是内存问题，建议把 limit 从 128Mi 调到 256Mi。"}}]}`)
+	}))
+	defer srv.Close()
+	ctx := context.Background()
+	s, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("打开内存库失败: %v", err)
+	}
+	defer s.Close()
+	real := model.NewRealWithConfig(model.RealConfig{
+		APIKey: "test-key", BaseURL: srv.URL, ModelName: "mock",
+		HTTPClient: srv.Client(), MaxRetries: 0,
+	})
+	svc := NewService(s, &run.ToolsAdapter{Kube: kube.NewFake()}, real)
+	conv := newConversation(t, svc)
+	reply, err := svc.RunMessage(ctx, conv, "demo 那个一直重启的是怎么回事")
+	if err != nil {
+		t.Fatalf("对话失败: %v", err)
+	}
+	if reply.SuggestedRepair != nil {
+		t.Fatalf("模型只给文字没给结构化建议时，不应合成建议卡，得到 %+v", reply.SuggestedRepair)
+	}
+	if _, ok := reply.Structured["suggestedRepair"]; ok {
+		t.Fatalf("Structured 里不应出现合成的 suggestedRepair，得到 %+v", reply.Structured)
+	}
+	if strings.Contains(reply.Reply, "修复建议：") {
+		t.Fatalf("不应在回复里追加合成的修复建议文本，得到 %q", reply.Reply)
+	}
+	// 刷新后同样无卡：持久化逻辑不能把一张不存在的卡变出来。
+	msgs, _ := s.ListMessages(ctx, conv)
+	for _, m := range msgs {
+		if m.Role == "assistant" && strings.Contains(m.Structured, "suggestedRepair") {
+			t.Fatalf("刷新后历史里不应出现 suggestedRepair，得到 %s", m.Structured)
+		}
 	}
 }
 

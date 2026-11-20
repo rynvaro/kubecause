@@ -33,7 +33,30 @@ h5 { font-size: 13px; margin: 10px 0 4px; }
 .side-note { margin-top: 24px; border-top: 1px solid #eee; padding-top: 8px; }
 
 .main { padding: 20px; overflow-y: auto; display: flex; flex-direction: column; }
-.detail { background: #fff; border-left: 1px solid #e0e0e0; padding: 16px; overflow-y: auto; }
+.activity { background: #fff; border-left: 1px solid #e0e0e0; padding: 16px; overflow-y: auto; }
+
+/* 右侧活动面板：每一步工具一张卡片，可点开展开。 */
+.activity-list { display: flex; flex-direction: column; gap: 8px; }
+.act-card { border: 1px solid #e0e0e0; border-radius: 8px; background: #fafafa; overflow: hidden; }
+.act-card.act-running { border-color: #1a6fd4; background: #e8f0fe; }
+.act-card.act-error { border-color: #b3261e; background: #fdecea; }
+.act-head { width: 100%; display: flex; gap: 8px; align-items: center; border: none; background: none; padding: 8px 10px; text-align: left; }
+.act-head .tl-dot { width: 20px; height: 20px; font-size: 12px; }
+.act-body { padding: 0 10px 10px 38px; }
+
+/* 聊天里的一行工具摘要：只留一行，点开看完整时间线。 */
+.tool-summary { margin-top: 8px; }
+.tool-summary-btn { background: #f8f9fa; border: 1px solid #e0e0e0; color: #444; border-radius: 16px; font-size: 12px; padding: 4px 12px; }
+.new-below { align-self: center; margin: 8px 0; background: #1a6fd4; color: #fff; border-color: #1a6fd4; border-radius: 16px; }
+
+/* 结果块：标题栏永远可见，正文可折叠；长列表内部再折叠行数。 */
+.result-block { border: 1px solid #eee; border-radius: 8px; margin: 10px 0; overflow: hidden; }
+.result-head { width: 100%; display: flex; gap: 8px; align-items: baseline; border: none; background: #f8f9fa; padding: 8px 12px; text-align: left; }
+.result-head .muted { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.result-body { padding: 4px 12px 12px; }
+.result-body .card { margin: 8px 0; }
+.link-btn { background: none; border: none; color: #1a6fd4; padding: 4px 0; font-size: 13px; }
+.run-result { border-color: #1a6fd4; }
 
 .empty { text-align: center; padding: 60px 20px; }
 .chips { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; margin-top: 16px; }
@@ -91,7 +114,7 @@ h5 { font-size: 13px; margin: 10px 0 4px; }
 
 @media (max-width: 1000px) {
   .layout { grid-template-columns: 200px 1fr; }
-  .detail { display: none; }
+  .activity { display: none; }
 }
 @media (max-width: 700px) {
   .layout { grid-template-columns: 1fr; }

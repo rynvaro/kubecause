@@ -94,3 +94,38 @@ func TestDecideApprovalIdempotent(t *testing.T) {
 		t.Fatalf("重复审批应幂等返回已批准: %v already=%v %+v", err, already2, decided2)
 	}
 }
+
+func TestClaimApprovedChangeAndResetExecuting(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	r := &Run{Namespace: "demo", Kind: "Deployment", Name: "demo-api", Question: "为什么重启"}
+	_ = s.CreateRun(ctx, r)
+	c, err := s.CreateChangeRequest(ctx, &ChangeRequest{RunID: r.ID, Namespace: "demo", Deployment: "demo-api", Container: "demo-api", OldValue: "128Mi", NewValue: "256Mi"})
+	if err != nil {
+		t.Fatalf("创建提案失败: %v", err)
+	}
+	// 未批准时领不到。
+	if claimed, _ := s.ClaimApprovedChange(ctx); claimed != nil {
+		t.Fatalf("未批准的提案不应被领到")
+	}
+	if _, _, err := s.DecideApproval(ctx, c.ID, ChangeApproved, "varo"); err != nil {
+		t.Fatalf("批准失败: %v", err)
+	}
+	claimed, err := s.ClaimApprovedChange(ctx)
+	if err != nil || claimed == nil || claimed.ExecutionStatus != ExecExecuting {
+		t.Fatalf("批准后应能领到并标为 executing: %v %+v", err, claimed)
+	}
+	// 第二次领不到，同一提案不能被领两次。
+	if again, _ := s.ClaimApprovedChange(ctx); again != nil {
+		t.Fatalf("执行中的提案不应被重复领取")
+	}
+	// 模拟进程在执行中途崩掉：重启后应改回待执行。
+	n, err := s.ResetExecutingChanges(ctx)
+	if err != nil || n != 1 {
+		t.Fatalf("重启恢复失败: n=%d err=%v", n, err)
+	}
+	claimed2, err := s.ClaimApprovedChange(ctx)
+	if err != nil || claimed2 == nil || claimed2.ID != c.ID {
+		t.Fatalf("恢复后应能重新领取: %v %+v", err, claimed2)
+	}
+}

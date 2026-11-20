@@ -15,6 +15,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -29,13 +30,34 @@ const (
 	StatusFailed    = "failed"
 )
 
-// 审批 / 变更状态。Slice 1 只做到 pending / approved / rejected 的记录，
-// 不执行修复，执行状态留在 Slice 3。
+// 审批 / 变更状态。
+// Status 是审批状态：pending -> approved / rejected / expired。
+// ExecutionStatus 是执行状态：not_started -> executing -> executed / failed / unknown / expired。
+// VerificationStatus 是验证状态：not_started -> verifying -> passed / failed / timeout。
+// 三者分开存，前端才能分别展示“写入成功了没有”和“验证通过了没有”，
+// 写入成功但验证失败时不能混成一个“成功”。
 const (
 	ChangePending  = "pending"
 	ChangeApproved = "approved"
 	ChangeRejected = "rejected"
 	ChangeExpired  = "expired"
+)
+
+const (
+	ExecNotStarted = "not_started"
+	ExecExecuting  = "executing"
+	ExecExecuted   = "executed"
+	ExecFailed     = "failed"
+	ExecUnknown    = "unknown"
+	ExecExpired    = "expired"
+)
+
+const (
+	VerifyNotStarted = "not_started"
+	VerifyVerifying  = "verifying"
+	VerifyPassed     = "passed"
+	VerifyFailed     = "failed"
+	VerifyTimeout    = "timeout"
 )
 
 // Run 对应 runs 表，一行就是一次诊断任务。
@@ -74,7 +96,9 @@ type RunStep struct {
 }
 
 // ChangeRequest 对应 change_requests 表，一份不可变的变更提案。
-// Slice 1 只生成和记录它，ExecutionStatus 保持 not_started。
+// DeploymentUID 是提案生成时绑定的目标 Deployment UID，执行前要重新
+// 核对，变了就说明目标已被重建，提案过期。ExecutionDetail /
+// VerificationDetail 存执行和验证结果的 JSON，分开存、分开展示。
 type ChangeRequest struct {
 	ID                 string    `json:"id"`
 	RunID              string    `json:"runId"`
@@ -83,10 +107,13 @@ type ChangeRequest struct {
 	Container          string    `json:"container"`
 	OldValue           string    `json:"oldValue"`
 	NewValue           string    `json:"newValue"`
+	DeploymentUID      string    `json:"deploymentUid,omitempty"`
 	Status             string    `json:"status"`
 	Approver           string    `json:"approver,omitempty"`
 	ExecutionStatus    string    `json:"executionStatus"`
 	VerificationStatus string    `json:"verificationStatus"`
+	ExecutionDetail    string    `json:"executionDetail,omitempty"`
+	VerificationDetail string    `json:"verificationDetail,omitempty"`
 	CreatedAt          time.Time `json:"createdAt"`
 	UpdatedAt          time.Time `json:"updatedAt"`
 }
@@ -173,10 +200,13 @@ func (s *Store) migrate(ctx context.Context) error {
 			container TEXT NOT NULL,
 			old_value TEXT NOT NULL,
 			new_value TEXT NOT NULL,
+			deployment_uid TEXT NOT NULL DEFAULT '',
 			status TEXT NOT NULL DEFAULT 'pending',
 			approver TEXT NOT NULL DEFAULT '',
 			execution_status TEXT NOT NULL DEFAULT 'not_started',
 			verification_status TEXT NOT NULL DEFAULT 'not_started',
+			execution_detail TEXT NOT NULL DEFAULT '',
+			verification_detail TEXT NOT NULL DEFAULT '',
 			created_at DATETIME NOT NULL,
 			updated_at DATETIME NOT NULL,
 			decided_at DATETIME
@@ -186,6 +216,39 @@ func (s *Store) migrate(ctx context.Context) error {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("迁移失败: %w", err)
 		}
+	}
+	// 老库升级：Slice 1/2 建的库没有这三列，启动时补上，不丢数据。
+	// SQLite 的 ADD COLUMN 没有 IF NOT EXISTS，所以先查表结构再决定加不加。
+	for _, col := range []struct{ name, typ string }{
+		{"deployment_uid", "TEXT NOT NULL DEFAULT ''"},
+		{"execution_detail", "TEXT NOT NULL DEFAULT ''"},
+		{"verification_detail", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := s.ensureColumn(ctx, "change_requests", col.name, col.typ); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ensureColumn 在列不存在时才 ALTER TABLE 加列，列已存在时什么都不做。
+func (s *Store) ensureColumn(ctx context.Context, table, column, typ string) error {
+	rows, err := s.db.QueryContext(ctx, `SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return fmt.Errorf("检查表结构失败: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return err
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, column, typ)); err != nil {
+		return fmt.Errorf("加列 %s.%s 失败: %w", table, column, err)
 	}
 	return nil
 }
@@ -365,14 +428,14 @@ func (s *Store) CreateChangeRequest(ctx context.Context, c *ChangeRequest) (*Cha
 	}
 	c.ID = NewID("chg_")
 	c.Status = ChangePending
-	c.ExecutionStatus = "not_started"
-	c.VerificationStatus = "not_started"
+	c.ExecutionStatus = ExecNotStarted
+	c.VerificationStatus = VerifyNotStarted
 	c.CreatedAt = now()
 	c.UpdatedAt = c.CreatedAt
 	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO change_requests(id, run_id, namespace, deployment, container, old_value, new_value, status, approver, execution_status, verification_status, created_at, updated_at)
-		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		c.ID, c.RunID, c.Namespace, c.Deployment, c.Container, c.OldValue, c.NewValue, c.Status, "", c.ExecutionStatus, c.VerificationStatus, c.CreatedAt, c.UpdatedAt)
+		`INSERT INTO change_requests(id, run_id, namespace, deployment, container, old_value, new_value, deployment_uid, status, approver, execution_status, verification_status, execution_detail, verification_detail, created_at, updated_at)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		c.ID, c.RunID, c.Namespace, c.Deployment, c.Container, c.OldValue, c.NewValue, c.DeploymentUID, c.Status, "", c.ExecutionStatus, c.VerificationStatus, "", "", c.CreatedAt, c.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -382,10 +445,10 @@ func (s *Store) CreateChangeRequest(ctx context.Context, c *ChangeRequest) (*Cha
 // GetChangeRequestByRun 取一个任务的提案。
 func (s *Store) GetChangeRequestByRun(ctx context.Context, runID string) (*ChangeRequest, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, run_id, namespace, deployment, container, old_value, new_value, status, approver, execution_status, verification_status, created_at, updated_at
+		`SELECT id, run_id, namespace, deployment, container, old_value, new_value, deployment_uid, status, approver, execution_status, verification_status, execution_detail, verification_detail, created_at, updated_at
 		 FROM change_requests WHERE run_id=? ORDER BY created_at ASC LIMIT 1`, runID)
 	c := &ChangeRequest{}
-	err := row.Scan(&c.ID, &c.RunID, &c.Namespace, &c.Deployment, &c.Container, &c.OldValue, &c.NewValue, &c.Status, &c.Approver, &c.ExecutionStatus, &c.VerificationStatus, &c.CreatedAt, &c.UpdatedAt)
+	err := row.Scan(&c.ID, &c.RunID, &c.Namespace, &c.Deployment, &c.Container, &c.OldValue, &c.NewValue, &c.DeploymentUID, &c.Status, &c.Approver, &c.ExecutionStatus, &c.VerificationStatus, &c.ExecutionDetail, &c.VerificationDetail, &c.CreatedAt, &c.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -395,10 +458,10 @@ func (s *Store) GetChangeRequestByRun(ctx context.Context, runID string) (*Chang
 // GetChangeRequest 按提案 ID 取。
 func (s *Store) GetChangeRequest(ctx context.Context, id string) (*ChangeRequest, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, run_id, namespace, deployment, container, old_value, new_value, status, approver, execution_status, verification_status, created_at, updated_at
+		`SELECT id, run_id, namespace, deployment, container, old_value, new_value, deployment_uid, status, approver, execution_status, verification_status, execution_detail, verification_detail, created_at, updated_at
 		 FROM change_requests WHERE id=?`, id)
 	c := &ChangeRequest{}
-	err := row.Scan(&c.ID, &c.RunID, &c.Namespace, &c.Deployment, &c.Container, &c.OldValue, &c.NewValue, &c.Status, &c.Approver, &c.ExecutionStatus, &c.VerificationStatus, &c.CreatedAt, &c.UpdatedAt)
+	err := row.Scan(&c.ID, &c.RunID, &c.Namespace, &c.Deployment, &c.Container, &c.OldValue, &c.NewValue, &c.DeploymentUID, &c.Status, &c.Approver, &c.ExecutionStatus, &c.VerificationStatus, &c.ExecutionDetail, &c.VerificationDetail, &c.CreatedAt, &c.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -431,4 +494,85 @@ func (s *Store) DecideApproval(ctx context.Context, id, decision, approver strin
 	c.Status = decision
 	c.Approver = approver
 	return c, false, nil
+}
+
+// ClaimApprovedChange 原子领取一份已批准、未执行的提案，并把它标为 executing。
+// 用一行 UPDATE ... WHERE status='approved' AND execution_status='not_started'
+// 保证同一时刻只有一个 Worker 能领到同一份提案。返回 nil, nil 表示暂时没有。
+// 领取和执行在同一个 Worker 循环里串行做，不需要分布式锁。
+func (s *Store) ClaimApprovedChange(ctx context.Context) (*ChangeRequest, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	row := tx.QueryRowContext(ctx,
+		`SELECT id, run_id, namespace, deployment, container, old_value, new_value, deployment_uid, status, approver, execution_status, verification_status, execution_detail, verification_detail, created_at, updated_at
+		 FROM change_requests WHERE status='approved' AND execution_status='not_started' ORDER BY created_at ASC LIMIT 1`)
+	c := &ChangeRequest{}
+	if err := row.Scan(&c.ID, &c.RunID, &c.Namespace, &c.Deployment, &c.Container, &c.OldValue, &c.NewValue, &c.DeploymentUID, &c.Status, &c.Approver, &c.ExecutionStatus, &c.VerificationStatus, &c.ExecutionDetail, &c.VerificationDetail, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE change_requests SET execution_status=?, updated_at=? WHERE id=? AND status='approved' AND execution_status='not_started'`, ExecExecuting, now(), c.ID)
+	if err != nil {
+		return nil, err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return nil, nil
+	}
+	c.ExecutionStatus = ExecExecuting
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// SetExecution 更新一份提案的执行状态和执行结果 JSON（分开存，执行和验证不混）。
+func (s *Store) SetExecution(ctx context.Context, id, executionStatus, detailJSON string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE change_requests SET execution_status=?, execution_detail=?, updated_at=? WHERE id=?`,
+		executionStatus, detailJSON, now(), id)
+	return err
+}
+
+// SetVerification 更新一份提案的验证状态和验证结果 JSON。
+func (s *Store) SetVerification(ctx context.Context, id, verificationStatus, detailJSON string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE change_requests SET verification_status=?, verification_detail=?, updated_at=? WHERE id=?`,
+		verificationStatus, detailJSON, now(), id)
+	return err
+}
+
+// SetChangeExpired 把提案标为过期：审批状态和执行状态都置为 expired，
+// 并把原因写进执行结果里。过期是终态，Worker 不会再领取它。
+func (s *Store) SetChangeExpired(ctx context.Context, id, reason string) error {
+	detail := `{"status":"expired","error":` + quoteJSON(reason) + `}`
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE change_requests SET status=?, execution_status=?, execution_detail=?, updated_at=? WHERE id=?`,
+		ChangeExpired, ExecExpired, detail, now(), id)
+	return err
+}
+
+// ResetExecutingChanges 是重启恢复的一部分：进程在执行中途崩掉时，
+// execution_status 停在 executing 的提案要改回 approved + not_started，
+// 让 Worker 重新领取。重跑是安全的，因为执行前校验会先看当前值：
+// 如果 Patch 其实已经生效了（当前值等于新值），会直接记为已执行，
+// 不会重复 Patch；如果还没生效，就重新走一遍 dry-run + Patch。
+func (s *Store) ResetExecutingChanges(ctx context.Context) (int64, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE change_requests SET execution_status=?, updated_at=? WHERE execution_status=?`,
+		ExecNotStarted, now(), ExecExecuting)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func quoteJSON(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
 }

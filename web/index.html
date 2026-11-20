@@ -2,12 +2,12 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<title>KubeCause — Kubernetes 故障诊断 Agent（Slice 1 演示页）</title>
-<style>body{font-family:system-ui,sans-serif;max-width:760px;margin:40px auto;padding:0 16px}input,select,button{padding:8px;margin:4px 0}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.card{border:1px solid #ddd;padding:12px;margin:12px 0}</style>
+<title>KubeCause — Kubernetes 故障诊断 Agent（Slice 3 演示页）</title>
+<style>body{font-family:system-ui,sans-serif;max-width:760px;margin:40px auto;padding:0 16px}input,select,button{padding:8px;margin:4px 0}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.card{border:1px solid #ddd;padding:12px;margin:12px 0}.approve{border-color:#2a7a2a}.warn{color:#8a6d00}</style>
 </head>
 <body>
-<h1>KubeCause <small>Slice 1 演示</small></h1>
-<p>提交任务后 Worker 在后台跑诊断，关闭页面任务也会继续。刷新后在下面填 runId 可重新读取。</p>
+<h1>KubeCause <small>Slice 3 演示</small></h1>
+<p>提交任务后 Worker 在后台跑诊断，关闭页面任务也会继续。刷新后在下面填 runId 可重新读取。诊断完成后出现审批卡，批准后 Worker 会执行 Patch 并验证 rollout，拒绝后不会对集群做任何写入。</p>
 <div class="card">
 <label>Namespace <input id="ns" value="demo"></label><br>
 <label>类型 <select id="kind"><option>Deployment</option><option>Pod</option></select></label><br>
@@ -26,23 +26,84 @@
 <pre id="events"></pre>
 <h2>诊断报告 / 提案</h2>
 <pre id="report"></pre>
+<!-- 审批卡：有提案时才显示，显示目标、变更前后值和相关证据 -->
+<div class="card approve" id="approvalCard" style="display:none">
+<h3>审批卡（人工审批后才执行）</h3>
+<p id="approvalText"></p>
+<p id="approvalEvidence" class="warn"></p>
+<button id="approveBtn" onclick="decide('approved')">批准</button>
+<button id="rejectBtn" onclick="decide('rejected')">拒绝</button>
+<p id="approvalResult"></p>
+</div>
+<!-- 修复验证：执行和验证分开显示，写入成功不等于验证通过 -->
+<div class="card" id="repairCard" style="display:none">
+<h3>修复执行 / 验证</h3>
+<pre id="repair"></pre>
+</div>
 <script>
 let after = 0;
+let currentProposal = null;
 async function createRun() {
   const r = await fetch('/api/runs', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({namespace: document.getElementById('ns').value, kind: document.getElementById('kind').value, name: document.getElementById('name').value, question: document.getElementById('q').value})});
   const j = await r.json();
   document.getElementById('runId').value = j.runId || '';
   after = 0;
+  document.getElementById('events').textContent = '';
   document.getElementById('status').textContent = JSON.stringify(j, null, 2);
   poll();
 }
 async function loadRun() {
   const id = document.getElementById('runId').value;
+  if (!id) return;
   const r = await fetch('/api/runs/' + id);
   const j = await r.json();
   document.getElementById('status').textContent = JSON.stringify(j, null, 2);
-  document.getElementById('report').textContent = JSON.stringify({report: j.report, proposal: j.proposal, repairStatus: j.repairStatus}, null, 2);
+  document.getElementById('report').textContent = JSON.stringify({report: j.report, proposal: j.proposal, repairStatus: j.repairStatus, verificationStatus: j.verificationStatus}, null, 2);
+  renderApproval(j);
+  renderRepair(j);
+}
+function renderApproval(j) {
+  const card = document.getElementById('approvalCard');
+  const p = j.proposal;
+  currentProposal = p;
+  if (!p) { card.style.display = 'none'; return; }
+  card.style.display = 'block';
+  document.getElementById('approvalText').textContent =
+    '目标：' + p.namespace + '/' + p.deployment + ' 容器 ' + p.container +
+    '，内存 limit ' + p.oldValue + ' -> ' + p.newValue +
+    '，提案状态：' + p.status + '，执行：' + p.executionStatus + '，验证：' + p.verificationStatus;
+  document.getElementById('approvalEvidence').textContent =
+    j.report ? ('相关证据：' + j.report.cause) : '诊断报告尚未生成，请先等任务完成。';
+  const pending = p.status === 'pending';
+  document.getElementById('approveBtn').disabled = !pending;
+  document.getElementById('rejectBtn').disabled = !pending;
+  document.getElementById('approvalResult').textContent = pending ? '' : ('已决定：' + p.status + '，审批人：' + (p.approver || '-'));
+}
+function renderRepair(j) {
+  const card = document.getElementById('repairCard');
+  const p = j.proposal;
+  if (!p || (p.executionStatus === 'not_started' && p.verificationStatus === 'not_started')) {
+    card.style.display = 'none';
+    return;
+  }
+  card.style.display = 'block';
+  document.getElementById('repair').textContent = JSON.stringify({
+    executionStatus: p.executionStatus,
+    verificationStatus: p.verificationStatus,
+    executionDetail: j.executionDetail || null,
+    verificationDetail: j.verificationDetail || null
+  }, null, 2);
+}
+async function decide(decision) {
+  const id = document.getElementById('runId').value;
+  if (!id || !currentProposal) return;
+  const r = await fetch('/api/runs/' + id + '/approvals/' + currentProposal.id + '/decision',
+    {method:'POST', headers:{'Content-Type':'application/json'},
+     body: JSON.stringify({decision: decision, approver: 'varo'})});
+  const j = await r.json();
+  document.getElementById('approvalResult').textContent = '审批结果：' + j.status + (j.alreadyDecided ? '（重复提交，返回当前结果）' : '') + '。批准后 Worker 会自动执行并验证，请稍等再点“读取任务”。';
+  loadRun();
 }
 async function poll() {
   const id = document.getElementById('runId').value;

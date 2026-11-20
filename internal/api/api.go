@@ -119,11 +119,42 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 		"report": report, "error": run.Error,
 		"steps": steps, "stepCount": len(steps),
 		"proposal": proposal,
-		// repairStatus 在 Slice 1 只有 not_started，执行在 Slice 3。
-		"repairStatus": repairStatusOf(proposal),
-		"createdAt":    run.CreatedAt, "updatedAt": run.UpdatedAt,
+		// 执行和验证分开返回：repairStatus 是写入结果，
+		// verificationStatus 是 rollout 验证结果，两者不要混成一个。
+		"repairStatus":       repairStatusOf(proposal),
+		"verificationStatus": verificationStatusOf(proposal),
+		"executionDetail":    parseDetail(proposal, true),
+		"verificationDetail": parseDetail(proposal, false),
+		"createdAt":          run.CreatedAt, "updatedAt": run.UpdatedAt,
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// parseDetail 把提案里存的执行/验证结果 JSON 字符串解析成对象，
+// 前端直接当对象用，不用自己再 JSON.parse 一次。没有结果时返回 nil。
+func parseDetail(p *store.ChangeRequest, execution bool) any {
+	if p == nil {
+		return nil
+	}
+	raw := p.VerificationDetail
+	if execution {
+		raw = p.ExecutionDetail
+	}
+	if raw == "" {
+		return nil
+	}
+	var v any
+	if err := json.Unmarshal([]byte(raw), &v); err != nil {
+		return nil
+	}
+	return v
+}
+
+func verificationStatusOf(p *store.ChangeRequest) string {
+	if p == nil {
+		return "none"
+	}
+	return p.VerificationStatus
 }
 
 func repairStatusOf(p *store.ChangeRequest) string {
@@ -168,8 +199,9 @@ type DecisionRequest struct {
 }
 
 // DecideApproval 处理 POST /api/runs/{id}/approvals/{approvalId}/decision。
-// Slice 1 只做持久化记录并明确返回“Slice 3 才执行修复”，
-// 不假装已经执行。重复提交返回当前结果，不重复改状态。
+// 只记录审批决定，不在这里执行修复：批准后 Worker 循环会领取提案、
+// 执行 Patch 并验证 rollout；拒绝后 Worker 永远不会领取它，
+// 所以拒绝后无写入。重复提交返回当前结果，不重复改状态。
 func (h *Handler) DecideApproval(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("id")
 	approvalID := r.PathValue("approvalId")
@@ -200,7 +232,7 @@ func (h *Handler) DecideApproval(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"approvalId": decided.ID, "runId": decided.RunID, "status": decided.Status,
 		"approver": decided.Approver, "alreadyDecided": already,
-		"note": "Slice 1 只记录审批决定，修复执行在 Slice 3，当前不会对集群做任何写入",
+		"note": "审批决定已记录。批准后 Worker 将执行 Patch 并验证 rollout；拒绝后不会执行，不会对集群做任何写入",
 	})
 }
 

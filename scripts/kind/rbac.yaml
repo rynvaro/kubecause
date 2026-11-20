@@ -1,0 +1,96 @@
+# KubeCause RBAC 参考清单（Slice 3）
+#
+# 读和写是两个不同的身份，不要共用一个 admin kubeconfig 上生产：
+#   kubecause-reader  只读，诊断用
+#   kubecause-writer  受写，只允许在 demo 命名空间改 demo-api 这一
+#                     个 Deployment 的内存 limit
+#
+# 本地 kind 演示为了简单仍用 admin kubeconfig（KUBECONFIG 和
+# REPAIR_KUBECONFIG 指向同一个文件），但代码路径已经分开：
+# 读走 NewReal，写走 NewRealRepair。生产部署时按下面这样建两个
+# ServiceAccount，各自生成一个 kubeconfig，分别配给 KUBECONFIG
+# 和 REPAIR_KUBECONFIG，修复代码不用改。
+#
+# 应用方法（kind 集群已建好后）：
+#   kubectl apply -f scripts/kind/rbac.yaml
+#   # 再为每个身份生成 token / kubeconfig（kubectl create token ...），
+#   # 分别写进两个 kubeconfig 文件，不要把 token 提交进仓库。
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubecause-reader
+  namespace: demo
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kubecause-reader
+  namespace: demo
+rules:
+  # 只读：诊断需要的 get / list / watch。没有 create / update /
+  # patch / delete，拿这个身份改不了任何东西。
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kubecause-reader
+  namespace: demo
+subjects:
+  - kind: ServiceAccount
+    name: kubecause-reader
+    namespace: demo
+roleRef:
+  kind: Role
+  name: kubecause-reader
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubecause-writer
+  namespace: demo
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kubecause-writer
+  namespace: demo
+rules:
+  # 写身份也要能读目标和 Pod，否则执行前校验和 rollout 验证没法做，
+  # 但读的范围同样只限 demo 命名空间。
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets"]
+    verbs: ["get", "list", "watch"]
+  # 写：只允许 patch demo-api 这一个 Deployment。
+  # resourceNames 是关键：没有它，这个 Role 就能改 demo 里的所有 Deployment。
+  # 注意：RBAC 只能限到资源和动词这一层，改哪个字段（内存 limit）
+  # 是代码里的白名单在管（internal/repair.ValidatePatchSpec），
+  # 两层都要有，缺一层都不够。
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["demo-api"]
+    verbs: ["patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kubecause-writer
+  namespace: demo
+subjects:
+  - kind: ServiceAccount
+    name: kubecause-writer
+    namespace: demo
+roleRef:
+  kind: Role
+  name: kubecause-writer
+  apiGroup: rbac.authorization.k8s.io

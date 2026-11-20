@@ -1,4 +1,4 @@
-# KubeCause Slice 2
+# KubeCause Slice 3
 # 默认用 fake + stub，不需要真集群就能跑通全部测试和演示。
 GO ?= go
 export PATH := $(HOME)/workspace/tools/go/bin:$(PATH)

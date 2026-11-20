@@ -81,14 +81,15 @@ func TestDecideApprovalBinding(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("提案与任务不匹配应 400，得到 %d", rec.Code)
 	}
-	// 正常批准应 200，且 note 明确 Slice 1 不执行修复。
+	// 正常批准应 200，且 note 明确批准后 Worker 会执行并验证，
+	// 拒绝后不会执行。Slice 3 已接入执行，不再是 Slice 1 的占位文案。
 	req = httptest.NewRequest("POST", "/api/runs/"+r.ID+"/approvals/"+c.ID+"/decision", bytes.NewReader(body))
 	rec = httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("批准应 200，得到 %d: %s", rec.Code, rec.Body.String())
 	}
-	if !bytes.Contains(rec.Body.Bytes(), []byte("Slice 1")) {
-		t.Fatalf("批准返回应明确说明 Slice 1 不执行修复: %s", rec.Body.String())
+	if !bytes.Contains(rec.Body.Bytes(), []byte("Worker 将执行 Patch")) {
+		t.Fatalf("批准返回应明确说明批准后 Worker 会执行 Patch: %s", rec.Body.String())
 	}
 }

@@ -1,10 +1,23 @@
-# KubeCause — Kubernetes 故障诊断 Agent（Slice 2）
+# KubeCause — Kubernetes 故障诊断 Agent（Slice 3）
 
 KubeCause 是一个 Kubernetes 故障诊断 Agent。用户选定 namespace 和 Pod 或 Deployment，描述故障现象，Agent 自主选择只读工具收集证据，检索排障手册，输出诊断结论和建议。演示环境支持一类人工审批后的变更，即调整指定 Deployment 的容器内存限制，并验证变更后的运行状态。
 
-Slice 2 在 Slice 1 的最小闭环上，把假的换成真的（只读诊断部分）：**真模型、FTS5 检索、真集群演示脚本、扩充的离线评估**。真修复、完整 React 前端仍在 Slice 3。
+Slice 3 在 Slice 2 的基础上，把修复真正做出来了：**审批后执行条件 Patch、rollout 验证、静态页审批卡和修复展示、RBAC 参考清单**。完整 React 前端仍未做，仍是静态页。
 
-Slice 1 已有的东西没有重写：SQLite 三张表、四个 HTTP 接口、Worker 状态机、Agent 循环的校验和恢复、fake 客户端、桩模型，全部保留并做了回归。
+Slice 1/2 已有的东西没有重写：SQLite 三张表、四个 HTTP 接口、Worker 状态机、Agent 循环的校验和恢复、fake 客户端、桩模型、真模型适配器、FTS5 检索，全部保留并做了回归。
+
+## Slice 3 改了什么
+
+- **修复执行**（`internal/repair/`）：Worker 领取已批准的提案后，先重新读取目标，核对 UID、容器名、变更前旧值，再 dry-run，再用本次读取的 resourceVersion 做条件 Patch，只改指定 Deployment、指定容器的内存 limit 这一个字段，值只允许是提案里的新值。写入后读回确认，写入超时或中断时先读回目标再下结论，归因不明确记 unknown，不谎报成功。前提变了（UID 变了、旧值变了、容器没了）标为过期，不执行；当前值已是新值时直接记为已执行，不重复 Patch。
+- **白名单**（`internal/repair.ValidatePatchSpec`）：只允许 demo/demo-api/demo-api 这一组目标，内存值必须是 Mi 结尾，新旧值不能相同，其他一律拒绝。RBAC 只能限到资源和动词，改哪个字段是代码白名单在管，两层都要有。
+- **写权限分离**：诊断走 `kube.KubeClient`（只读），修复走新增的 `kube.RepairClient`（PatchDeploymentMemoryLimit 等），Fake 和 Real 各实现一份。本地 kind 演示仍用同一个 kubeconfig，但对象是分开建的；生产上把 `REPAIR_KUBECONFIG` 指向写身份专用的 kubeconfig 即可，修复代码不用改。
+- **rollout 验证**（`internal/repair/`）：独立检查 observedGeneration 追上 generation、updatedReplicas 和 availableReplicas 达标、新 Pod Ready、验证窗口内重启次数没有继续增长。新 Pod 按 pod-template-hash 区分，不把旧 Pod 的 Ready 当成新 Pod 的。超时 120 秒（默认），到点标 timeout，不一直循环；连续两轮 Ready 才算通过，避免只看一眼就放行。执行和验证结果分开存、分开展示，写入成功但验证失败时前端能分别看到。
+- **Fake 模拟 rollout**：fake clientset 没有 Deployment 控制器，Patch 后不会自动建新 Pod，所以 Fake 的 Patch 在写完后模拟控制器行为：generation +1、status 置为已更新且可用、建带新 hash 的 ReplicaSet 和一个 Ready 的新 Pod。只在 Fake 里模拟，Real 不走这条路。
+- **Worker 接入**：诊断没有任务时，Worker 轮询已批准的提案并执行验证。诊断和修复状态分开，诊断报告能独立于修复状态展示。等待审批的提案一直存在数据库里，重启后仍能领取；执行中途崩掉的提案重启后改回待执行，重跑是安全的（执行前校验先看当前值）。
+- **提案生成放宽**：原来只在 high 置信度时生成提案，真模型在 kind 上跑 OOM 常常只给 medium（日志为空、没有实时 metrics，它不敢说 high），但 OOM 本身是直接原因，调高 limit 是低风险、可逆的操作，而且还要经过人工审批，所以 high 或 medium 都生成，low 仍不生成。
+- **前端静态页**（`web/index.html`，仍是静态页，不是 React）：加了审批卡（目标、变更前后值、相关证据，批准/拒绝按钮）和修复展示（执行结果和验证结果分开显示、rollout 状态、新 Pod、重启次数）。无构建步骤，Go 服务同源托管。
+- **RBAC 清单**（`scripts/kind/rbac.yaml`）：只读身份和受写身份的参考清单，写身份只能 patch demo-api 这一个 Deployment（resourceNames 限定）。
+- **修复了两个 Slice 2 遗留问题**：Agent 工具失败不回传给模型的问题在 Slice 2 已修，本次未改坏；另外本次发现并修了一个相关问题——提案生成时没有绑定 UID，执行前无法校验目标是否被重建，现在生成时绑定 UID，执行前核对。
 
 ## Slice 2 改了什么
 
@@ -67,7 +80,8 @@ make eval-real  # 真模型评估，无 Key 时明确跳过，不报错
 | `MODEL_NAME` | `deepseek-chat` | 真模型名；换 OpenAI 时改成 `gpt-4o-mini` 等 |
 | `DB_PATH` | `./kubecause.db` | SQLite 文件路径 |
 | `ADDR` | `:8080` | 监听地址 |
-| `KUBECONFIG` | 空 | kind 模式下指定 kubeconfig 路径，不填用默认 |
+| `KUBECONFIG` | 空 | kind 模式下指定读身份的 kubeconfig 路径，不填用默认 |
+| `REPAIR_KUBECONFIG` | 空 | 写身份专用的 kubeconfig，不填时和读身份用同一个文件；生产上应指向写身份的文件 |
 
 ## 启动
 
@@ -172,14 +186,19 @@ curl -s "http://localhost:8080/api/runs/$RUN_ID/events?after=0"
 # 3. 等 2 秒后读任务快照，能看到状态、诊断报告和待审批提案
 curl -s "http://localhost:8080/api/runs/$RUN_ID"
 
-# 4. 审批提案（Slice 1/2 只记录决定，不执行修复）
+# 4. 审批提案（批准后 Worker 自动执行并验证，拒绝后不执行）
 #    先从上一步的 proposal.id 里拿到提案 ID，例如 chg_xxxxxxxxxxxxxxxx
 curl -s -X POST "http://localhost:8080/api/runs/$RUN_ID/approvals/$CHG_ID/decision" \
   -H 'Content-Type: application/json' \
   -d '{"decision":"approved","approver":"varo"}'
 ```
 
-预期结果：任务状态从 `queued` 到 `running` 再到 `completed`；时间线里有 `list_workload_pods`、`get_pod`、`get_events`、`get_pod_logs`、`get_deployment`、`search_runbooks` 六步；诊断报告的原因为“容器内存限制过低，触发 OOMKilled 导致反复重启”，证据里包含 OOMKilled；提案为 `128Mi -> 256Mi`，状态 `pending`，批准后变成 `approved`，但 `executionStatus` 仍是 `not_started`。
+预期结果：任务状态从 `queued` 到 `running` 再到 `completed`；时间线里有 `list_workload_pods`、`get_pod`、`get_events`、`get_pod_logs`、`get_deployment`、`search_runbooks` 六步；诊断报告的原因为“容器内存限制过低，触发 OOMKilled 导致反复重启”，证据里包含 OOMKilled；提案为 `128Mi -> 256Mi`，状态 `pending`。
+
+# 5. 批准后等几秒再读任务快照，Worker 会自动执行并验证
+curl -s "http://localhost:8080/api/runs/$RUN_ID"
+
+预期结果：提案 `status` 为 `approved`，`executionStatus` 为 `executed`，`verificationStatus` 为 `passed`；`executionDetail` 里 `beforeValue` 是 `128Mi`、`afterValue` 是 `256Mi`、`dryRunOk` 为 true；`verificationDetail` 里新 Pod 已 Ready、重启次数未增长；时间线里多了两步 Kind 为 `repair` 的步骤，一步是“修复已写入”，一步是“验证通过”。拒绝时则相反：`executionStatus` 保持 `not_started`，Deployment 的 limit 不变。
 
 ## 目录说明
 
@@ -194,7 +213,8 @@ curl -s -X POST "http://localhost:8080/api/runs/$RUN_ID/approvals/$CHG_ID/decisi
 | `internal/model/` | 模型适配器：stub 桩模型（三类场景确定性剧本），real 是 OpenAI 兼容协议的真模型 |
 | `internal/kube/` | client-go 只读访问：fake 预置三类场景数据，kind 读 kubeconfig |
 | `internal/knowledge/` | 排障手册检索：FTS5 索引（keywords 列解决中文短词查询）+ 关键词回退 |
-| `internal/repair/` | 修复占位：只生成提案，Slice 2 不执行，条件 Patch 的做法写在注释里 |
+| `internal/repair/` | 修复执行：白名单校验、条件 Patch、dry-run、写入后读回确认、rollout 验证（执行和验证分开存） |
+| `scripts/kind/rbac.yaml` | RBAC 参考清单：只读身份和受写身份（写身份只能 patch demo-api） |
 | `runbooks/` | 排障手册 Markdown |
 | `testdata/cases/` | 评估用例：OOM、镜像拉取失败、探针失败 |
 | `scripts/kind/` | kind 演示：demo-api.yaml 和 setup-demo.sh |
@@ -209,11 +229,18 @@ curl -s -X POST "http://localhost:8080/api/runs/$RUN_ID/approvals/$CHG_ID/decisi
 - fake 客户端三类场景：OOM、镜像拉取失败、探针失败
 - Slice 1 回归：fake + stub 全流程仍完成并生成提案
 
-## Slice 2 未实现（Slice 3 做）
+## Slice 3 已实现
 
-- 修复执行和 rollout 验证（审批只记录，`executionStatus` 保持 `not_started`）
-- 完整 React + TypeScript 前端（目前是极简静态页）
-- 多集群、多 namespace 演示、鉴权
+- 修复执行：条件 Patch、dry-run、写入后读回确认、超时/中断后读回再下结论、过期和幂等处理
+- rollout 验证：generation、副本数、新 Pod Ready、重启次数不增长，四项都达标且连续两轮才通过，超时标 timeout
+- Worker 接入：批准后自动执行并验证，拒绝后无写入，重启后仍能领取
+- 前端审批卡和修复展示（静态页），RBAC 参考清单
+- 提案生成放宽到 high 或 medium，真模型 medium 也能出提案
+
+## Slice 3 未实现
+
+- 完整 React + TypeScript 前端（目前是静态页，审批卡和修复展示已做）
+- 多集群、多 namespace 演示、鉴权、监控
 
 ## 架构文档
 

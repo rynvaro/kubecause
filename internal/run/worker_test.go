@@ -3,9 +3,11 @@ package run
 import (
 	"context"
 	"testing"
+	"time"
 
 	"kubecause/internal/kube"
 	"kubecause/internal/model"
+	"kubecause/internal/repair"
 	"kubecause/internal/store"
 )
 
@@ -102,4 +104,79 @@ func contains(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+func TestWorkerRepairFullFlowFakeStub(t *testing.T) {
+	ctx := context.Background()
+	s, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("打开内存库失败: %v", err)
+	}
+	defer s.Close()
+	fake := kube.NewFake()
+	w := NewWorker(s, &ToolsAdapter{Kube: fake}, model.NewStub())
+	// 修复执行器用写客户端（fake 上读写是同一个对象，但接口分开）。
+	w.SetRepair(repair.NewExecutor(s, fake))
+	// 把验证超时调小，测试不用等 120 秒。
+	w.Repair.VerifyTimeout = 5 * time.Second
+	w.Repair.VerifyInterval = 20 * time.Millisecond
+	r := &store.Run{Namespace: "demo", Kind: "Deployment", Name: "demo-api", Question: "demo-api 为什么一直重启", MaxSteps: 8, TimeoutSeconds: 60}
+	_ = s.CreateRun(ctx, r)
+	if ran, err := w.RunOne(ctx); err != nil || !ran {
+		t.Fatalf("Worker 应跑完诊断: %v", err)
+	}
+	proposal, err := s.GetChangeRequestByRun(ctx, r.ID)
+	if err != nil || proposal == nil {
+		t.Fatalf("诊断后应生成提案: %v", err)
+	}
+	// 批准后 Worker 应领取并执行、验证。
+	if _, _, err := s.DecideApproval(ctx, proposal.ID, store.ChangeApproved, "varo"); err != nil {
+		t.Fatalf("批准失败: %v", err)
+	}
+	if ran, err := w.ProcessOneRepair(ctx); err != nil || !ran {
+		t.Fatalf("Worker 应执行已批准提案: ran=%v err=%v", ran, err)
+	}
+	got, _ := s.GetChangeRequest(ctx, proposal.ID)
+	if got.ExecutionStatus != store.ExecExecuted {
+		t.Fatalf("执行状态应为 executed，得到 %s，详情 %s", got.ExecutionStatus, got.ExecutionDetail)
+	}
+	if got.VerificationStatus != store.VerifyPassed {
+		t.Fatalf("验证状态应为 passed，得到 %s，详情 %s", got.VerificationStatus, got.VerificationDetail)
+	}
+	dep, _ := fake.GetDeployment(ctx, "demo", "demo-api")
+	if dep.Spec.Template.Spec.Containers[0].Resources.Limits.Memory().String() != "256Mi" {
+		t.Fatalf("执行后 limit 应为 256Mi")
+	}
+	// 第二次再跑修复应无事可做（提案已执行完，不会重复 Patch）。
+	if ran, _ := w.ProcessOneRepair(ctx); ran {
+		t.Fatalf("已执行的提案不应被重复领取")
+	}
+}
+
+func TestWorkerRepairRejectedNoWrite(t *testing.T) {
+	ctx := context.Background()
+	s, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("打开内存库失败: %v", err)
+	}
+	defer s.Close()
+	fake := kube.NewFake()
+	w := NewWorker(s, &ToolsAdapter{Kube: fake}, model.NewStub())
+	w.SetRepair(repair.NewExecutor(s, fake))
+	r := &store.Run{Namespace: "demo", Kind: "Deployment", Name: "demo-api", Question: "demo-api 为什么一直重启", MaxSteps: 8, TimeoutSeconds: 60}
+	_ = s.CreateRun(ctx, r)
+	if _, err := w.RunOne(ctx); err != nil {
+		t.Fatalf("诊断失败: %v", err)
+	}
+	proposal, _ := s.GetChangeRequestByRun(ctx, r.ID)
+	if _, _, err := s.DecideApproval(ctx, proposal.ID, store.ChangeRejected, "varo"); err != nil {
+		t.Fatalf("拒绝失败: %v", err)
+	}
+	if ran, _ := w.ProcessOneRepair(ctx); ran {
+		t.Fatalf("拒绝的提案不应被执行")
+	}
+	dep, _ := fake.GetDeployment(ctx, "demo", "demo-api")
+	if dep.Spec.Template.Spec.Containers[0].Resources.Limits.Memory().String() != "128Mi" {
+		t.Fatalf("拒绝后 limit 应仍为 128Mi")
+	}
 }

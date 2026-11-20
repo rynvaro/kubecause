@@ -15,6 +15,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/clientcmd"
@@ -308,6 +309,183 @@ func (r *Real) GetPodLogs(ctx context.Context, namespace, pod, container string,
 		return "", err
 	}
 	return string(b), nil
+}
+
+// ---------------------------------------------------------------------------
+// 写客户端：和只读的 KubeClient 完全分开的接口。
+//
+// 为什么要分开：诊断只读，修复要写，两个操作的安全边界不一样。
+// 生产上读身份和写身份应该是两个不同的 ServiceAccount，写身份只允许
+// 在演示 namespace 改指定 Deployment 的内存 limit（见 scripts/kind/rbac.yaml）。
+// 本地 kind 演示为了简单仍用同一个 kubeconfig，但代码路径已经分开：
+// 读走 NewReal，写走 NewRealRepair；以后只要把 NewRealRepair 换成
+// 另一个 kubeconfig（REPAIR_KUBECONFIG）就行，修复模块不用改。
+// RepairClient 只暴露修复需要的三个操作，不暴露通用的 clientset，
+// 防止修复代码绕过白名单去调任意写 API。
+// ---------------------------------------------------------------------------
+
+// RepairClient 是修复专用的写接口。
+type RepairClient interface {
+	// GetDeploymentForRepair 是执行前校验用的读操作，只在修复流程里用。
+	GetDeploymentForRepair(ctx context.Context, namespace, name string) (*appsv1.Deployment, error)
+	// PatchDeploymentMemoryLimit 只改指定容器的内存 limit 这一个字段。
+	// resourceVersion 是执行前那次读取的版本，写进 Patch 里做并发校验；
+	// dryRun 为真时只校验不落盘。其他字段一律不改，调用方（repair 包）
+	// 还要在 Patch 前做一次白名单校验，双重防线。
+	PatchDeploymentMemoryLimit(ctx context.Context, namespace, name, container, newValue, resourceVersion string, dryRun bool) (*appsv1.Deployment, error)
+	// ListPodsForRepair 按标签列 Pod，供 rollout 验证区分新旧 Pod。
+	ListPodsForRepair(ctx context.Context, namespace string, labels map[string]string) ([]corev1.Pod, error)
+}
+
+// NewRealRepair 创建写客户端。kubeconfig 为空时用默认的 ~/.kube/config。
+// 生产部署时应传入写身份专用的 kubeconfig（REPAIR_KUBECONFIG），
+// 本地演示传入空字符串即可，仍会和读客户端用同一个文件，但对象是独立的。
+func NewRealRepair(kubeconfig string) (*Real, error) {
+	return NewReal(kubeconfig)
+}
+
+// strategicMergePatch 只改一个容器的内存 limit，并把 resourceVersion
+// 写进 metadata 做并发校验：API Server 发现版本已变会返回 409，
+// 调用方就知道有人在中间改过目标，不能再按旧前提 Patch。
+func memoryLimitPatch(container, newValue, resourceVersion string) []byte {
+	rv := ""
+	if resourceVersion != "" {
+		rv = fmt.Sprintf(`"metadata":{"resourceVersion":%q},`, resourceVersion)
+	}
+	return []byte(fmt.Sprintf(`{%s"spec":{"template":{"spec":{"containers":[{"name":%q,"resources":{"limits":{"memory":%q}}}]}}}}`,
+		rv, container, newValue))
+}
+
+func (r *Real) GetDeploymentForRepair(ctx context.Context, namespace, name string) (*appsv1.Deployment, error) {
+	return r.GetDeployment(ctx, namespace, name)
+}
+
+func (r *Real) ListPodsForRepair(ctx context.Context, namespace string, labels map[string]string) ([]corev1.Pod, error) {
+	return r.ListPodsByLabels(ctx, namespace, labels)
+}
+
+func (r *Real) PatchDeploymentMemoryLimit(ctx context.Context, namespace, name, container, newValue, resourceVersion string, dryRun bool) (*appsv1.Deployment, error) {
+	opts := metav1.PatchOptions{}
+	if dryRun {
+		opts.DryRun = []string{metav1.DryRunAll}
+	}
+	return r.client.AppsV1().Deployments(namespace).Patch(ctx, name, types.StrategicMergePatchType,
+		memoryLimitPatch(container, newValue, resourceVersion), opts)
+}
+
+func (f *Fake) GetDeploymentForRepair(ctx context.Context, namespace, name string) (*appsv1.Deployment, error) {
+	return f.GetDeployment(ctx, namespace, name)
+}
+
+func (f *Fake) ListPodsForRepair(ctx context.Context, namespace string, labels map[string]string) ([]corev1.Pod, error) {
+	return f.ListPodsByLabels(ctx, namespace, labels)
+}
+
+// PatchDeploymentMemoryLimit 是 Fake 的写实现。
+// dryRun 时只在内存里算出结果，不落盘、不模拟 rollout。
+// 真实 Patch 时先走和 Real 一样的 clientset Patch，再模拟控制器行为：
+// fake clientset 没有 Deployment 控制器，不会自动建新 ReplicaSet / 新 Pod、
+// 也不会推进 observedGeneration，不模拟的话 rollout 验证在 fake 上永远过不了。
+// 所以这里显式做这三件事：generation +1、status 置为已更新且可用、
+// 建一个带新 pod-template-hash 的 ReplicaSet 和一个 Ready 的新 Pod。
+// 这只是 fake 的模拟，Real 不走这条路，生产集群由真正的控制器完成 rollout。
+func (f *Fake) PatchDeploymentMemoryLimit(ctx context.Context, namespace, name, container, newValue, resourceVersion string, dryRun bool) (*appsv1.Deployment, error) {
+	dep, err := f.GetDeployment(ctx, namespace, name)
+	if err != nil {
+		return nil, err
+	}
+	found := false
+	for _, c := range dep.Spec.Template.Spec.Containers {
+		if c.Name == container {
+			found = true
+		}
+	}
+	if !found {
+		return nil, fmt.Errorf("Deployment %s/%s 里没有容器 %q", namespace, name, container)
+	}
+	if _, err := resource.ParseQuantity(newValue); err != nil {
+		return nil, fmt.Errorf("内存值非法 %q: %w", newValue, err)
+	}
+	if dryRun {
+		// 只在内存副本上改，不写回 clientset。
+		cp := dep.DeepCopy()
+		for i := range cp.Spec.Template.Spec.Containers {
+			if cp.Spec.Template.Spec.Containers[i].Name == container {
+				cp.Spec.Template.Spec.Containers[i].Resources.Limits[corev1.ResourceMemory] = resource.MustParse(newValue)
+			}
+		}
+		return cp, nil
+	}
+	patched, err := f.client.AppsV1().Deployments(namespace).Patch(ctx, name, types.StrategicMergePatchType,
+		memoryLimitPatch(container, newValue, resourceVersion), metav1.PatchOptions{})
+	if err != nil {
+		return nil, err
+	}
+	f.simulateRollout(ctx, patched, newValue)
+	// 模拟完再读一次，返回带新 status 的 Deployment。
+	return f.GetDeployment(ctx, namespace, name)
+}
+
+// simulateRollout 模拟控制器在 Patch 后的行为，只在 Fake 里用。
+func (f *Fake) simulateRollout(ctx context.Context, dep *appsv1.Deployment, newValue string) {
+	const newHash = "9a1b2c3d4"
+	// 1. generation +1，status 置为已更新且可用。
+	dep.Generation++
+	if _, err := f.client.AppsV1().Deployments(dep.Namespace).Update(ctx, dep, metav1.UpdateOptions{}); err != nil {
+		return
+	}
+	dep.Status.ObservedGeneration = dep.Generation
+	dep.Status.Replicas = 1
+	dep.Status.UpdatedReplicas = 1
+	dep.Status.AvailableReplicas = 1
+	dep.Status.ReadyReplicas = 1
+	_, _ = f.client.AppsV1().Deployments(dep.Namespace).UpdateStatus(ctx, dep, metav1.UpdateOptions{})
+
+	// 2. 建带新 hash 的 ReplicaSet（已存在时跳过，保证重复 Patch 不报错）。
+	rsName := dep.Name + "-" + newHash
+	if _, err := f.client.AppsV1().ReplicaSets(dep.Namespace).Get(ctx, rsName, metav1.GetOptions{}); err != nil {
+		replicas := int32(1)
+		tmpl := *dep.Spec.Template.DeepCopy()
+		if tmpl.Labels == nil {
+			tmpl.Labels = map[string]string{}
+		}
+		tmpl.Labels["pod-template-hash"] = newHash
+		rs := &appsv1.ReplicaSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: rsName, Namespace: dep.Namespace, UID: types.UID("uid-" + rsName),
+				OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "Deployment", Name: dep.Name, UID: dep.UID}},
+				Labels:          map[string]string{"app": dep.Name, "pod-template-hash": newHash},
+			},
+			Spec: appsv1.ReplicaSetSpec{
+				Replicas: &replicas,
+				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": dep.Name, "pod-template-hash": newHash}},
+				Template: tmpl,
+			},
+		}
+		_, _ = f.client.AppsV1().ReplicaSets(dep.Namespace).Create(ctx, rs, metav1.CreateOptions{})
+	}
+
+	// 3. 建一个 Ready、重启 0 次的新 Pod（已存在时跳过）。
+	podName := dep.Name + "-" + newHash + "-abcde"
+	if _, err := f.client.CoreV1().Pods(dep.Namespace).Get(ctx, podName, metav1.GetOptions{}); err != nil {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: podName, Namespace: dep.Namespace,
+				Labels: map[string]string{"app": dep.Name, "pod-template-hash": newHash},
+				OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: rsName, UID: types.UID("uid-" + rsName)}},
+				CreationTimestamp: metav1.Now(),
+			},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: DemoContainer, Image: "demo-api:latest"}}},
+			Status: corev1.PodStatus{
+				Phase: corev1.PodRunning,
+				ContainerStatuses: []corev1.ContainerStatus{{
+					Name: DemoContainer, Ready: true, RestartCount: 0,
+					State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+				}},
+			},
+		}
+		_, _ = f.client.CoreV1().Pods(dep.Namespace).Create(ctx, pod, metav1.CreateOptions{})
+	}
 }
 
 // PodDeploymentName 按 Pod -> ReplicaSet -> Deployment 追溯归属。

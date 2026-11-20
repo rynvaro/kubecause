@@ -28,6 +28,7 @@ import (
 	"kubecause/internal/knowledge"
 	"kubecause/internal/kube"
 	"kubecause/internal/model"
+	"kubecause/internal/repair"
 	"kubecause/internal/run"
 	"kubecause/internal/store"
 )
@@ -45,7 +46,7 @@ func main() {
 	kubeMode := strings.ToLower(env("KUBE_MODE", "fake"))
 	modelMode := strings.ToLower(env("MODEL_MODE", "stub"))
 
-	log.Printf("KubeCause Slice 2 启动：KUBE_MODE=%s MODEL_MODE=%s DB_PATH=%s ADDR=%s", kubeMode, modelMode, dbPath, addr)
+	log.Printf("KubeCause Slice 3 启动：KUBE_MODE=%s MODEL_MODE=%s DB_PATH=%s ADDR=%s", kubeMode, modelMode, dbPath, addr)
 
 	// 1. 打开 SQLite，启动时自动执行迁移。
 	st, err := store.Open(dbPath)
@@ -54,7 +55,9 @@ func main() {
 	}
 	defer st.Close()
 
-	// 2. 启动恢复：上次崩掉时停在 running 的任务改回 queued，步骤保留续跑。
+	// 2. 启动恢复：上次崩掉时停在 running 的任务改回 queued，步骤保留续跑；
+	// 执行中途崩掉的提案改回待执行，重启后重新领取（重跑是安全的，
+	// 执行前校验会先看当前值是否已是新值）。
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	if n, err := st.ResetRunningToQueued(ctx); err != nil {
@@ -62,20 +65,41 @@ func main() {
 	} else if n > 0 {
 		log.Printf("启动恢复：%d 个中断的任务已改回 queued，将从已提交步骤续跑", n)
 	}
+	if n, err := st.ResetExecutingChanges(ctx); err != nil {
+		log.Fatalf("启动恢复（修复）失败: %v", err)
+	} else if n > 0 {
+		log.Printf("启动恢复：%d 个执行中的提案已改回待执行，将重新领取", n)
+	}
 
-	// 3. 按 KUBE_MODE 组装 K8s 客户端。
+	// 3. 按 KUBE_MODE 组装 K8s 客户端。读和写是两个独立的对象：
+	// 读走 KubeClient（只读），写走 RepairClient（只 Patch 内存 limit）。
+	// 本地 kind 演示为了简单仍用同一个 kubeconfig，但对象是分开建的；
+	// 生产部署时把 REPAIR_KUBECONFIG 指向写身份专用的 kubeconfig，
+	// 读身份和写身份就是两个不同的 ServiceAccount（见 scripts/kind/rbac.yaml）。
 	var kc kube.KubeClient
+	var rc kube.RepairClient
 	switch kubeMode {
 	case "fake":
-		kc = kube.NewFake()
-		log.Printf("使用 fake K8s 客户端，预置 demo/demo-api 演示数据")
+		f := kube.NewFake()
+		kc = f
+		rc = f
+		log.Printf("使用 fake K8s 客户端，预置 demo/demo-api 演示数据（读写接口分开，同一 fake 对象）")
 	case "kind":
 		real, err := kube.NewReal(os.Getenv("KUBECONFIG"))
 		if err != nil {
 			log.Fatalf("KUBE_MODE=kind 但无法连接集群: %v", err)
 		}
 		kc = real
-		log.Printf("使用真 K8s 客户端（kind），读取 kubeconfig")
+		repairKubeconfig := os.Getenv("REPAIR_KUBECONFIG")
+		if repairKubeconfig == "" {
+			repairKubeconfig = os.Getenv("KUBECONFIG")
+		}
+		realRepair, err := kube.NewRealRepair(repairKubeconfig)
+		if err != nil {
+			log.Fatalf("无法创建写客户端: %v", err)
+		}
+		rc = realRepair
+		log.Printf("使用真 K8s 客户端（kind），读取 kubeconfig；写客户端独立创建，生产上应换成写身份专用的 kubeconfig")
 	default:
 		log.Fatalf("KUBE_MODE 非法: %q，只能是 fake 或 kind", kubeMode)
 	}
@@ -114,9 +138,11 @@ func main() {
 		log.Printf("FTS5 索引未建成（找不到 runbooks 目录），search_runbooks 将回退到关键词检索")
 	}
 
-	// 5. 组装工具、Worker、API。
+	// 5. 组装工具、Worker、API。修复执行器用写客户端，Worker 循环里
+	// 诊断没有任务时才会去领已批准的提案。
 	tools := &run.ToolsAdapter{Kube: kc, KB: kbIdx}
 	worker := run.NewWorker(st, tools, m)
+	worker.SetRepair(repair.NewExecutor(st, rc))
 	go worker.RunLoop(ctx)
 
 	handler := &api.Handler{Store: st}

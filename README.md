@@ -1,6 +1,6 @@
 # KubeCause — Kubernetes 故障诊断 Agent
 
-当前版本：v0.10.0。更新记录见 [CHANGELOG.md](CHANGELOG.md)。
+当前版本：v0.12.0。更新记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 KubeCause 是一个 Kubernetes 故障诊断 Agent。用户选定 namespace 和 Pod 或 Deployment，描述故障现象，Agent 自主选择只读工具收集证据，检索排障手册，输出诊断结论和建议。演示环境支持人工审批后的变更：用一组通用 Patch 改指定 Deployment 的白名单字段（镜像、内存 limit/request、CPU limit/request、副本数），并验证变更后的运行状态；也可以在对话里直接创建一个新的 Deployment，同样走建议卡 → 人工审批 → 执行 → 验证 rollout 这条线。
 
@@ -14,6 +14,8 @@ KubeCause 是一个 Kubernetes 故障诊断 Agent。用户选定 namespace 和 P
 - **发现工具**：`list_namespaces`、`list_deployments`、`list_problem_pods`、`get_cluster_overview`，全部只读，结构化返回，前端渲染成卡片和表格。系统命名空间可查不可改。
 - **配置中心**：`config.yaml` + 环境变量覆盖 + `GET/POST /api/config` 热加载，前端“设置”页能改，不用重启。`MODEL_API_KEY` 只从环境变量读，绝不进配置。
 - **离线评估**：`go run ./cmd/eval` 跑 OOM、镜像、探针三个用例，输出命中率、引用准确性、步数和耗时。
+- **工具调用只存一份（round_id 关联）**：一次工具调用在库里只存在 tool 消息里，每调一次一条；同一轮的用户 / tool / 助手消息共享一个 `round_` 开头的 roundID，助手消息不再抄一份 tool_calls，前端按 roundId 关联数“查了 N 个工具”，右侧活动面板只读 tool 消息，不用去重。以前助手消息里抄了一份，前端按“消息 id + 调用 id”去重认不出来，同一条调用显示两遍（耗时毫秒数完全相同）。老数据没有 round_id，读出来是空，前端回退到位置推导（上一条用户消息到本条助手消息之间的 tool 消息），再没有就读助手消息里存的老副本。
+- **模型请求调试日志**：`KUBE_DEBUG_MODEL=1` 启动时，对话里每次调模型前把实际发过去的完整消息数组（system + 历史 + 当前问题 + 本轮的 assistant(tool_calls) / tool 往返）打到服务端 stdout，返回后再打一条返回日志（调了哪个工具及参数，或最终文本 / 是否提交了诊断报告）。默认关闭，页面上没有任何调试痕迹，API 回复里也不含调试数据；日志里不含 API Key（Key 只在请求头里）。单条内容超长时截断并注明原长。
 
 ## 通用 Patch 格式和白名单
 
@@ -194,6 +196,24 @@ make eval-real  # 真模型评估，无 Key 时明确跳过，不报错
 | `MODEL_TEMPERATURE` | 0.2 | 覆盖 `model.temperature` |
 | `REPAIR_MAX_MEMORY_MI` | 4096 | 覆盖 `repair.maxMemoryMi` |
 | `REPAIR_MAX_RATIO` | 4 | 覆盖 `repair.maxRatio` |
+| `KUBE_DEBUG_MODEL` | 空 | 设为 `1` 时打开模型请求调试：对话里每次调模型的完整请求和返回打到服务端 stdout；默认关闭，页面上无任何调试痕迹 |
+
+## 模型请求调试
+
+想看看到底发给了模型什么东西（历史怎么拼的、当前问题在不在最后一条、本轮调了哪些工具），不用在页面上找：发给模型是后端 Go 服务直接调模型 API，浏览器碰不到模型，所以调试只打服务端日志。
+
+```bash
+KUBE_DEBUG_MODEL=1 go run ./cmd/server
+```
+
+打开后，每次调模型前打一条请求日志、返回后打一条返回日志，前缀都是 `[debug model]`，带会话 id、round id 和第几次请求：
+
+```
+[debug model] conv=conv_... round=round_... step=1 request=[{"role":"system",...},{"role":"user","content":"当前状态怎么样"}]
+[debug model] conv=conv_... round=round_... step=1 response tool=get_cluster_overview args={}
+```
+
+日志里是实际发过去的完整数组，不是事后重建的摘要；单条内容超长时截断并注明原长，角色、顺序、tool_calls 不丢。API Key 在请求头里，不在数组里，日志里不会出现。桩模型不调外部模型，不打这个日志。默认关闭时一行都不打，API 回复里也没有调试字段。
 
 ## 启动
 

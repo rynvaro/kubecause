@@ -12,6 +12,9 @@
 //	MODEL_MODE=real         Slice 2 真模型，Key 从 MODEL_API_KEY 读，
 //	                        缺失时启动报错；BaseURL 默认 DeepSeek，
 //	                        可用 MODEL_BASE_URL / MODEL_NAME 切换厂商
+//	KUBE_DEBUG_MODEL=1      调试模式：对话里每次发给模型的完整请求
+//	                        和模型返回打到服务端 stdout；默认关闭，
+//	                        页面上没有任何调试痕迹
 //	DB_PATH                 SQLite 文件路径，默认 ./kubecause.db
 //	ADDR                    监听地址，默认 :8080
 package main
@@ -225,6 +228,13 @@ func main() {
 	// 对话服务（Slice 4）：和单次诊断共用同一套工具和模型，
 	// 但只读，不生成提案、不执行修复。
 	chatSvc := chat.NewService(st, tools, m)
+	// 模型请求调试（v0.12.0）：KUBE_DEBUG_MODEL=1 时打开，
+	// 对话里每次发给模型的完整请求和模型返回打到服务端 stdout；
+	// 默认关闭，API 回复里不含调试数据，前端没有任何调试痕迹。
+	chatSvc.DebugModel = os.Getenv("KUBE_DEBUG_MODEL") == "1"
+	if chatSvc.DebugModel {
+		log.Printf("模型请求调试已开启（KUBE_DEBUG_MODEL=1）：每次调模型的完整请求和返回都会打到 stdout")
+	}
 
 	// 配置中心应用到各组件（Slice 8）：对话步数、任务默认值、
 	// 修复上限、真模型超时/温度。POST /api/config 后 OnConfigChange

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -40,6 +41,69 @@ const chatSystemPrompt = `你是 Kubernetes 故障诊断助手，正在和用户
 10. 用户明确说要创建 Deployment 或 Pod 时，先问缺的信息（命名空间、名字、镜像、副本数），问全了直接在 submit_diagnosis 的 suggestedCreation 里给出创建建议，不用先做故障诊断。用户说创建 Pod 时也按 Deployment 给建议，并在回答里说明裸 Pod 不会自动重建、建议用 Deployment。
 11. 给用户看的回答里不要提任何内部字段名、工具名、结构化字段名（例如 suggestedRepair、suggestedCreation、submit_diagnosis、get_pod），只说人话：说“修复建议”“创建建议”“审批任务”就可以。用户不需要知道建议在内部叫什么字段。`
 
+// debugLogMaxContent 是调试日志里单条消息内容的最长字数：
+// 发给模型的数组里可能带上很长的工具结果（例如日志），
+// 超长时截断并注明已截断、原长多少字，结构本身不截断。
+const debugLogMaxContent = 4000
+
+// truncateForLog 截断一段过长文本并注明原长，短的不动。
+func truncateForLog(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…（内容已截断，原长 " + fmt.Sprintf("%d", len(r)) + " 字）"
+}
+
+// debugRequestJSON 把一次实际发给模型的完整消息数组转成日志用的 JSON：
+// 每条消息的 Content 超长时截断（见 truncateForLog），
+// 角色、顺序、tool_calls、tool_call_id 原样保留，结构不丢。
+func debugRequestJSON(msgs []model.ChatMessage) string {
+	type logMsg struct {
+		Role       string               `json:"role"`
+		Content    string               `json:"content,omitempty"`
+		ToolCalls  []model.ChatToolCall `json:"tool_calls,omitempty"`
+		ToolCallID string               `json:"tool_call_id,omitempty"`
+	}
+	out := make([]logMsg, len(msgs))
+	for i, m := range msgs {
+		out[i] = logMsg{Role: m.Role, Content: truncateForLog(m.Content, debugLogMaxContent), ToolCalls: m.ToolCalls, ToolCallID: m.ToolCallID}
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		return fmt.Sprintf("（调试请求序列化失败: %v）", err)
+	}
+	return string(b)
+}
+
+// logModelRequest 打一条模型请求调试日志：这次实际发过去的完整数组。
+// 只在 KUBE_DEBUG_MODEL=1 时调；API Key 在请求头里，不在数组里，
+// 日志里不会出现任何密钥。
+func logModelRequest(conversationID, roundID string, step int, msgs []model.ChatMessage) {
+	log.Printf("[debug model] conv=%s round=%s step=%d request=%s", conversationID, roundID, step, debugRequestJSON(msgs))
+}
+
+// logModelResponse 打一条模型返回调试日志：调了哪个工具及参数，
+// 或最终文本 / 是否提交了诊断报告；出错时记错误。
+func logModelResponse(conversationID, roundID string, step int, st model.ChatStep, err error) {
+	if err != nil {
+		log.Printf("[debug model] conv=%s round=%s step=%d response error: %v", conversationID, roundID, step, err)
+		return
+	}
+	if st.ToolCall != nil {
+		args, _ := json.Marshal(st.ToolCall.Args)
+		log.Printf("[debug model] conv=%s round=%s step=%d response tool=%s args=%s", conversationID, roundID, step, st.ToolCall.Name, args)
+		return
+	}
+	if st.IsFinal {
+		if st.Report != nil {
+			log.Printf("[debug model] conv=%s round=%s step=%d response final report cause=%q confidence=%s suggestedRepair=%v suggestedCreation=%v", conversationID, roundID, step, truncateForLog(st.Report.Cause, 500), st.Report.Confidence, st.Report.SuggestedRepair != nil, st.Report.SuggestedCreation != nil)
+			return
+		}
+		log.Printf("[debug model] conv=%s round=%s step=%d response final text=%q", conversationID, roundID, step, truncateForLog(st.Content, 1000))
+	}
+}
+
 // runReal 是真模型的对话循环：
 // 每轮最多调 s.maxSteps() 次工具（默认 12，配置中心可改），每次问模型一步，
 // 模型调工具就执行并把结果以 tool 角色追加进历史，
@@ -53,12 +117,18 @@ const chatSystemPrompt = `你是 Kubernetes 故障诊断助手，正在和用户
 // 以前这里在 history 后面又追加了一遍同样的 text，
 // 当前问题在模型输入里出现两次，模型会过度看重最新一句、跟着重复。
 //
+// 调试模式：debug 为 true（环境变量 KUBE_DEBUG_MODEL=1，默认关闭）时，
+// 每次调 m.Chat 之前打一条请求日志（这次实际发过去的完整数组），
+// 返回后再打一条返回日志（调了哪个工具及参数，或最终文本 / 是否提交
+// 了诊断报告）；只打服务端 stdout，不写进数据库、不进 API 回复，
+// 前端没有任何调试开关和面板。
+//
 // 步数用完时不直接报错：已经查到的工具结果会整理成半成品回复返回，
 // 文字里写明“步数用完了，还没来得及总结”，再问用户想深入查哪个目标。
 // MaxChatSteps 是预算不是决策——它只决定一轮最多查多少，
 // 不决定模型该查什么；查到的东西不能因为预算用完就丢掉，
 // 否则用户看到的是一片空白加一句报错，等于白查了。
-func (s *Service) runReal(ctx context.Context, conversationID, text string, history []store.ConversationMessage, m *model.Real) (*Reply, error) {
+func (s *Service) runReal(ctx context.Context, conversationID, roundID, text string, history []store.ConversationMessage, m *model.Real, debug bool) (*Reply, error) {
 	msgs := []model.ChatMessage{{Role: "system", Content: chatSystemPrompt}}
 	for _, h := range history {
 		switch h.Role {
@@ -89,7 +159,13 @@ func (s *Service) runReal(ctx context.Context, conversationID, text string, hist
 	askedForStructured := false
 
 	for step := 0; step < s.maxSteps(); step++ {
+		if debug {
+			logModelRequest(conversationID, roundID, step+1, msgs)
+		}
 		st, err := m.Chat(ctx, msgs)
+		if debug {
+			logModelResponse(conversationID, roundID, step+1, st, err)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("调用模型失败: %w", err)
 		}
@@ -163,7 +239,7 @@ func (s *Service) runReal(ctx context.Context, conversationID, text string, hist
 			rec.Error = err.Error()
 			rec.Summary = "工具执行失败：" + err.Error()
 			recs = append(recs, rec)
-			s.recordTool(ctx, conversationID, rec, agent.ToolOutput{Summary: rec.Summary})
+			s.recordTool(ctx, conversationID, roundID, rec, agent.ToolOutput{Summary: rec.Summary})
 			// 工具失败回传给模型：下一轮它能看到失败原因，
 			// 换个工具重试，而不是原地重复调同一个。
 			msgs = append(msgs,
@@ -202,7 +278,7 @@ func (s *Service) runReal(ctx context.Context, conversationID, text string, hist
 		case "search_runbooks":
 			structured["runbooks"] = out.Data
 		}
-		s.recordTool(ctx, conversationID, rec, out)
+		s.recordTool(ctx, conversationID, roundID, rec, out)
 		msgs = append(msgs,
 			model.ChatMessage{Role: "assistant", Content: "", ToolCalls: []model.ChatToolCall{{ID: tc.ID, Name: tc.Name, Arguments: mustJSON(tc.Args)}}},
 			model.ChatMessage{Role: "tool", Content: out.Summary + "\n" + mustJSON(out.Data), ToolCallID: tc.ID},

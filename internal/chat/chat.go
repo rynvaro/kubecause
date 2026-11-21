@@ -86,6 +86,10 @@ type Service struct {
 	MaxSteps int
 	// MaxHistoryMessages 是每次调用模型带上的历史消息数，默认 10。
 	MaxHistoryMessages int
+	// DebugModel 是模型请求调试的总开关（环境变量 KUBE_DEBUG_MODEL=1 时
+	// 由 main.go 置 true）：打开后 runReal 把每次发给模型的完整请求
+	// 和模型返回打到服务端 stdout；默认关闭，不写进数据库、不进 API 回复。
+	DebugModel bool
 }
 
 // NewService 组装对话服务，步数和历史数先用默认值，
@@ -155,6 +159,18 @@ func (s *Service) lastMessages(ctx context.Context, conversationID string, n int
 // 最后把助手回复落盘并返回。
 // 对话只读：本函数里没有任何写集群的操作，
 // 修复建议只以 SuggestedRepair 卡的形式返回，不生成 change_requests。
+// RunMessage 处理一条用户消息：先把用户消息落盘，
+// 再跑一轮 Agent（Stub 走确定性规则，真模型走模型循环），
+// 最后把助手回复落盘并返回。
+// 对话只读：本函数里没有任何写集群的操作，
+// 修复建议只以 SuggestedRepair 卡的形式返回，不生成 change_requests。
+// 调试模式只走 Service.DebugModel（环境变量 KUBE_DEBUG_MODEL=1 时打开，
+// main.go 置 true）：打开后 runReal 把每次发给模型的完整请求和模型
+// 返回打到服务端 stdout；默认关闭，API 回复里不含调试数据，
+// 前端没有任何调试开关和面板，页面上无痕迹。
+// roundID 是本轮的关联 ID（v0.12.0）：同一轮的用户 / tool / 助手消息
+// 共享一个 round_ 开头的 ID；工具调用只存在 tool 消息里，
+// 助手消息不再抄一份 tool_calls，前端按 roundId 关联。
 func (s *Service) RunMessage(ctx context.Context, conversationID, text string) (*Reply, error) {
 	text = strings.TrimSpace(text)
 	if text == "" {
@@ -163,8 +179,9 @@ func (s *Service) RunMessage(ctx context.Context, conversationID, text string) (
 	if _, err := s.Store.GetConversation(ctx, conversationID); err != nil {
 		return nil, fmt.Errorf("会话不存在: %w", err)
 	}
+	roundID := store.NewID("round_")
 	if err := s.Store.AppendMessage(ctx, &store.ConversationMessage{
-		ConversationID: conversationID, Role: "user", Content: text,
+		ConversationID: conversationID, Role: "user", Content: text, RoundID: roundID,
 	}); err != nil {
 		return nil, err
 	}
@@ -175,13 +192,13 @@ func (s *Service) RunMessage(ctx context.Context, conversationID, text string) (
 	var reply *Reply
 	switch m := s.Model.(type) {
 	case *model.Real:
-		reply, err = s.runReal(ctx, conversationID, text, history, m)
+		reply, err = s.runReal(ctx, conversationID, roundID, text, history, m, s.DebugModel)
 	case *model.Stub:
-		reply, err = s.runStub(ctx, conversationID, text, history)
+		reply, err = s.runStub(ctx, conversationID, roundID, text, history)
 	default:
 		// 未知模型类型时按 Stub 的确定性规则走，至少能查状态、
 		// 不会因为模型类型不对就让对话直接报错。
-		reply, err = s.runStub(ctx, conversationID, text, history)
+		reply, err = s.runStub(ctx, conversationID, roundID, text, history)
 	}
 	if err != nil {
 		return nil, err
@@ -205,11 +222,13 @@ func (s *Service) RunMessage(ctx context.Context, conversationID, text string) (
 		}
 		reply.Structured["suggestedCreation"] = reply.SuggestedCreation
 	}
-	toolCallsJSON, _ := json.Marshal(reply.ToolCalls)
 	structuredJSON, _ := json.Marshal(reply.Structured)
+	// 助手消息不再存 tool_calls（v0.12.0）：工具调用只存在 tool 消息里，
+	// 同一轮靠 roundID 关联；Reply.ToolCalls 仍在 POST 回复里返回，
+	// 那是当次返回的临时数据，不是存储。
 	if err := s.Store.AppendMessage(ctx, &store.ConversationMessage{
 		ConversationID: conversationID, Role: "assistant", Content: reply.Reply,
-		ToolCalls: string(toolCallsJSON), Structured: string(structuredJSON),
+		Structured: string(structuredJSON), RoundID: roundID,
 	}); err != nil {
 		return nil, err
 	}
@@ -218,11 +237,12 @@ func (s *Service) RunMessage(ctx context.Context, conversationID, text string) (
 
 // recordTool 把一次工具调用记进本轮记录，并以 tool 角色落盘一条消息，
 // 这样会话历史里能看到每一步调了什么、返回了什么。
-func (s *Service) recordTool(ctx context.Context, conversationID string, rec ToolCallRecord, out agent.ToolOutput) {
+// roundID 是本轮的关联 ID，和本轮的用户 / 助手消息是同一个值。
+func (s *Service) recordTool(ctx context.Context, conversationID, roundID string, rec ToolCallRecord, out agent.ToolOutput) {
 	b, _ := json.Marshal([]ToolCallRecord{rec})
 	_ = s.Store.AppendMessage(ctx, &store.ConversationMessage{
 		ConversationID: conversationID, Role: "tool",
-		Content: rec.Summary, ToolCalls: string(b),
+		Content: rec.Summary, ToolCalls: string(b), RoundID: roundID,
 	})
 }
 

@@ -164,6 +164,10 @@ export interface ConversationMessage {
   content: string
   toolCalls?: string
   structured?: string
+  // 同一轮的关联 ID（v0.12.0）：同一轮的用户 / tool / 助手消息共享一个
+  // round_ 开头的 ID；工具调用只存在 tool 消息里，助手消息不再抄一份
+  // tool_calls。老数据没有它，读出来是 undefined，走位置推导回退。
+  roundId?: string
   createdAt: string
 }
 
@@ -235,6 +239,34 @@ export function parseToolCalls(msg: ConversationMessage): ToolCallRecord[] {
   const v = parseJSONLoose(msg.toolCalls)
   if (Array.isArray(v)) return v as ToolCallRecord[]
   return []
+}
+
+/** 取一条助手消息对应的本轮工具调用（v0.12.0，真关联）：
+ * 有 roundId 时数同 roundId 的 tool 消息——工具调用只存在 tool 消息里，
+ * 每调一次一条，助手消息不再抄一份，数出来的就是实际调过的次数。
+ * 老数据没有 roundId 时回退到位置推导：上一条用户消息到本条助手消息
+ * 之间的 tool 消息；再没有就读助手消息里存的老 tool_calls 副本。
+ * 这样新老会话的“查了 N 个工具”都对得上，活动面板也不会再出现两遍。 */
+export function toolCallsForAssistant(
+  msgs: ConversationMessage[],
+  assistant: ConversationMessage,
+): ToolCallRecord[] {
+  if (assistant.roundId) {
+    const out: ToolCallRecord[] = []
+    for (const m of msgs) {
+      if (m.role === 'tool' && m.roundId === assistant.roundId) out.push(...parseToolCalls(m))
+    }
+    return out
+  }
+  const idx = msgs.findIndex((m) => m.id === assistant.id)
+  const calls: ToolCallRecord[] = []
+  for (let i = idx - 1; i >= 0; i--) {
+    const m = msgs[i]
+    if (m.role === 'user' || m.role === 'assistant') break
+    if (m.role === 'tool') calls.unshift(...parseToolCalls(m))
+  }
+  if (calls.length > 0) return calls
+  return parseToolCalls(assistant)
 }
 
 /** 从一条会话消息里解析出结构化结果。 */

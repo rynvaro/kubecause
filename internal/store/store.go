@@ -190,6 +190,10 @@ type Conversation struct {
 // ConversationMessage 对应 messages 表，一条会话消息。
 // Role 是 user / assistant / tool；ToolCalls 存本轮调过的工具
 // （JSON），Structured 存结构化结果（JSON，前端渲染表格/卡片用）。
+// RoundID 是同一轮的关联字段（v0.12.0）：同一轮的用户 / tool /
+// 助手消息共享一个 round_ 开头的 ID；工具调用只存在 tool 消息里，
+// 助手消息不再抄一份 tool_calls，前端按 roundId 关联数“查了几个工具”。
+// 老数据没有这一列，读出来是 ""，前端回退到位置推导，见 types.ts。
 type ConversationMessage struct {
 	ID             int64     `json:"id"`
 	ConversationID string    `json:"conversationId"`
@@ -197,6 +201,7 @@ type ConversationMessage struct {
 	Content        string    `json:"content"`
 	ToolCalls      string    `json:"toolCalls,omitempty"`
 	Structured     string    `json:"structured,omitempty"`
+	RoundID        string    `json:"roundId,omitempty"`
 	CreatedAt      time.Time `json:"createdAt"`
 }
 
@@ -315,6 +320,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			content TEXT NOT NULL DEFAULT '',
 			tool_calls TEXT NOT NULL DEFAULT '',
 			structured TEXT NOT NULL DEFAULT '',
+			round_id TEXT NOT NULL DEFAULT '',
 			created_at DATETIME NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, id)`,
@@ -347,6 +353,11 @@ func (s *Store) migrate(ctx context.Context) error {
 		if err := s.ensureColumn(ctx, "runs", col.name, col.typ); err != nil {
 			return err
 		}
+	}
+	// messages 表的老库升级（v0.12.0）：同一轮的关联字段 round_id，
+	// 老库没有时补上，空字符串表示老数据，前端回退到位置推导。
+	if err := s.ensureColumn(ctx, "messages", "round_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
 	}
 	return nil
 }
@@ -834,8 +845,8 @@ func (s *Store) AppendMessage(ctx context.Context, m *ConversationMessage) error
 	defer func() { _ = tx.Rollback() }()
 	m.CreatedAt = now()
 	res, err := tx.ExecContext(ctx,
-		`INSERT INTO messages(conversation_id, role, content, tool_calls, structured, created_at) VALUES(?,?,?,?,?,?)`,
-		m.ConversationID, m.Role, m.Content, m.ToolCalls, m.Structured, m.CreatedAt)
+		`INSERT INTO messages(conversation_id, role, content, tool_calls, structured, round_id, created_at) VALUES(?,?,?,?,?,?,?)`,
+		m.ConversationID, m.Role, m.Content, m.ToolCalls, m.Structured, m.RoundID, m.CreatedAt)
 	if err != nil {
 		return err
 	}
@@ -856,7 +867,7 @@ func (s *Store) AppendMessage(ctx context.Context, m *ConversationMessage) error
 // 给前端时全量返回，前端能看到完整历史。
 func (s *Store) ListMessages(ctx context.Context, conversationID string) ([]ConversationMessage, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, conversation_id, role, content, tool_calls, structured, created_at FROM messages WHERE conversation_id=? ORDER BY id ASC`, conversationID)
+		`SELECT id, conversation_id, role, content, tool_calls, structured, round_id, created_at FROM messages WHERE conversation_id=? ORDER BY id ASC`, conversationID)
 	if err != nil {
 		return nil, err
 	}
@@ -864,7 +875,7 @@ func (s *Store) ListMessages(ctx context.Context, conversationID string) ([]Conv
 	out := []ConversationMessage{}
 	for rows.Next() {
 		var m ConversationMessage
-		if err := rows.Scan(&m.ID, &m.ConversationID, &m.Role, &m.Content, &m.ToolCalls, &m.Structured, &m.CreatedAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.ConversationID, &m.Role, &m.Content, &m.ToolCalls, &m.Structured, &m.RoundID, &m.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, m)

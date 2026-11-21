@@ -2,6 +2,25 @@
 
 按版本号倒序。每个版本对应一个 git tag，例如 `v0.9.0`。
 
+## v0.12.0（2026-11-21）
+
+v0.12.0 修的是用户在 2026-11-20 晚真机确认的双份时间线 bug：右侧活动面板里同一条工具调用显示两遍，耗时毫秒数完全相同（25/14/24/13 各两次，list_workload_pods 28ms 两次）。根因在代码里确认过：同一份调用存了两份——`recordTool` 每调一次写一条 tool 消息，`RunMessage` 一轮结束又把整轮的 tool_calls 抄进助手消息；前端按“消息 id + 调用 id”去重，tool 消息 id=101 和助手消息 id=107 的同一调用 id 变成两个 key，都留下了。修法按用户定的：用真关联，不用位置推导——messages 表加 `round_id`，同一轮的用户 / tool / 助手消息共享一个 `round_` 开头的 ID，助手消息不再抄 tool_calls。同一版本还加了用户要的模型请求调试：只打服务端日志，页面上什么都不加。
+
+### 改了什么
+
+- **工具调用只存一份，round_id 关联**（`internal/store/store.go`、`internal/chat/chat.go`、`internal/chat/real.go`、`internal/chat/stub.go`、`frontend/src/types.ts`、`frontend/src/App.tsx`）：messages 表加 `round_id` 列（老库自动迁移，老数据为空）；`RunMessage` 每轮生成一个 `round_` ID，`recordTool` 写进 tool 消息，助手消息存同一个；助手消息不再存 tool_calls（`Reply.ToolCalls` 仍在 POST 回复里返回，那是当次返回的临时数据，不是存储）。前端 `chatActivityItems` 只读 role=tool 的消息，按顺序列，去重 Map 删掉；每条助手消息下的“查了 N 个工具”改成数同 roundId 的 tool 消息（`types.ts` 的 `toolCallsForAssistant`）。老数据兼容：roundId 为空时回退到位置推导（上一条用户消息到本条助手消息之间的 tool 消息），再没有就读助手消息里存的老副本。`resolveNamespace` 还会扫历史的 ToolCalls，但只剩 tool 消息里那份——新轮次的命名空间解析靠用户文本、助手消息正文和 Structured 里的 namespace 字段，现有三轮记忆测试仍过。验证：新增 `TestRoundIDSharedAcrossRound`（两轮共享/区分 roundID、助手消息 tool_calls 为空）、`TestOldRoundIDEmptyIsReadable`（老数据行照常读）；前端逻辑用临时 node 脚本验过（新数据按 roundId 计数、活动列表恰好 3 条不重复、老数据两档回退都对）；curl fake+stub 两轮：round_1 是 1 用户 + 2 tool + 1 助手，round_2 是 1 用户 + 6 tool + 1 助手，助手消息 tool_calls 全空。
+- **模型请求调试只打服务端日志**（`internal/chat/real.go`、`internal/chat/chat.go`、`cmd/server/main.go`）：`KUBE_DEBUG_MODEL=1` 启动时，`runReal` 每次调模型前打一条请求日志（实际发过去的完整数组，`[debug model] conv=... round=... step=N request=[...]`）、返回后打一条返回日志（调了哪个工具及参数，或最终文本 / 是否提交了诊断报告）。默认关闭；没有 POST 的 debug 参数、不往 API 回复里加调试字段、前端没有任何改动（没有开关、面板、console.log、`?debug=1`）。单条内容超 4000 字截断并注明原长，结构不丢；API Key 在请求头里，日志里不会出现；桩模型不调外部模型，不打这个日志。验证：真模型路径用 httptest 假服务端验过（`TestDebugLoggingWithMockModel`：第一次请求的数组是 system + 当前问题在最后一条，返回日志记下工具名，关闭时零日志，日志里无 Key）；curl 用本地 mock 模型服务端验过端到端：3 次请求（工具调用、最终文本、追问后的最终文本）的数组结构都对，step=2 的数组里含 assistant(tool_calls) + tool 往返，日志里无 Key；默认启动（不设环境变量）零调试日志；`KUBE_DEBUG_MODEL=1` + 桩模型时启动行出现、零 `[debug model]` 行（符合预期，桩模型不调模型）。
+- **OOM 回归仍通**（curl fake+stub）：两轮对话出 128Mi→256Mi 修复建议卡 → 转换 `run_71898c5008438ad3` → 提案 `chg_18749b99b0085c54` → 批准 → executed + verification passed（新 Pod Ready）。
+
+### 未实现（仍未做）
+
+- 新问题还回上一轮答案（锚定）：已确认根因不只是历史里有上一轮诊断，还有 `runReal` 里不分问题类型、每轮都追问一次诊断报告的逻辑（`askedForStructured`）和 `formatReportReply` 替换掉模型原文的做法。用户明确说先搁置这个 bug，提示词那条也不加，等 v0.12.0 验证完再看。
+- 对话历史摘要（现在是截断，TODO 在代码和 README 里写清了）
+- 云端部署、鉴权、监控
+- 白名单做成可配置（用户说复杂先不做）
+- op 只支持 replace：add/remove 以后需要时再加，现在不做，避免删字段
+- command/args、hostNetwork、privileged 这些字段先禁掉，以后用户明确要求时再放开
+
 ## v0.11.0（2026-11-20）
 
 v0.11.0 修的是用户在 2026-11-20 晚反馈的 5 个问题：**审批后不知道在干嘛**（批完页面不反馈状态，要再问一句才刷出来）、**点转换按钮后不自动滚到审批卡**、**聊多了上下文混乱**（答案停留在上次问的问题上）、**右侧活动面板看不到最新工具调用**、**创建追问里出现内部字段名**（模型把 `suggestedCreation` 直接写给用户看）。根因都在代码里确认过，不是感觉问题：审批轮询的启动门控、历史按全量行数截断、当前问题在模型输入里出现两次，都是确定性的 bug。

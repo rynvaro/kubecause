@@ -48,7 +48,7 @@ import {
   ToolSummary,
 } from './components'
 import type { ActivityItem } from './components'
-import { parseStructured, parseToolCalls } from './types'
+import { parseStructured, parseToolCalls, toolCallsForAssistant } from './types'
 import type { AppConfig, ChangeRequest, Conversation, ConversationMessage, ConvertPayload, RunSnapshot, RunStep } from './types'
 
 type Mode = 'chat' | 'run'
@@ -84,27 +84,27 @@ function shouldKeepPolling(snap: RunSnapshot | null): boolean {
   return proposalUnsettled(snap.proposal)
 }
 
-/** 从会话消息里汇总本轮调过的工具：tool 消息和助手消息里都存了同一份调用，
- * 按“消息 id + 调用 id”去重——桩模型每轮的调用 id 会从 1 重新编号，
- * 只按调用 id 去重会把第二轮的调用吞掉。 */
+/** 从会话消息里汇总本轮调过的工具（v0.12.0）：工具调用只存在 tool 消息里，
+ * 每调一次一条，按顺序列，不用去重。助手消息不再抄一份 tool_calls，
+ * 再去读助手消息的 tool_calls 会把同一条调用算两次——
+ * 双份时间线 bug 的根因就是这里（tool 消息和助手消息各存了一份，
+ * 按“消息 id + 调用 id”去重认不出来）。 */
 function chatActivityItems(msgs: ConversationMessage[]): ActivityItem[] {
-  const byKey = new Map<string, ActivityItem>()
+  const items: ActivityItem[] = []
   for (const m of msgs) {
+    if (m.role !== 'tool') continue
     for (const c of parseToolCalls(m)) {
-      const key = `${m.id}:${c.id || c.name}`
-      if (!byKey.has(key)) {
-        byKey.set(key, {
-          id: key,
-          name: c.name,
-          args: c.args,
-          summary: c.summary,
-          error: c.error,
-          durationMs: c.durationMs ?? 0,
-        })
-      }
+      items.push({
+        id: `${m.id}:${c.id || c.name}`,
+        name: c.name,
+        args: c.args,
+        summary: c.summary,
+        error: c.error,
+        durationMs: c.durationMs ?? 0,
+      })
     }
   }
-  return [...byKey.values()]
+  return items
 }
 
 /** 单次诊断的步骤转成活动面板的卡片：报告和修复是里程碑，也各占一张卡。 */
@@ -645,7 +645,7 @@ export default function App() {
                           <div key={m.id} className="msg msg-assistant">
                             {/* 助手消息用轻量 Markdown 渲染，不再是纯文本。 */}
                             <MarkdownText text={m.content} />
-                            <ToolSummary calls={parseToolCalls(m)} running={chatBusy} />
+                            <ToolSummary calls={toolCallsForAssistant(messages, m)} running={chatBusy} />
                             <StructuredView
                               structured={parseStructured(m)}
                               onConvert={convertCurrent}

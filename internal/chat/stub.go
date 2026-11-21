@@ -79,7 +79,7 @@ func deploymentMentionedInText(ctx context.Context, s *Service, text, namespace 
 //
 // 每一步工具调用都记进 ToolCalls 并以 tool 角色落盘，
 // 最后的助手回复带结构化结果和可选的修复建议卡。
-func (s *Service) runStub(ctx context.Context, conversationID, text string, history []store.ConversationMessage) (*Reply, error) {
+func (s *Service) runStub(ctx context.Context, conversationID, roundID, text string, history []store.ConversationMessage) (*Reply, error) {
 	lower := strings.ToLower(text)
 	var recs []ToolCallRecord
 	var outputs []agent.ToolOutput
@@ -100,13 +100,13 @@ func (s *Service) runStub(ctx context.Context, conversationID, text string, hist
 			rec.Error = err.Error()
 			rec.Summary = "工具执行失败：" + err.Error()
 			recs = append(recs, rec)
-			s.recordTool(ctx, conversationID, rec, agent.ToolOutput{Summary: rec.Summary})
+			s.recordTool(ctx, conversationID, roundID, rec, agent.ToolOutput{Summary: rec.Summary})
 			return agent.ToolOutput{}, err
 		}
 		rec.Summary = out.Summary
 		recs = append(recs, rec)
 		outputs = append(outputs, out)
-		s.recordTool(ctx, conversationID, rec, out)
+		s.recordTool(ctx, conversationID, roundID, rec, out)
 		return out, nil
 	}
 
@@ -124,7 +124,7 @@ func (s *Service) runStub(ctx context.Context, conversationID, text string, hist
 	// （例如只回一句“叫 web-demo”），也是创建的继续，
 	// 不能当成一个新问题去查故障。
 	if isCreateIntent(text) || continuesCreation(history) {
-		return s.runStubCreate(ctx, conversationID, text, history)
+		return s.runStubCreate(ctx, conversationID, roundID, text, history)
 	}
 
 	// 主动变更 / 多轮追问选镜像（Slice 9）：用户明确说了要换成哪个镜像，
@@ -400,7 +400,7 @@ func deploymentExists(data any, name string) bool {
 // 不用先做故障诊断——要创建的东西本来就没有故障可诊。
 // 裸 Pod 不直接创建：用户说“创建一个 Pod”时也按 Deployment 给卡，
 // 并在回复里说明原因（Pod 挂了不会自动重建，也没有 rollout）。
-func (s *Service) runStubCreate(ctx context.Context, conversationID, text string, history []store.ConversationMessage) (*Reply, error) {
+func (s *Service) runStubCreate(ctx context.Context, conversationID, roundID, text string, history []store.ConversationMessage) (*Reply, error) {
 	var recs []ToolCallRecord
 	structured := map[string]any{}
 
@@ -416,12 +416,12 @@ func (s *Service) runStubCreate(ctx context.Context, conversationID, text string
 			rec.Error = err.Error()
 			rec.Summary = "工具执行失败：" + err.Error()
 			recs = append(recs, rec)
-			s.recordTool(ctx, conversationID, rec, agent.ToolOutput{Summary: rec.Summary})
+			s.recordTool(ctx, conversationID, roundID, rec, agent.ToolOutput{Summary: rec.Summary})
 			return agent.ToolOutput{}, err
 		}
 		rec.Summary = out.Summary
 		recs = append(recs, rec)
-		s.recordTool(ctx, conversationID, rec, out)
+		s.recordTool(ctx, conversationID, roundID, rec, out)
 		return out, nil
 	}
 

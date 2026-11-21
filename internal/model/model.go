@@ -934,7 +934,9 @@ type ChatToolCall struct {
 }
 
 // ChatStep 是 Real.Chat 一次调用的返回：
-// 要么是一个工具调用（循环继续），要么是一段最终文本 / 一份诊断报告。
+// 一次返回里文字和工具调用 / 诊断报告可以同时存在，
+// Content 和 ToolCall / Report 都带上，调用方都要保留——
+// 模型的文字不能因为它同时调了工具、交了报告就被丢掉。
 type ChatStep struct {
 	Content  string
 	ToolCall *agent.ToolCall
@@ -973,6 +975,10 @@ func (r *Real) Chat(ctx context.Context, msgs []ChatMessage) (ChatStep, error) {
 		return ChatStep{}, fmt.Errorf("模型返回为空，没有 choices")
 	}
 	msg := resp.Choices[0].Message
+	// 文字和工具调用可以同时存在（模型一边说“我来查一下”一边调工具，
+	// 或一边写结论一边交 submit_diagnosis）：先把文字取出来，
+	// 下面无论返回工具调用还是诊断报告都带上，不丢。
+	content := strings.TrimSpace(msg.Content)
 	if len(msg.ToolCalls) > 0 {
 		tc := msg.ToolCalls[0]
 		if tc.Function.Name == "submit_diagnosis" {
@@ -980,7 +986,7 @@ func (r *Real) Chat(ctx context.Context, msgs []ChatMessage) (ChatStep, error) {
 			if err != nil {
 				return ChatStep{}, fmt.Errorf("模型提交的诊断报告解析失败: %w", err)
 			}
-			return ChatStep{IsFinal: true, Report: rep}, nil
+			return ChatStep{IsFinal: true, Content: content, Report: rep}, nil
 		}
 		args, err := parseToolArgs(tc.Function.Arguments)
 		if err != nil {
@@ -990,9 +996,8 @@ func (r *Real) Chat(ctx context.Context, msgs []ChatMessage) (ChatStep, error) {
 		if id == "" {
 			id = "call-chat"
 		}
-		return ChatStep{ToolCall: &agent.ToolCall{ID: id, Name: tc.Function.Name, Args: args}}, nil
+		return ChatStep{Content: content, ToolCall: &agent.ToolCall{ID: id, Name: tc.Function.Name, Args: args}}, nil
 	}
-	content := strings.TrimSpace(msg.Content)
 	if content == "" {
 		return ChatStep{}, fmt.Errorf("模型既没有调工具也没有返回文本")
 	}

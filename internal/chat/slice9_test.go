@@ -42,8 +42,8 @@ func TestRealMultiRoundImageChoice(t *testing.T) {
 		n := atomic.AddInt64(&calls, 1)
 		w.Header().Set("Content-Type", "application/json")
 		switch n {
-		case 1, 2:
-			// 第一轮：模型问选哪个镜像（第 2 次是追问结构化建议后的回答，仍问）。
+		case 1:
+			// 第一轮：模型问选哪个镜像。
 			_, _ = fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"镜像 tag 不存在，拉取失败。你想换成哪个镜像？是 nginx:1.25 还是 nginx:latest？"}}]}`)
 		default:
 			// 第二轮：用户已选 nginx:1.25，模型提交结构化诊断 + Patch。

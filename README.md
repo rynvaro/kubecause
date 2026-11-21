@@ -1,6 +1,6 @@
 # KubeCause — Kubernetes 故障诊断 Agent
 
-当前版本：v0.12.0。更新记录见 [CHANGELOG.md](CHANGELOG.md)。
+当前版本：v0.13.0。更新记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 KubeCause 是一个 Kubernetes 故障诊断 Agent。用户选定 namespace 和 Pod 或 Deployment，描述故障现象，Agent 自主选择只读工具收集证据，检索排障手册，输出诊断结论和建议。演示环境支持人工审批后的变更：用一组通用 Patch 改指定 Deployment 的白名单字段（镜像、内存 limit/request、CPU limit/request、副本数），并验证变更后的运行状态；也可以在对话里直接创建一个新的 Deployment，同样走建议卡 → 人工审批 → 执行 → 验证 rollout 这条线。
 
@@ -16,6 +16,7 @@ KubeCause 是一个 Kubernetes 故障诊断 Agent。用户选定 namespace 和 P
 - **离线评估**：`go run ./cmd/eval` 跑 OOM、镜像、探针三个用例，输出命中率、引用准确性、步数和耗时。
 - **工具调用只存一份（round_id 关联）**：一次工具调用在库里只存在 tool 消息里，每调一次一条；同一轮的用户 / tool / 助手消息共享一个 `round_` 开头的 roundID，助手消息不再抄一份 tool_calls，前端按 roundId 关联数“查了 N 个工具”，右侧活动面板只读 tool 消息，不用去重。以前助手消息里抄了一份，前端按“消息 id + 调用 id”去重认不出来，同一条调用显示两遍（耗时毫秒数完全相同）。老数据没有 round_id，读出来是空，前端回退到位置推导（上一条用户消息到本条助手消息之间的 tool 消息），再没有就读助手消息里存的老副本。
 - **模型请求调试日志**：`KUBE_DEBUG_MODEL=1` 启动时，对话里每次调模型前把实际发过去的完整消息数组（system + 历史 + 当前问题 + 本轮的 assistant(tool_calls) / tool 往返）打到服务端 stdout，返回后再打一条返回日志（调了哪个工具及参数，或最终文本 / 是否提交了诊断报告）。默认关闭，页面上没有任何调试痕迹，API 回复里也不含调试数据；日志里不含 API Key（Key 只在请求头里）。单条内容超长时截断并注明原长。
+- **不再追问结构化建议**：模型给最终文本但没交诊断报告时，直接显示文本，不再追加假 user 消息追问一次；交不交报告由模型自己决定（系统提示词里关于 submit_diagnosis 的指引保留，那只是指引）。模型一次返回里的文字和工具调用 / 报告都保留：文字在前、格式化报告在后，调工具时顺带的文字也拼进回复，不再悄悄替换或丢掉。执行动作（修复提议怎么落地、按钮、审批流）的重设计是下一步，不在这版。
 
 ## 通用 Patch 格式和白名单
 

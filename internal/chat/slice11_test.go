@@ -145,8 +145,9 @@ func countUserMessagesWithContent(req capturedRequest, content string) int {
 //     上一轮的 tool 消息不应再以“工具返回：”的形式出现在请求里。
 //  2. 当前问题只出现一次：RunMessage 先把用户消息落盘，
 //     history 里已经有这句了，runReal 不能再追加一遍。
-//     mock 模型每次只给纯文本，会触发一次追问结构化建议，
-//     所以一共收到 2 次请求，两次里当前问题都只能出现一次。
+//     mock 模型每次只给纯文本；以前这里会触发一次追问结构化建议，
+//     一共收到 2 次请求。v0.13.0 删掉了追问，只收到 1 次请求，
+//     当前问题在其中恰好出现一次，请求里也不再有追问那句假 user 消息。
 func TestRealHistoryKeepsFirstRoundAndQuestionSentOnce(t *testing.T) {
 	ctx := context.Background()
 	s, err := store.Open(":memory:")
@@ -163,13 +164,16 @@ func TestRealHistoryKeepsFirstRoundAndQuestionSentOnce(t *testing.T) {
 	if _, err := svc.RunMessage(ctx, conv, question); err != nil {
 		t.Fatalf("对话失败: %v", err)
 	}
-	if len(*captured) != 2 {
-		t.Fatalf("mock 模型应收到 2 次请求（首次回答 + 追问结构化建议后一次），得到 %d 次", len(*captured))
+	if len(*captured) != 1 {
+		t.Fatalf("mock 模型应只收到 1 次请求（纯文本直接返回，不再追问结构化建议），得到 %d 次", len(*captured))
 	}
 	first := (*captured)[0]
 	joined := ""
 	for _, m := range first.Messages {
 		joined += m.Role + "：" + m.Content + "\n"
+	}
+	if strings.Contains(joined, "如果你认为需要修复") {
+		t.Fatalf("请求里不应再有追问结构化建议的假 user 消息，得到:\n%s", joined)
 	}
 	if !strings.Contains(joined, "第1轮：demo-api 为什么一直重启") {
 		t.Fatalf("第一次请求里应仍有第一轮的用户问题，得到:\n%s", joined)
@@ -179,9 +183,5 @@ func TestRealHistoryKeepsFirstRoundAndQuestionSentOnce(t *testing.T) {
 	}
 	if n := countUserMessagesWithContent(first, question); n != 1 {
 		t.Fatalf("第一次请求里当前问题应恰好出现一次，出现 %d 次，请求内容:\n%s", n, joined)
-	}
-	second := (*captured)[1]
-	if n := countUserMessagesWithContent(second, question); n != 1 {
-		t.Fatalf("第二次请求里当前问题应恰好出现一次，出现 %d 次", n)
 	}
 }

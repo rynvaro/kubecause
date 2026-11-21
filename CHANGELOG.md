@@ -2,6 +2,25 @@
 
 按版本号倒序。每个版本对应一个 git tag，例如 `v0.9.0`。
 
+## v0.13.0（2026-11-21）
+
+v0.13.0 只做用户定的第一步：拿掉追问（`askedForStructured`）这个 hack。之前确认的锚定 bug 有两个推手，一是 `runReal` 里不分问题类型、每轮都追问一次诊断报告（往消息数组最后追加一条假 user 消息“如果你认为需要修复，请调用 submit_diagnosis……”），二是 `formatReportReply` 把模型第一轮的原文整个替换掉。用户明确说不要改成 Markdown、执行动作的重设计下一步再规划，所以这版只拿掉追问、保住模型文字，修复提议怎么落地、按钮、审批流一个字都不动。
+
+### 改了什么
+
+- **删掉追问**（`internal/chat/real.go`）：`askedForStructured` 变量、触发判断、追加假 user 消息那几行和 `continue` 全删。模型给最终文本但没有结构化报告时，直接把这段文本当回复返回，不再发第二次请求。没有结构化建议，就显示文本；交不交报告由模型自己决定。系统提示词里关于 submit_diagnosis 的指引保留（那只是指引，模型自己决定交不交）。桩模型路径本来就没有追问逻辑，不用改。
+- **模型文字不再被丢掉**（`internal/model/model.go` 的 `Chat`、`internal/chat/real.go` 的 `runReal`）：一次返回里文字和工具调用 / 诊断报告可以同时存在，`ChatStep` 里 Content 和 ToolCall / Report 同时带上；`runReal` 里收到带文字的报告时，回复 = 模型文字在前 + 格式化报告在后（不要替换掉文字）；调只读工具时顺带回来的文字攒进 `sideTexts`，按步骤顺序拼进最终回复（步数用完的半成品回复也带上），同时也放进发给模型的上下文（assistant 消息的 Content 不再写死成空）。调试日志的返回行也把顺带的文字打出来，和实际返回一致。规则写进代码注释：模型的原文永远保留在回复里，结构化报告只追加在后面，不替换原文。
+- **测试跟着改**（`internal/chat/slice11_test.go`、`slice9_test.go`、`slice12_test.go`，新加 `internal/chat/slice13_test.go`）：`TestRealHistoryKeepsFirstRoundAndQuestionSentOnce` 以前预期 2 次请求（首次回答 + 追问后一次），现在预期 1 次，并断言请求里没有追问那句假 user 消息；`TestRealMultiRoundImageChoice` 的 mock 剧本按调用次数编号，以前第 2 次是追问后的回答，现在第一轮只有 1 次调用，第二轮直接走默认分支交诊断；`TestDebugLoggingWithMockModel` 加断言：追问删掉后一共只有 2 次请求（工具调用 + 最终文本），调试日志里没有追问那句。新加 3 个测试：`TestTextOnlyFinalReturnsDirectly`（只给文字不给报告时只发 1 次请求、回复就是那段文字）、`TestTextAndReportBothKept`（文字 + submit_diagnosis 同时返回时回复里文字在前、报告在后，两边都在）、`TestToolCallSideTextKept`（调工具时顺带的文字拼进最终回复，第二次请求的 assistant 消息同时带文字和 tool_calls）。验证：`go vet` 干净，`go test ./...` 全过，`go run ./cmd/eval` 3/3（命中率 1.00，eval 走单次诊断路径，不受影响），`npm run build` 通过（没有前端改动）。
+- **curl 验证**（fresh DB，本地 mock 模型服务端 + `MODEL_MODE=real` + `KUBE_DEBUG_MODEL=1`）：第一轮 mock 只回文字不交报告，服务端日志里 mock 只收到 1 次请求，回复就是那段文字（“demo 命名空间下只有 1 个 Pod。”）；第二轮 mock 同时回文字和 submit_diagnosis，回复里文字和报告都在（文字在前，接着“诊断结论：容器内存限制过低。”），`structured.report` 齐全；服务端日志里“如果你认为需要修复”出现 0 次，第一次请求的数组是 system + 历史 + 当前问题在最后一条。
+
+### 未实现（仍未做）
+
+- 执行动作的重设计（修复提议怎么落地、按钮、审批流）：下一步再规划，不在这版
+- 锚定问题只做了一半：追问和替换原文这两个推手拿掉了，但历史里上一轮诊断全文仍会进模型上下文，模型仍可能顺着上一轮答
+- 对话历史摘要（现在是截断，TODO 在代码和 README 里写清了）
+- 云端部署、鉴权、监控
+- 白名单做成可配置（用户说复杂先不做）
+
 ## v0.12.0（2026-11-21）
 
 v0.12.0 修的是用户在 2026-11-20 晚真机确认的双份时间线 bug：右侧活动面板里同一条工具调用显示两遍，耗时毫秒数完全相同（25/14/24/13 各两次，list_workload_pods 28ms 两次）。根因在代码里确认过：同一份调用存了两份——`recordTool` 每调一次写一条 tool 消息，`RunMessage` 一轮结束又把整轮的 tool_calls 抄进助手消息；前端按“消息 id + 调用 id”去重，tool 消息 id=101 和助手消息 id=107 的同一调用 id 变成两个 key，都留下了。修法按用户定的：用真关联，不用位置推导——messages 表加 `round_id`，同一轮的用户 / tool / 助手消息共享一个 `round_` 开头的 ID，助手消息不再抄 tool_calls。同一版本还加了用户要的模型请求调试：只打服务端日志，页面上什么都不加。

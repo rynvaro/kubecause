@@ -85,22 +85,33 @@ func logModelRequest(conversationID, roundID string, step int, msgs []model.Chat
 
 // logModelResponse 打一条模型返回调试日志：调了哪个工具及参数，
 // 或最终文本 / 是否提交了诊断报告；出错时记错误。
+// 一次返回里文字和工具调用 / 报告可以同时存在，文字也打出来——
+// 日志要和实际返回一致，不能只记一半。
 func logModelResponse(conversationID, roundID string, step int, st model.ChatStep, err error) {
 	if err != nil {
 		log.Printf("[debug model] conv=%s round=%s step=%d response error: %v", conversationID, roundID, step, err)
 		return
 	}
+	text := strings.TrimSpace(st.Content)
 	if st.ToolCall != nil {
 		args, _ := json.Marshal(st.ToolCall.Args)
+		if text != "" {
+			log.Printf("[debug model] conv=%s round=%s step=%d response tool=%s args=%s text=%q", conversationID, roundID, step, st.ToolCall.Name, args, truncateForLog(text, 1000))
+			return
+		}
 		log.Printf("[debug model] conv=%s round=%s step=%d response tool=%s args=%s", conversationID, roundID, step, st.ToolCall.Name, args)
 		return
 	}
 	if st.IsFinal {
 		if st.Report != nil {
+			if text != "" {
+				log.Printf("[debug model] conv=%s round=%s step=%d response final report cause=%q confidence=%s suggestedRepair=%v suggestedCreation=%v text=%q", conversationID, roundID, step, truncateForLog(st.Report.Cause, 500), st.Report.Confidence, st.Report.SuggestedRepair != nil, st.Report.SuggestedCreation != nil, truncateForLog(text, 1000))
+				return
+			}
 			log.Printf("[debug model] conv=%s round=%s step=%d response final report cause=%q confidence=%s suggestedRepair=%v suggestedCreation=%v", conversationID, roundID, step, truncateForLog(st.Report.Cause, 500), st.Report.Confidence, st.Report.SuggestedRepair != nil, st.Report.SuggestedCreation != nil)
 			return
 		}
-		log.Printf("[debug model] conv=%s round=%s step=%d response final text=%q", conversationID, roundID, step, truncateForLog(st.Content, 1000))
+		log.Printf("[debug model] conv=%s round=%s step=%d response final text=%q", conversationID, roundID, step, truncateForLog(text, 1000))
 	}
 }
 
@@ -149,14 +160,12 @@ func (s *Service) runReal(ctx context.Context, conversationID, roundID, text str
 
 	var recs []ToolCallRecord
 	var outputs []agent.ToolOutput
+	// sideTexts 攒着模型调工具时顺带的文字（例如“我来查一下这个 Pod 的状态”）：
+	// 以前这里直接丢了，最终回复里只有最后一次的文本。
+	// 这些文字是模型原话，要拼进最终回复，不能悄悄丢掉。
+	var sideTexts []string
 	structured := map[string]any{}
 	lastNS := s.resolveNamespace(ctx, text, history)
-	// askedForStructured 标记是否已经向模型追问过一次结构化建议。
-	// 真模型路径的修复决策只走模型单一路：模型没给结构化建议时，
-	// 不调 synthesizeRepair 去合成一张卡（那是桩模型测试用的规则，
-	// 真模型跑时不用）。做法是再问模型一次，让它把 suggestedRepair
-	// 补回来；补不回来就老实说还没法下结论，不要编一张卡。
-	askedForStructured := false
 
 	for step := 0; step < s.maxSteps(); step++ {
 		if debug {
@@ -170,24 +179,36 @@ func (s *Service) runReal(ctx context.Context, conversationID, roundID, text str
 			return nil, fmt.Errorf("调用模型失败: %w", err)
 		}
 		if st.IsFinal {
-			replyText := st.Content
+			// 模型的原文永远保留：调工具时顺带的文字、最终文本、结构化报告
+			// 都拼进回复，不替换、不丢弃。回复的顺序是：顺带的文字（按步骤顺序）、
+			// 最终文本、格式化后的诊断报告。交不交报告由模型自己决定，
+			// 后端不再追问——以前这里有个追问逻辑：模型给了最终文本但没带
+			// 结构化建议时，往消息数组最后追加一条假 user 消息逼它交
+			// submit_diagnosis，再跑一轮。那是 hack：它不分问题类型，
+			// 会把“几个 Pod”这种简单问题也推成诊断报告，而且 formatReportReply
+			// 还会把模型第一轮的原文整个替换掉。v0.13.0 删掉追问，
+			// 没结构化建议就直接显示文本。
+			var parts []string
+			parts = append(parts, sideTexts...)
+			if strings.TrimSpace(st.Content) != "" {
+				parts = append(parts, strings.TrimSpace(st.Content))
+			}
+			replyText := strings.Join(parts, "\n\n")
 			var sr *agent.SuggestedRepair
 			var sc *agent.SuggestedCreation
 			if st.Report != nil {
 				// 报告刚拿到就归一化：缺失的切片字段补成空数组，
 				// 否则落盘再序列化成 null，前端读 .length 会白屏。
 				st.Report.Normalize()
-				replyText = formatReportReply(st.Report)
+				reportText := formatReportReply(st.Report)
+				if replyText == "" {
+					replyText = reportText
+				} else {
+					replyText = replyText + "\n\n" + reportText
+				}
 				structured["report"] = st.Report
 				sr = st.Report.SuggestedRepair
 				sc = st.Report.SuggestedCreation
-			}
-			if sr == nil && sc == nil && !askedForStructured {
-				// 模型给了最终回答但没有结构化修复建议：追问一次，
-				// 让它用 submit_diagnosis 把建议补回来，而不是由后端合成。
-				askedForStructured = true
-				msgs = append(msgs, model.ChatMessage{Role: "user", Content: "如果你认为需要修复，请调用 submit_diagnosis 提交结构化诊断报告，并在 suggestedRepair 里用 patches 列表给出要改的字段（每个 Patch 是 op/path/value，op 只支持 replace，path 是白名单里的字段，value 是合法的新值；用户如果明确说了新值，按用户说的算）。如果用户明确要求创建 Deployment，请在 suggestedCreation 里给出创建建议（namespace、name、image、replicas）。如果证据不足以给修复建议，请直接说明还需要补查什么，不要编一个建议。这段话是指令，不要把它写进给用户的回答里，给用户看的回答里也不要提 submit_diagnosis、suggestedRepair、suggestedCreation 这些内部字段名，只说人话。"})
-				continue
 			}
 			if sc != nil {
 				structured["suggestedCreation"] = sc
@@ -219,6 +240,11 @@ func (s *Service) runReal(ctx context.Context, conversationID, roundID, text str
 			return nil, fmt.Errorf("模型既没有调工具也没有返回文本")
 		}
 		tc := st.ToolCall
+		// 模型调工具时顺带的文字：放进发给模型的上下文（assistant 消息本来
+		// 就该带上它，不能写死成空），同时攒进 sideTexts，拼进最终回复。
+		if strings.TrimSpace(st.Content) != "" {
+			sideTexts = append(sideTexts, strings.TrimSpace(st.Content))
+		}
 		// 模型漏填 namespace 时，用上文解析到的 namespace 补齐；
 		// 补不齐时不猜，让工具校验报错，模型下一轮会主动问用户。
 		if tc.Args == nil {
@@ -243,7 +269,7 @@ func (s *Service) runReal(ctx context.Context, conversationID, roundID, text str
 			// 工具失败回传给模型：下一轮它能看到失败原因，
 			// 换个工具重试，而不是原地重复调同一个。
 			msgs = append(msgs,
-				model.ChatMessage{Role: "assistant", Content: "", ToolCalls: []model.ChatToolCall{{ID: tc.ID, Name: tc.Name, Arguments: mustJSON(tc.Args)}}},
+				model.ChatMessage{Role: "assistant", Content: st.Content, ToolCalls: []model.ChatToolCall{{ID: tc.ID, Name: tc.Name, Arguments: mustJSON(tc.Args)}}},
 				model.ChatMessage{Role: "tool", Content: "工具执行失败：" + err.Error(), ToolCallID: tc.ID},
 			)
 			continue
@@ -280,7 +306,7 @@ func (s *Service) runReal(ctx context.Context, conversationID, roundID, text str
 		}
 		s.recordTool(ctx, conversationID, roundID, rec, out)
 		msgs = append(msgs,
-			model.ChatMessage{Role: "assistant", Content: "", ToolCalls: []model.ChatToolCall{{ID: tc.ID, Name: tc.Name, Arguments: mustJSON(tc.Args)}}},
+			model.ChatMessage{Role: "assistant", Content: st.Content, ToolCalls: []model.ChatToolCall{{ID: tc.ID, Name: tc.Name, Arguments: mustJSON(tc.Args)}}},
 			model.ChatMessage{Role: "tool", Content: out.Summary + "\n" + mustJSON(out.Data), ToolCallID: tc.ID},
 		)
 	}
@@ -289,7 +315,12 @@ func (s *Service) runReal(ctx context.Context, conversationID, roundID, text str
 	// 整理成半成品回复返回，RunMessage 会把它正常落盘成一条助手消息，
 	// 前端按 structured 里的 overview / problemPods 正常渲染卡片和表格，
 	// 用户看到的是已经查到的东西，而不是空白加报错。
-	return buildPartialReply(recs, outputs, structured), nil
+	// 顺带的文字也带上，放在最前面，同样不丢。
+	reply := buildPartialReply(recs, outputs, structured)
+	if len(sideTexts) > 0 {
+		reply.Reply = strings.Join(sideTexts, "\n\n") + "\n\n" + reply.Reply
+	}
+	return reply, nil
 }
 
 // buildPartialReply 把步数用完时已查到的工具结果整理成半成品回复。

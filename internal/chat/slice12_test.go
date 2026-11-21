@@ -144,7 +144,7 @@ func captureLog(t *testing.T) *bytes.Buffer {
 // DebugModel 关闭时一条调试日志都没有。
 func TestDebugLoggingWithMockModel(t *testing.T) {
 	ctx := context.Background()
-	srv, _ := mockModelServer(t)
+	srv, calls := mockModelServer(t)
 
 	t.Run("debug on logs full request and response", func(t *testing.T) {
 		svc, _ := newMockRealService(t, srv)
@@ -155,6 +155,14 @@ func TestDebugLoggingWithMockModel(t *testing.T) {
 			t.Fatalf("RunMessage 失败: %v", err)
 		}
 		out := buf.String()
+		// v0.13.0 删掉了追问：mock 先调一次工具、再回一段最终文本，
+		// 一共应只有 2 次请求，没有追问结构化建议的那一次。
+		if got := atomic.LoadInt32(calls); got != 2 {
+			t.Fatalf("追问删掉后应只有 2 次请求（工具调用 + 最终文本），得到 %d 次", got)
+		}
+		if strings.Contains(out, "如果你认为需要修复") {
+			t.Fatalf("调试日志里不应再有追问结构化建议的假 user 消息，得到：%s", out)
+		}
 		// 请求日志：第一次请求应是 system + 当前问题（最后一条 user）。
 		reqIdx := strings.Index(out, "[debug model]")
 		if reqIdx < 0 {

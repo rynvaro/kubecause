@@ -289,8 +289,15 @@ func (s *Service) runReal(ctx context.Context, conversationID, roundID, text str
 			structured["overview"] = out.Data
 		case "list_problem_pods":
 			structured["problemPods"] = out.Data
-		case "list_workload_pods":
+		case "list_pods":
 			structured["pods"] = out.Data
+		case "list_workload_pods":
+			// 注意：这里不再写 "pods"——list_workload_pods 以前返回名字
+			// 字符串数组，和 list_pods 的完整行撞了同一个 key，
+			// 前端按 problemPods ?? pods 读到字符串数组就渲出一排空行。
+			// 现在两个工具各走各的 key：全部 Pod 是 pods，
+			// 某 Deployment 下的 Pod 是 workloadPods。
+			structured["workloadPods"] = out.Data
 		case "get_pod":
 			structured["pod"] = out.Data
 		case "get_deployment":

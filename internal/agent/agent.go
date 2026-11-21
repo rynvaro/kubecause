@@ -21,7 +21,7 @@ import (
 )
 
 // 允许的工具名，白名单，模型只能叫这些，多一个都不行。
-// 前 6 个是单次诊断的定向工具，后 4 个是发现工具：
+// 前 6 个是单次诊断的定向工具，后 5 个是发现工具：
 // 对话模式里模型不知道目标在哪时，先用它们看全貌、找问题，
 // 再用定向工具深挖。发现工具全部是只读的。
 var allowedTools = map[string]bool{
@@ -34,14 +34,16 @@ var allowedTools = map[string]bool{
 	"list_namespaces":      true,
 	"list_deployments":     true,
 	"list_problem_pods":    true,
+	"list_pods":            true,
 	"get_cluster_overview": true,
 }
 
 // 发现工具集合：namespace 为空表示查全部，不用和任务 namespace 一致。
 var discoveryTools = map[string]bool{
-	"list_namespaces":      true,
-	"list_deployments":     true,
-	"list_problem_pods":    true,
+	"list_namespaces":   true,
+	"list_deployments":  true,
+	"list_problem_pods": true,
+	"list_pods":         true,
 	"get_cluster_overview": true,
 }
 
@@ -280,6 +282,7 @@ type Tools interface {
 	ListNamespaces(ctx context.Context) (ToolOutput, error)
 	ListDeployments(ctx context.Context, namespace string) (ToolOutput, error)
 	ListProblemPods(ctx context.Context, namespace string) (ToolOutput, error)
+	ListPods(ctx context.Context, namespace string) (ToolOutput, error)
 	GetClusterOverview(ctx context.Context) (ToolOutput, error)
 }
 
@@ -637,6 +640,8 @@ func (a *Agent) executeTool(ctx context.Context, call *ToolCall) (ToolOutput, er
 		return a.Tools.ListDeployments(ctx, call.Args["namespace"])
 	case "list_problem_pods":
 		return a.Tools.ListProblemPods(ctx, call.Args["namespace"])
+	case "list_pods":
+		return a.Tools.ListPods(ctx, call.Args["namespace"])
 	case "get_cluster_overview":
 		return a.Tools.GetClusterOverview(ctx)
 	default:

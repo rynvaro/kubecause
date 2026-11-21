@@ -2,6 +2,28 @@
 
 按版本号倒序。每个版本对应一个 git tag，例如 `v0.9.0`。
 
+## v0.14.0（2026-11-21）
+
+v0.14.0 一次修两个问题，根上都是 Pod 行的形状不统一。用户在真机上问“demo 命名空间下有哪些 Pod”，模型只能猜一个 Deployment 去查，结果只查到 1 个；同一轮里“有问题的 Pod”那张表还经常渲出一排空单元格（标题栏个数对、行里全空，只有“原因”列的兜底“—”）。查代码确认了两个根因：一是工具箱里没有“列出某命名空间下全部 Pod”的工具，只有只列有问题 Pod 的 `list_problem_pods` 和要先知道 Deployment 名的 `list_workload_pods`；二是 `list_workload_pods` 返回的是 Pod 名字字符串数组，前端 `buildBlocks` 用 `structured.problemPods ?? structured.pods` 把它当完整 PodRow 对象渲染，`asPods` 只检查了是不是数组、没检查元素形状，字符串也通过了。
+
+### 改了什么
+
+- **新工具 `list_pods`**（`internal/run/tools.go`、`internal/agent/agent.go`、`internal/chat/chat.go`、`internal/model/model.go`）：列出某命名空间下全部 Pod（不限于有问题的），每条是完整行；namespace 为空表示全部命名空间。发现工具、白名单、分发（单次诊断和对话两条路）都加上了，`list_problem_pods` 保留，它是有问题 Pod 的快捷入口。工具描述只写返回什么和覆盖范围，不写禁止句（`TestToolDescriptionsDescribeOnly` 的工具数 11 改成 12）。
+- **Pod 行形状统一**（`internal/run/tools.go`）：抽了共用的 `podRowFromPod` helper（一个 `corev1.Pod` 生成 name/namespace/isSystem/phase/ready/restarts/deployment/lastTerminationReason/waitingReason 这一行，外加是否“有问题”的判断），`ListProblemPods`、`ListWorkloadPods`、`ListPods` 都用它，**一种 PodRow 形状走到底**。`ListWorkloadPods` 改成返回完整行（Deployment 查不到时按 `app=<deployment>` 标签兜底的那条路也返回完整行，照样带 `deploymentNotFound` 标记）。
+- **规范 key 不再撞**（`internal/chat/real.go`）：`list_pods` → `structured["pods"]`，`list_workload_pods` → 新 key `structured["workloadPods"]`，`list_problem_pods` → `structured["problemPods"]` 不变；工具名那份留着做追溯。以前 `list_workload_pods` 写的也是 `pods`，和字符串数组撞在一起就是空表的直接原因。
+- **前端按来源区分标题**（`frontend/src/types.ts`、`frontend/src/components.tsx`）：`buildBlocks` 里三个来源各渲一张表——“有问题的 Pod”“demo 的 Pod”“demo-api 的 Pod”（Data 里有 namespace/deployment 时带上），摘要行也跟着标题走，不再不管哪张表都写“有问题 Pod”。`asPods` 加了一层轻校验：元素必须是带字符串 `name` 的对象，否则不认——以后形状再对不上，宁可不渲染这块，也不要再渲染一排空单元格。`PodTable` 本身复用，没重写。
+- **桩模型路径跟上**（`internal/chat/stub.go`、`internal/model/model.go`）：`runStub` 加了一个“列 Pod”分支——问“某命名空间下有哪些 / 有几个 Pod”时直接调 `list_pods`（提到具体 Deployment 名的调 `list_workload_pods`），不走“找问题 Pod 再深挖”的诊断流程。桩模型（`model.Stub`）的固定剧本里 `discoverPodName` 原来按 `Pods []string` 解析 `list_workload_pods` 的结果，现在按行对象（`name` 字段）解析，不然 eval 的 Deployment 用例在第 1 步后就找不到 Pod 名。
+- **测试**（新加 `internal/run/slice14_test.go`、`internal/chat/slice14_test.go`）：`TestListPodsReturnsAllPodsFullRows`（demo 下 1 个 Pod 完整行，namespace 为空也是 1 个）、`TestListWorkloadPodsReturnsFullRows`（完整行，且按 `[]string` 解析必须失败，证明字符串形状已不存在）、`TestListWorkloadPodsFallbackReturnsFullRows`（Deployment 查不到的兜底也返回完整行，带 `deploymentNotFound` 标记）、`TestStubListPodsQuestion` / `TestStubListWorkloadPodsQuestion`（桩模型两路分支）、`TestRealListPodsCanonicalKey` / `TestRealListWorkloadPodsCanonicalKey`（真模型路径规范 key 对、行完整、对方的 key 不出现）。验证：`go vet` 干净，`go test ./...` 全过，`go run ./cmd/eval` 3/3（命中率 1.00，桩模型固定剧本改了 `discoverPodName` 解析后仍通），`npm run build` 通过。
+- **curl 验证**（fresh DB，本地 mock 模型服务端 + `MODEL_MODE=real` + `KUBE_DEBUG_MODEL=1`，fake 集群）：会话 `conv_3bab82e957a5624f` 问“demo 命名空间下有哪些 Pod”，mock 收到 2 次请求，第 2 次数组里是 `list_pods {"namespace":"demo"}` 的工具调用（没猜 Deployment），回复 `structured.pods` 是 1 行完整行（`demo-api-7d9f6c4b5-xk2v9`，`ready 1/1`，`restarts 5`，`lastTerminationReason OOMKilled`）；会话 `conv_0599ae0cbc1d38ef` 问“demo-api 下有几个 Pod”，调的是 `list_workload_pods`，`structured.workloadPods` 是同样 1 行完整行，`pods` 那个 key 不存在。前端 `buildBlocks` 用临时 node 脚本验过 7 项全过：三个来源标题区分正确、同轮三个来源出三张表、旧的字符串数组不再产出空行、单个 Pod 回退仍在。
+
+### 未实现（仍未做）
+
+- 执行动作的重设计（修复提议怎么落地、按钮、审批流）：下一步再规划，不在这版
+- 锚定问题只做了一半：追问和替换原文这两个推手拿掉了，但历史里上一轮诊断全文仍会进模型上下文，模型仍可能顺着上一轮答
+- 对话历史摘要（现在是截断，TODO 在代码和 README 里写清了）
+- 云端部署、鉴权、监控
+- 白名单做成可配置（用户说复杂先不做）
+
 ## v0.13.0（2026-11-21）
 
 v0.13.0 只做用户定的第一步：拿掉追问（`askedForStructured`）这个 hack。之前确认的锚定 bug 有两个推手，一是 `runReal` 里不分问题类型、每轮都追问一次诊断报告（往消息数组最后追加一条假 user 消息“如果你认为需要修复，请调用 submit_diagnosis……”），二是 `formatReportReply` 把模型第一轮的原文整个替换掉。用户明确说不要改成 Markdown、执行动作的重设计下一步再规划，所以这版只拿掉追问、保住模型文字，修复提议怎么落地、按钮、审批流一个字都不动。

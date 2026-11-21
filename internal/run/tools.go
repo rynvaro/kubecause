@@ -10,6 +10,8 @@ import (
 	"kubecause/internal/agent"
 	"kubecause/internal/knowledge"
 	"kubecause/internal/kube"
+
+	corev1 "k8s.io/api/core/v1"
 )
 
 // ToolsAdapter 把 agent.Tools 的 6 个工具分发到 kube 客户端和知识库。
@@ -57,8 +59,46 @@ func (t *ToolsAdapter) GetPod(ctx context.Context, namespace, name string) (agen
 	return agent.ToolOutput{Summary: summary, Data: data}, nil
 }
 
+// podRowFromPod 把一个 corev1.Pod 转成前端表格用的结构化行：
+// Pod 名、命名空间、是否系统、状态、就绪、重启次数、归属 Deployment、
+// 终止/等待原因。ListProblemPods、ListWorkloadPods、ListPods 三个工具
+// 共用这一份形状，pods 数组里永远是行对象，不再有时是名字字符串、
+// 有时是行对象——前端不用再猜，空表那类 bug 就没有藏身的地方。
+// 第二个返回值是这个 Pod 是否有问题（非 Running、未 Ready、
+// 重启过、有等待原因），ListProblemPods 用它过滤，别的工具忽略。
+func podRowFromPod(p corev1.Pod) (map[string]any, bool) {
+	restarts := int32(0)
+	ready := 0
+	total := 0
+	lastReason := ""
+	waitingReason := ""
+	for _, cs := range p.Status.ContainerStatuses {
+		total++
+		restarts += cs.RestartCount
+		if cs.Ready {
+			ready++
+		}
+		if cs.LastTerminationState.Terminated != nil && cs.LastTerminationState.Terminated.Reason != "" {
+			lastReason = cs.LastTerminationState.Terminated.Reason
+		}
+		if cs.State.Waiting != nil && cs.State.Waiting.Reason != "" {
+			waitingReason = cs.State.Waiting.Reason
+		}
+	}
+	problem := p.Status.Phase != "Running" || ready < total || restarts > 0 || waitingReason != ""
+	return map[string]any{
+		"name": p.Name, "namespace": p.Namespace, "isSystem": isSystemNamespace(p.Namespace),
+		"phase": string(p.Status.Phase),
+		"ready": fmt.Sprintf("%d/%d", ready, total), "restarts": restarts,
+		"deployment": kube.PodDeploymentName(&p), "lastTerminationReason": lastReason,
+		"waitingReason": waitingReason,
+	}, problem
+}
+
 // ListWorkloadPods 按 Deployment 的 selector 列出所属 Pod，
 // 并核对 Pod 确实属于这个 Deployment，防止模型把别的 Pod 混进来。
+// 返回的是和 ListProblemPods 同形的完整行（不只是名字），
+// 前端直接渲染成表格。
 func (t *ToolsAdapter) ListWorkloadPods(ctx context.Context, namespace, deployment string) (agent.ToolOutput, error) {
 	dep, err := t.Kube.GetDeployment(ctx, namespace, deployment)
 	if err != nil {
@@ -69,13 +109,16 @@ func (t *ToolsAdapter) ListWorkloadPods(ctx context.Context, namespace, deployme
 		if listErr != nil || len(pods) == 0 {
 			return agent.ToolOutput{}, err
 		}
+		rows := make([]map[string]any, 0, len(pods))
 		names := make([]string, 0, len(pods))
 		for _, p := range pods {
+			row, _ := podRowFromPod(p)
+			rows = append(rows, row)
 			names = append(names, p.Name)
 		}
 		return agent.ToolOutput{
 			Summary: fmt.Sprintf("Deployment %s 查不到（%v），但按标签 app=%s 找到 %d 个 Pod：%s", deployment, err, deployment, len(names), strings.Join(names, ", ")),
-			Data:    map[string]any{"deployment": deployment, "pods": names, "count": len(names), "deploymentNotFound": true},
+			Data:    map[string]any{"deployment": deployment, "namespace": namespace, "pods": rows, "count": len(rows), "deploymentNotFound": true},
 		}, nil
 	}
 	labels := map[string]string{}
@@ -86,14 +129,44 @@ func (t *ToolsAdapter) ListWorkloadPods(ctx context.Context, namespace, deployme
 	if err != nil {
 		return agent.ToolOutput{}, err
 	}
+	rows := make([]map[string]any, 0, len(pods))
 	names := make([]string, 0, len(pods))
 	for _, p := range pods {
+		row, _ := podRowFromPod(p)
+		rows = append(rows, row)
 		names = append(names, p.Name)
 	}
-	data := map[string]any{"deployment": deployment, "pods": names, "count": len(names)}
+	data := map[string]any{"deployment": deployment, "namespace": namespace, "pods": rows, "count": len(rows)}
 	return agent.ToolOutput{
 		Summary: fmt.Sprintf("Deployment %s 下有 %d 个 Pod：%s", deployment, len(names), strings.Join(names, ", ")),
 		Data:    data,
+	}, nil
+}
+
+// ListPods 列出某命名空间下全部 Pod（不限于有问题的）：
+// 用户问“这个命名空间下有哪些 Pod”时用的就是它，不用先猜 Deployment。
+// 每条是和 ListProblemPods 同形的完整行，前端直接渲染成表格。
+// namespace 为空表示全部命名空间。
+func (t *ToolsAdapter) ListPods(ctx context.Context, namespace string) (agent.ToolOutput, error) {
+	if err := validateDiscoveryNamespace(namespace); err != nil {
+		return agent.ToolOutput{}, err
+	}
+	pods, err := t.Kube.ListPods(ctx, namespace)
+	if err != nil {
+		return agent.ToolOutput{}, err
+	}
+	rows := make([]map[string]any, 0, len(pods))
+	for _, p := range pods {
+		row, _ := podRowFromPod(p)
+		rows = append(rows, row)
+	}
+	scope := "全部命名空间"
+	if namespace != "" {
+		scope = namespace
+	}
+	return agent.ToolOutput{
+		Summary: fmt.Sprintf("%s下有 %d 个 Pod", scope, len(rows)),
+		Data:    map[string]any{"namespace": namespace, "pods": rows, "count": len(rows)},
 	}, nil
 }
 
@@ -308,35 +381,11 @@ func (t *ToolsAdapter) ListProblemPods(ctx context.Context, namespace string) (a
 	}
 	rows := make([]map[string]any, 0)
 	for _, p := range pods {
-		restarts := int32(0)
-		ready := 0
-		total := 0
-		lastReason := ""
-		waitingReason := ""
-		for _, cs := range p.Status.ContainerStatuses {
-			total++
-			restarts += cs.RestartCount
-			if cs.Ready {
-				ready++
-			}
-			if cs.LastTerminationState.Terminated != nil && cs.LastTerminationState.Terminated.Reason != "" {
-				lastReason = cs.LastTerminationState.Terminated.Reason
-			}
-			if cs.State.Waiting != nil && cs.State.Waiting.Reason != "" {
-				waitingReason = cs.State.Waiting.Reason
-			}
-		}
-		problem := p.Status.Phase != "Running" || ready < total || restarts > 0 || waitingReason != ""
+		row, problem := podRowFromPod(p)
 		if !problem {
 			continue
 		}
-		rows = append(rows, map[string]any{
-			"name": p.Name, "namespace": p.Namespace, "isSystem": isSystemNamespace(p.Namespace),
-			"phase": string(p.Status.Phase),
-			"ready": fmt.Sprintf("%d/%d", ready, total), "restarts": restarts,
-			"deployment": kube.PodDeploymentName(&p), "lastTerminationReason": lastReason,
-			"waitingReason": waitingReason,
-		})
+		rows = append(rows, row)
 	}
 	scope := "全部命名空间"
 	if namespace != "" {

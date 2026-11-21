@@ -308,6 +308,14 @@ function asPods(v: unknown): PodRow[] | null {
   if (!v || typeof v !== 'object') return null
   const o = v as { pods?: unknown }
   if (!Array.isArray(o.pods)) return null
+  // 每个元素必须是带字符串 name 的对象：以前这里只认数组，
+  // list_workload_pods 的名字字符串数组也通过了，
+  // 前端拿字符串当 PodRow 渲，r.name、r.namespace 全是 undefined，
+  // 标题栏个数对、行里全空。现在形状不对直接不认，
+  // 宁可不渲染这块，也不要再渲染一排空单元格。
+  for (const p of o.pods) {
+    if (!p || typeof p !== 'object' || typeof (p as PodRow).name !== 'string') return null
+  }
   return o.pods as PodRow[]
 }
 
@@ -343,13 +351,41 @@ export function buildBlocks(structured: Record<string, unknown> | null | undefin
   if (structured.overview && typeof structured.overview === 'object') {
     blocks.push({ kind: 'overview', title: '集群总览', data: structured.overview })
   }
-  const podData = (structured.problemPods ?? structured.pods) as unknown
-  const pods = asPods(podData)
-  if (pods) {
-    blocks.push({ kind: 'podList', title: '有问题的 Pod', data: { pods } })
-  } else if (structured.pod && typeof structured.pod === 'object') {
+  // Pod 表格有三个来源，各走各的 key、标题各不相同：
+  // problemPods 是有问题的 Pod，pods 是 list_pods 列的全部 Pod，
+  // workloadPods 是某 Deployment 下的 Pod。以前 problemPods 和 pods
+  // 撞在一个 ?? 里，而 pods 那份一度是名字字符串数组，
+  // asPods 只认数组不认元素形状，渲出来就是一排空单元格。
+  // 现在三个来源都渲染（同轮调了两个就出两张表），
+  // 形状不对的 asPods 直接不认，宁可不渲染也不渲空行。
+  let podBlockPushed = false
+  const pushPodList = (data: unknown, title: string, label: string) => {
+    const rows = asPods(data)
+    if (rows) {
+      blocks.push({ kind: 'podList', title, data: { pods: rows, label } })
+      podBlockPushed = true
+    }
+  }
+  pushPodList(structured.problemPods, '有问题的 Pod', '有问题 Pod')
+  const podsData = structured.pods as { namespace?: unknown } | null | undefined
+  const podsNs =
+    typeof podsData?.namespace === 'string' && podsData.namespace ? podsData.namespace : ''
+  pushPodList(
+    structured.pods,
+    podsNs ? `${podsNs} 的 Pod` : 'Pod 列表',
+    podsNs ? `${podsNs} 的 Pod` : 'Pod',
+  )
+  const wpData = structured.workloadPods as { deployment?: unknown } | null | undefined
+  const wpDep =
+    typeof wpData?.deployment === 'string' && wpData.deployment ? wpData.deployment : ''
+  pushPodList(
+    structured.workloadPods,
+    wpDep ? `${wpDep} 的 Pod` : 'Deployment 的 Pod',
+    wpDep ? `${wpDep} 的 Pod` : 'Deployment 的 Pod',
+  )
+  if (!podBlockPushed && structured.pod && typeof structured.pod === 'object') {
     // 单个 Pod（桩模型深挖路径）：包成一行表格，不再单独写一套展示。
-    blocks.push({ kind: 'podList', title: 'Pod', data: { pods: [structured.pod as PodRow] } })
+    blocks.push({ kind: 'podList', title: 'Pod', data: { pods: [structured.pod as PodRow], label: 'Pod' } })
   }
   const depData = structured.deployments as unknown
   const deps = asDeployments(depData)

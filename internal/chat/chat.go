@@ -291,6 +291,8 @@ func (s *Service) executeChatTool(ctx context.Context, call *agent.ToolCall) (ag
 		return s.Tools.ListDeployments(ctx, call.Args["namespace"])
 	case "list_problem_pods":
 		return s.Tools.ListProblemPods(ctx, call.Args["namespace"])
+	case "list_pods":
+		return s.Tools.ListPods(ctx, call.Args["namespace"])
 	case "get_cluster_overview":
 		return s.Tools.GetClusterOverview(ctx)
 	default:
@@ -300,7 +302,7 @@ func (s *Service) executeChatTool(ctx context.Context, call *agent.ToolCall) (ag
 
 func isDiscovery(name string) bool {
 	switch name {
-	case "list_namespaces", "list_deployments", "list_problem_pods", "get_cluster_overview":
+	case "list_namespaces", "list_deployments", "list_problem_pods", "list_pods", "get_cluster_overview":
 		return true
 	}
 	return false

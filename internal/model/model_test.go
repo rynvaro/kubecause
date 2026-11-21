@@ -211,8 +211,8 @@ func TestTruncateRunes(t *testing.T) {
 // 同时要求发现工具的描述讲清“不带 namespace 时查全部、带时只查那个”。
 func TestToolDescriptionsDescribeOnly(t *testing.T) {
 	defs := toolDefs()
-	if len(defs) != 11 {
-		t.Fatalf("工具表应有 11 个定义（10 个工具 + submit_diagnosis），得到 %d", len(defs))
+	if len(defs) != 12 {
+		t.Fatalf("工具表应有 12 个定义（11 个工具 + submit_diagnosis），得到 %d", len(defs))
 	}
 	banned := []string{"不要调", "不再需要", "不需要调", "不要查", "不要再调", "禁止调"}
 	for _, d := range defs {
@@ -248,6 +248,9 @@ func TestToolDescriptionsDescribeOnly(t *testing.T) {
 	}
 	if !strings.Contains(byName["list_problem_pods"], "全部命名空间") {
 		t.Fatalf("list_problem_pods 应讲清不带 namespace 时查全部命名空间，得到 %q", byName["list_problem_pods"])
+	}
+	if !strings.Contains(byName["list_pods"], "全部命名空间") {
+		t.Fatalf("list_pods 应讲清不带 namespace 时查全部命名空间，得到 %q", byName["list_pods"])
 	}
 	if !strings.Contains(byName["list_namespaces"], "只返回名字") {
 		t.Fatalf("list_namespaces 应讲清只返回名字列表，得到 %q", byName["list_namespaces"])

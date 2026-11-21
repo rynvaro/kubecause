@@ -1,6 +1,6 @@
 # KubeCause — Kubernetes 故障诊断 Agent
 
-当前版本：v0.13.0。更新记录见 [CHANGELOG.md](CHANGELOG.md)。
+当前版本：v0.14.0。更新记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 KubeCause 是一个 Kubernetes 故障诊断 Agent。用户选定 namespace 和 Pod 或 Deployment，描述故障现象，Agent 自主选择只读工具收集证据，检索排障手册，输出诊断结论和建议。演示环境支持人工审批后的变更：用一组通用 Patch 改指定 Deployment 的白名单字段（镜像、内存 limit/request、CPU limit/request、副本数），并验证变更后的运行状态；也可以在对话里直接创建一个新的 Deployment，同样走建议卡 → 人工审批 → 执行 → 验证 rollout 这条线。
 
@@ -11,7 +11,8 @@ KubeCause 是一个 Kubernetes 故障诊断 Agent。用户选定 namespace 和 P
 - **通用 Patch 修复**：修复建议是一组通用 Patch（`{op, path, value}`），只改白名单字段（镜像、内存/CPU 的 limit/request、副本数），不按故障类型分分支。人工审批后才执行，执行前 dry-run、核对 resourceVersion，执行后逐条读回确认，再做 rollout 验证。
 - **创建 Deployment**：对话里说“在 demo 空间下创建一个 Deployment，镜像 nginx:1.25”，Agent 先问缺的信息（命名空间、名字、镜像、副本数），问全了给一张创建建议卡，点“创建可审批的创建任务”后走同一套审批 → 执行 → 验证 rollout 的线。只创建 Deployment，不直接创建裸 Pod（Pod 挂了不会自动重建，也没有 rollout）；创建校验和 Patch 共用同一套安全思路（系统命名空间拒绝、镜像合法、副本数 1–10、内存/CPU 在上限内）。
 - **转换带目标**：建议卡上的转换按钮把这张卡的目标（namespace/kind/name）和 Patches 一起传给后端，Worker 直接拿建议校验、生成提案，不用重新诊断一遍。以前只传会话 id，后端去历史里猜目标，会猜错（demo-bad-image 的卡转出来却是 demo-api 的任务），重跑 8 步耗尽、置信度 low、没有提案。
-- **发现工具**：`list_namespaces`、`list_deployments`、`list_problem_pods`、`get_cluster_overview`，全部只读，结构化返回，前端渲染成卡片和表格。系统命名空间可查不可改。
+- **发现工具**：`list_namespaces`、`list_deployments`、`list_problem_pods`、`list_pods`、`get_cluster_overview`，全部只读，结构化返回，前端渲染成卡片和表格。系统命名空间可查不可改。问“这个命名空间下有哪些 Pod”时用 `list_pods` 直接列全部 Pod，不用先猜 Deployment；`list_problem_pods` 只列有问题的 Pod。
+- **Pod 行只有一种形状**：`list_problem_pods`、`list_pods`、`list_workload_pods` 三个工具返回的 pods 数组永远是完整行（名字、命名空间、状态、就绪、重启次数、归属 Deployment、终止/等待原因），前端按来源分三张表渲染（“有问题的 Pod”“demo 的 Pod”“demo-api 的 Pod”），不再把名字字符串数组当行对象渲出一排空单元格。
 - **配置中心**：`config.yaml` + 环境变量覆盖 + `GET/POST /api/config` 热加载，前端“设置”页能改，不用重启。`MODEL_API_KEY` 只从环境变量读，绝不进配置。
 - **离线评估**：`go run ./cmd/eval` 跑 OOM、镜像、探针三个用例，输出命中率、引用准确性、步数和耗时。
 - **工具调用只存一份（round_id 关联）**：一次工具调用在库里只存在 tool 消息里，每调一次一条；同一轮的用户 / tool / 助手消息共享一个 `round_` 开头的 roundID，助手消息不再抄一份 tool_calls，前端按 roundId 关联数“查了 N 个工具”，右侧活动面板只读 tool 消息，不用去重。以前助手消息里抄了一份，前端按“消息 id + 调用 id”去重认不出来，同一条调用显示两遍（耗时毫秒数完全相同）。老数据没有 round_id，读出来是空，前端回退到位置推导（上一条用户消息到本条助手消息之间的 tool 消息），再没有就读助手消息里存的老副本。

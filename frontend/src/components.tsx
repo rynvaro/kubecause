@@ -484,8 +484,11 @@ function ResultBlockView({ block, onConvert, converting }: { block: ResultBlock;
       summary = '集群状态总览'
       break
     case 'podList': {
-      const pods = (block.data as { pods?: PodRow[] }).pods ?? []
-      summary = `有问题 Pod ${pods.length} 个`
+      const d = block.data as { pods?: PodRow[]; label?: string }
+      const pods = d.pods ?? []
+      // 摘要里的叫法跟着标题走：有问题 Pod / demo 的 Pod / demo-api 的 Pod，
+      // 不再不管哪张表都写“有问题 Pod”。老数据没有 label 时回退到旧写法。
+      summary = d.label ? `${d.label} ${pods.length} 个` : `有问题 Pod ${pods.length} 个`
       body = <PodTable rows={pods} />
       break
     }

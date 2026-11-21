@@ -174,6 +174,35 @@ func (s *Service) runStub(ctx context.Context, conversationID, roundID, text str
 		return &Reply{Reply: reply.String(), ToolCalls: recs, Structured: structured, SuggestedRepair: sr}, nil
 	}
 
+	// 问“这个命名空间下有哪些 / 有几个 Pod”：直接列全部 Pod，
+	// 不用先猜 Deployment，也不用走“找问题 Pod 再深挖”的诊断流程。
+	// 问的是某一个 Deployment 下的 Pod 时也一样：直接列它下面的。
+	// v0.14.0 新加的 list_pods 就是为这类问题准备的，
+	// list_workload_pods 也改成返回完整行。
+	if isListPodsQuestion(text) && ns != "" {
+		if dep := deploymentMentionedInText(ctx, s, text, ns); dep != "" {
+			wp, err := call("list_workload_pods", map[string]string{"namespace": ns, "deployment": dep})
+			if err != nil {
+				return &Reply{Reply: "列 Pod 时出错：" + err.Error(), ToolCalls: recs, Structured: structured}, nil
+			}
+			structured["workloadPods"] = wp.Data
+			reply.WriteString(wp.Summary + "。")
+			return &Reply{Reply: reply.String(), ToolCalls: recs, Structured: structured}, nil
+		}
+		pods, err := call("list_pods", map[string]string{"namespace": ns})
+		if err != nil {
+			return &Reply{Reply: "列 Pod 时出错：" + err.Error(), ToolCalls: recs, Structured: structured}, nil
+		}
+		structured["pods"] = pods.Data
+		reply.WriteString(pods.Summary + "。")
+		if countOf(pods.Data) == 0 {
+			reply.WriteString("这个命名空间下没有 Pod。")
+		} else {
+			reply.WriteString("想看某个 Pod 是怎么回事，直接问我它的名字就行。")
+		}
+		return &Reply{Reply: reply.String(), ToolCalls: recs, Structured: structured}, nil
+	}
+
 	if isOverview {
 		ov, err := call("get_cluster_overview", map[string]string{})
 		if err == nil {
@@ -269,6 +298,20 @@ func (s *Service) runStub(ctx context.Context, conversationID, roundID, text str
 // ---------------------------------------------------------------------------
 // 创建意图（Slice 10，Stub 的确定性规则，真模型路径不走这里，见 real.go）
 // ---------------------------------------------------------------------------
+
+// isListPodsQuestion 判断用户是不是在问“某命名空间下有哪些 / 有几个 Pod”：
+// 问的是全部 Pod 的清单，不是“哪个 Pod 出了问题”，
+// 所以用 list_pods 直接列，不走问题 Pod 深挖那条路。
+// 提到具体 Deployment 名的也算（例如“demo-api 下有几个 Pod”），
+// 只不过那种走 list_workload_pods，分支里再分。
+func isListPodsQuestion(text string) bool {
+	if !strings.Contains(text, "Pod") && !strings.Contains(text, "pod") {
+		return false
+	}
+	return strings.Contains(text, "有哪些") || strings.Contains(text, "哪些") ||
+		strings.Contains(text, "有几个") || strings.Contains(text, "多少个") ||
+		strings.Contains(text, "几个") || strings.Contains(text, "列表")
+}
 
 // isCreateIntent 判断用户这轮是不是在说“创建 Deployment / Pod”：
 // 消息里要有“创建”，并且提到 Deployment、部署或 Pod。

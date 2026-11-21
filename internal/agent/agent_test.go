@@ -44,6 +44,9 @@ func (s *stubTools) ListDeployments(ctx context.Context, ns string) (ToolOutput,
 func (s *stubTools) ListProblemPods(ctx context.Context, ns string) (ToolOutput, error) {
 	return ToolOutput{Summary: "problem pods", Data: map[string]any{}}, nil
 }
+func (s *stubTools) ListPods(ctx context.Context, ns string) (ToolOutput, error) {
+	return ToolOutput{Summary: "pods", Data: map[string]any{}}, nil
+}
 func (s *stubTools) GetClusterOverview(ctx context.Context) (ToolOutput, error) {
 	return ToolOutput{Summary: "overview", Data: map[string]any{}}, nil
 }

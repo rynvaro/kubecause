@@ -113,15 +113,18 @@ func keywordFromHistory(in agent.ModelInput) string {
 }
 
 func discoverPodName(in agent.ModelInput) string {
-	// 先按结构化结果解析：list_workload_pods 的 ResultJSON 里有 pods 列表，
-	// 取第一个，不认具体名字，这样换一个 Deployment 也能工作。
+	// 先按结构化结果解析：list_workload_pods 的 ResultJSON 里有 pods 行列表，
+	// 每行是带 name 的对象，取第一行的名字，不认具体名字，
+	// 这样换一个 Deployment 也能工作。
 	for _, h := range in.History {
 		if h.ToolName == "list_workload_pods" && h.ResultJSON != "" {
 			var v struct {
-				Pods []string `json:"pods"`
+				Pods []struct {
+					Name string `json:"name"`
+				} `json:"pods"`
 			}
-			if err := json.Unmarshal([]byte(h.ResultJSON), &v); err == nil && len(v.Pods) > 0 {
-				return v.Pods[0]
+			if err := json.Unmarshal([]byte(h.ResultJSON), &v); err == nil && len(v.Pods) > 0 && v.Pods[0].Name != "" {
+				return v.Pods[0].Name
 			}
 		}
 	}
@@ -522,7 +525,7 @@ func toolDefs() []chatToolDef {
 	}
 	ns := map[string]any{"namespace": strParam("命名空间，必须和任务一致")}
 	return []chatToolDef{
-		def("list_workload_pods", "列出指定 Deployment 下的 Pod，返回 Pod 名字列表和数量；只返回名字，不返回每个 Pod 的状态、重启次数和事件，想看单个 Pod 的状态再调 get_pod", merge(ns, map[string]any{"deployment": strParam("Deployment 名称")}), []string{"namespace", "deployment"}),
+		def("list_workload_pods", "列出指定 Deployment 下的 Pod，每条带 Pod 名、命名空间、状态、就绪情况、重启次数、归属 Deployment 和终止/等待原因；只返回这个 Deployment 下的 Pod，整个命名空间的全部 Pod 由 list_pods 返回", merge(ns, map[string]any{"deployment": strParam("Deployment 名称")}), []string{"namespace", "deployment"}),
 		def("get_pod", "查询单个 Pod，返回它的状态（phase）、重启次数、上次终止原因、容器等待原因和归属 Deployment；只返回这一个 Pod 的信息", merge(ns, map[string]any{"pod": strParam("Pod 名称")}), []string{"namespace", "pod"}),
 		def("get_events", "查询和目标 Pod 或 Deployment 相关的 Events，返回最近 20 条，每条有原因、消息和关联对象；只返回事件，不返回 Pod 当前状态", merge(ns, map[string]any{"name": strParam("Pod 或 Deployment 名称")}), []string{"namespace", "name"}),
 		def("get_pod_logs", "读取指定容器的一段日志，返回截断后的日志文本（最多 100 行 / 64KB，超了会标注已截断）；previous 为 true 时读上一次容器的日志，否则读当前容器的日志", merge(ns, map[string]any{"pod": strParam("Pod 名称"), "container": strParam("容器名"), "previous": map[string]any{"type": "boolean", "description": "是否读上一次容器的日志"}}), []string{"namespace", "pod"}),
@@ -536,6 +539,7 @@ func toolDefs() []chatToolDef {
 		def("list_namespaces", "列出集群的全部命名空间，返回名字列表和总数（含系统命名空间，另有 systemNamespaces 子集）；只返回名字，不返回各命名空间下的 Pod 状态", map[string]any{}, []string{}),
 		def("list_deployments", "列出 Deployment 列表，每条带命名空间、副本数、就绪副本数、已更新和可用副本数；namespace 为空时返回全部命名空间的，指定 namespace 时只返回那个命名空间的；不返回 Pod 详情", map[string]any{"namespace": strParam("命名空间，为空表示全部命名空间，指定时只查那个命名空间")}, []string{}),
 		def("list_problem_pods", "列出有问题的 Pod（非 Running、未 Ready、重启过、有等待原因），每条带 Pod 名、命名空间、状态、就绪情况、重启次数、归属 Deployment 和终止/等待原因；namespace 为空时一次返回全部命名空间的有问题 Pod，指定 namespace 时只返回那个命名空间的", map[string]any{"namespace": strParam("命名空间，为空表示全部命名空间，指定时只查那个命名空间")}, []string{}),
+		def("list_pods", "列出某命名空间下全部 Pod（不限于有问题的），每条带 Pod 名、命名空间、状态、就绪情况、重启次数、归属 Deployment 和终止/等待原因；namespace 为空时一次返回全部命名空间的全部 Pod，指定 namespace 时只返回那个命名空间的", map[string]any{"namespace": strParam("命名空间，为空表示全部命名空间，指定时只查那个命名空间")}, []string{}),
 		def("get_cluster_overview", "一次返回全集群的汇总：节点数、命名空间数（含系统命名空间数）、Deployment 数、Pod 总数、有问题 Pod 数（含系统命名空间的有问题 Pod 数）、未完全就绪的 Deployment 数；只返回汇总数字，不返回具体的 Pod 或 Deployment 列表", map[string]any{}, []string{}),
 		def("submit_diagnosis", "提交最终诊断报告，证据 ID 只能引用已返回的工具结果里的 ID", map[string]any{
 			"facts":           map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "观测事实，每条来自工具结果"},

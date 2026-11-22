@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -25,11 +26,18 @@ type Server struct {
 	exec NodeExecutor
 }
 
-// NewServer 组装一个 MCP server，注册 4 个只读工具。
+// EmptyInput 是 node_list 的入参：不需要参数。
+type EmptyInput struct{}
+
+// NewServer 组装一个 MCP server，注册 5 个只读工具。
 // 工具描述只写返回什么和覆盖范围。
 func NewServer(exec NodeExecutor) *mcp.Server {
 	s := &Server{exec: exec}
 	server := mcp.NewServer(&mcp.Implementation{Name: "kubecause-linux", Version: "v0.14.0"}, nil)
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "node_list",
+		Description: "列出集群的全部节点，返回节点名和 Ready 状态；查节点磁盘、内存或日志之前，先用它拿到节点名。",
+	}, s.nodeList)
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "node_disk",
 		Description: "查看指定节点的磁盘用量：返回 chroot 进宿主机根目录后执行 df -h 的输出，每行一个挂载点，含总容量、已用、可用和使用率。",
@@ -47,6 +55,32 @@ func NewServer(exec NodeExecutor) *mcp.Server {
 		Description: "查看指定节点上 kubelet 最近的日志：返回 chroot 进宿主机根目录后执行 journalctl -u kubelet --no-pager 的输出，lines 指定行数，默认 100，上限 500。",
 	}, s.nodeLogs)
 	return server
+}
+
+// nodeList 列出节点：每行一个节点，“名字 Ready/NotReady”，没有节点时说清楚。
+func (s *Server) nodeList(ctx context.Context, _ *mcp.CallToolRequest, _ EmptyInput) (*mcp.CallToolResult, any, error) {
+	nodes, err := s.exec.ListNodes(ctx)
+	if err != nil {
+		res := &mcp.CallToolResult{}
+		res.SetError(fmt.Errorf("列出节点失败: %w", err))
+		return res, nil, nil
+	}
+	if len(nodes) == 0 {
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: "集群里没有节点"}},
+		}, nil, nil
+	}
+	var b strings.Builder
+	for _, n := range nodes {
+		status := "NotReady"
+		if n.Ready {
+			status = "Ready"
+		}
+		fmt.Fprintf(&b, "%s %s\n", n.Name, status)
+	}
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: strings.TrimRight(b.String(), "\n")}},
+	}, nil, nil
 }
 
 func (s *Server) nodeDisk(ctx context.Context, _ *mcp.CallToolRequest, in NodeInput) (*mcp.CallToolResult, any, error) {

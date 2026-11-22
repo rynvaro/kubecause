@@ -251,7 +251,9 @@ func (s *Service) runReal(ctx context.Context, conversationID, roundID, text str
 			tc.Args = map[string]string{}
 		}
 		if _, ok := tc.Args["namespace"]; !ok || tc.Args["namespace"] == "" {
-			if !isDiscovery(tc.Name) && tc.Name != "search_runbooks" && lastNS != "" {
+			// 节点工具不补 namespace：它们不带这个参数（查的是节点），
+			// 补了也是多余参数，Server 侧会直接忽略。
+			if !isDiscovery(tc.Name) && tc.Name != "search_runbooks" && !agent.IsNodeTool(tc.Name) && lastNS != "" {
 				tc.Args["namespace"] = lastNS
 			}
 		}

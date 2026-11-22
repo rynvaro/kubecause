@@ -28,6 +28,9 @@ type Worker struct {
 	// Repair 是修复执行器，Slice 3 才有；为 nil 时只做诊断，不执行修复。
 	// 这样 Slice 1/2 的调用方（NewWorker）不用改，测试也不用每次都配写客户端。
 	Repair *repair.Executor
+	// NodeTools 是 MCP 节点工具的调用口，main.go 在 MCP Client 接通后才填；
+	// 为 nil 时单次诊断里没有节点工具。
+	NodeTools agent.NodeTools
 	// PollInterval 是轮询间隔，Slice 1 用 500ms，演示时几乎立刻开始。
 	PollInterval time.Duration
 }
@@ -40,6 +43,12 @@ func NewWorker(s *store.Store, tools agent.Tools, m agent.Model) *Worker {
 // SetRepair 给 Worker 配上修复执行器，main.go 在组装写客户端后调用。
 func (w *Worker) SetRepair(e *repair.Executor) {
 	w.Repair = e
+}
+
+// SetNodeTools 给 Worker 配上 MCP 节点工具的调用口，
+// main.go 在 MCP Client 接通后调用；不调时单次诊断里没有节点工具。
+func (w *Worker) SetNodeTools(nt agent.NodeTools) {
+	w.NodeTools = nt
 }
 
 // StartupRecovery 在进程启动时调用：把上次崩掉时停在 running 的任务
@@ -144,7 +153,7 @@ func (w *Worker) execute(ctx context.Context, run *store.Run) error {
 	}
 	// 2. 组装 Agent，OnStep 把每一步写库。Seq 在写库时按已有最大序号 +1 算，
 	//    这样即使进程在两步之间崩掉，序号也不会断、不会重。
-	ag := &agent.Agent{Tools: w.Tools, Model: w.Model}
+	ag := &agent.Agent{Tools: w.Tools, Model: w.Model, MCP: w.NodeTools}
 	ag.OnStep = func(ctx context.Context, step *store.RunStep) error {
 		seq, err := w.Store.NextSeq(ctx, run.ID)
 		if err != nil {

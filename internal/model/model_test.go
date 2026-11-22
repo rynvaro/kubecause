@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"kubecause/internal/agent"
+	"kubecause/internal/mcpclient"
 	"kubecause/internal/store"
 )
 
@@ -257,5 +258,30 @@ func TestToolDescriptionsDescribeOnly(t *testing.T) {
 	}
 	if !strings.Contains(byName["list_deployments"], "不返回 Pod 详情") {
 		t.Fatalf("list_deployments 应讲清不返回 Pod 详情，得到 %q", byName["list_deployments"])
+	}
+}
+
+func TestRealExtraTools(t *testing.T) {
+	m := NewRealWithConfig(RealConfig{APIKey: "test-key", BaseURL: "http://example.com", ModelName: "test-model", HTTPClient: http.DefaultClient, Timeout: 5 * time.Second})
+	// 默认 12 个工具（11 个 k8s 工具 + submit_diagnosis）。
+	if got := len(m.toolDefs()); got != 12 {
+		t.Fatalf("默认工具表 = %d 个, want 12", got)
+	}
+	// MCP 发现的节点工具并进来，排在后面，原来的 12 个不动。
+	m.SetExtraTools([]mcpclient.ToolDef{
+		{Name: "node_list", Description: "列节点", Parameters: map[string]any{"type": "object", "properties": map[string]any{}}},
+		{Name: "node_disk", Description: "磁盘", Parameters: map[string]any{"type": "object", "properties": map[string]any{}}},
+	})
+	defs := m.toolDefs()
+	if len(defs) != 14 {
+		t.Fatalf("加了 2 个节点工具后工具表 = %d 个, want 14", len(defs))
+	}
+	if defs[12].Function.Name != "node_list" || defs[13].Function.Name != "node_disk" {
+		t.Errorf("节点工具没有排在后面: %v", defs[12:])
+	}
+	// 传空恢复成默认表——没有 MCP Client 的部署不受影响。
+	m.SetExtraTools(nil)
+	if got := len(m.toolDefs()); got != 12 {
+		t.Errorf("清空后工具表 = %d 个, want 12", got)
 	}
 }

@@ -18,11 +18,25 @@ import (
 	"strings"
 )
 
+// NodeInfo 是一个节点的一行摘要：名字和 Ready 状态。
+// node_list 只返回这两列，不返回节点详情——
+// 模型查节点工具之前只需要知道“有哪些节点、哪个能用”，
+// 详情（磁盘、内存、日志）由另外 4 个工具按节点名去查。
+type NodeInfo struct {
+	Name  string `json:"name"`
+	Ready bool   `json:"ready"`
+}
+
 // NodeExecutor 在指定节点上执行一条命令，返回合并后的 stdout/stderr。
 // command 是 exec 的 argv（不经过 shell），调用方必须传固定命令，
 // 绝不能把用户输入拼进 shell。
 type NodeExecutor interface {
 	ExecOnNode(ctx context.Context, node string, command []string) (string, error)
+	// ListNodes 列出集群的全部节点（名字 + Ready 状态），
+	// 给模型一个拿到节点名的渠道：KubeCause 的 k8s 工具
+	// （get_pod、list_pods、get_cluster_overview）都不返回节点名，
+	// 没有这个工具，模型连 node_disk 的 node 参数都填不出来。
+	ListNodes(ctx context.Context) ([]NodeInfo, error)
 }
 
 // nodeNameRe 是 Kubernetes 节点名的规则（DNS 子域名，小写字母、数字、-、.）：
@@ -115,6 +129,8 @@ type FakeExecutor struct {
 	Output string
 	// Err 是每次调用返回的错误，设置后 ExecOnNode 直接返回它。
 	Err error
+	// Nodes 是 ListNodes 返回的节点列表。
+	Nodes []NodeInfo
 	// Calls 记录每次调用的节点和命令。
 	Calls []FakeCall
 }
@@ -128,4 +144,12 @@ func (f *FakeExecutor) ExecOnNode(_ context.Context, node string, command []stri
 		return "", f.Err
 	}
 	return f.Output, nil
+}
+
+// ListNodes 返回预设的节点列表，不碰真实集群。
+func (f *FakeExecutor) ListNodes(_ context.Context) ([]NodeInfo, error) {
+	if f.Err != nil {
+		return nil, f.Err
+	}
+	return f.Nodes, nil
 }

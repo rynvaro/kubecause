@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"kubecause/internal/agent"
+	"kubecause/internal/mcpclient"
 )
 
 // Stub 是确定性桩模型。
@@ -416,6 +417,10 @@ func (c RealConfig) withDefaults() RealConfig {
 type Real struct {
 	mu  sync.RWMutex
 	cfg RealConfig
+	// extraTools 是从 MCP 发现的额外工具定义（节点工具）：
+	// 启动时 main.go 从 MCP Client 的 tools/list 结果转过来。
+	// 没有 MCP Client 时为空，工具表就是原来的 12 个。
+	extraTools []chatToolDef
 }
 
 // getCfg 返回当前配置的一份拷贝。
@@ -423,6 +428,45 @@ func (r *Real) getCfg() RealConfig {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.cfg
+}
+
+// SetExtraTools 把 MCP 发现的工具定义并进模型的工具表：
+// 调用方（main.go）在 MCP Client 接通后调一次，
+// 之后 Next / Chat 发给大模型的工具表就是原来的 12 个 + 这些。
+// 传空或不调时工具表不变——没有 MCP Client 的部署不受影响。
+func (r *Real) SetExtraTools(defs []mcpclient.ToolDef) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.extraTools = nil
+	for _, d := range defs {
+		params := d.Parameters
+		if params == nil {
+			params = map[string]any{"type": "object", "properties": map[string]any{}}
+		}
+		var cd chatToolDef
+		cd.Type = "function"
+		cd.Function.Name = d.Name
+		cd.Function.Description = d.Description
+		cd.Function.Parameters = params
+		r.extraTools = append(r.extraTools, cd)
+	}
+}
+
+// toolDefs 返回本次问模型时用的工具表：
+// 原来的 12 个 + MCP 发现的节点工具（有的话）。
+// 节点工具和 k8s 工具放一起，模型自己决定调不调，
+// 后端不替模型挑——该不该查节点由模型按证据判断。
+func (r *Real) toolDefs() []chatToolDef {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if len(r.extraTools) == 0 {
+		return toolDefs()
+	}
+	base := toolDefs()
+	out := make([]chatToolDef, 0, len(base)+len(r.extraTools))
+	out = append(out, base...)
+	out = append(out, r.extraTools...)
+	return out
 }
 
 // ApplyModelSettings 热更新模型的超时和温度（配置中心 POST 后调），
@@ -625,7 +669,7 @@ func (r *Real) Next(ctx context.Context, in agent.ModelInput) (agent.ModelStep, 
 		return agent.ModelStep{}, fmt.Errorf("真模型缺少 API Key，请设置 MODEL_API_KEY")
 	}
 	msgs := buildRealMessages(in)
-	resp, err := r.callWithRetry(ctx, msgs, toolDefs())
+	resp, err := r.callWithRetry(ctx, msgs, r.toolDefs())
 	if err != nil {
 		return agent.ModelStep{}, err
 	}
@@ -971,7 +1015,7 @@ func (r *Real) Chat(ctx context.Context, msgs []ChatMessage) (ChatStep, error) {
 		}
 		internal = append(internal, cm)
 	}
-	resp, err := r.callWithRetry(ctx, internal, toolDefs())
+	resp, err := r.callWithRetry(ctx, internal, r.toolDefs())
 	if err != nil {
 		return ChatStep{}, err
 	}

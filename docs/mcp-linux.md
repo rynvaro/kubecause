@@ -4,14 +4,19 @@
 和 KubeCause 主程序（Kubernetes 故障诊断 Agent）分开。
 只做一件事：让模型能查 Linux 节点的磁盘、内存、进程和 kubelet 日志。
 
-## 4 个工具（全部只读）
+## 5 个工具（全部只读）
 
 | 工具 | 作用 | 参数 |
 | --- | --- | --- |
+| `node_list` | 列出集群的全部节点（节点名 + Ready 状态） | 无 |
 | `node_disk` | 节点磁盘用量（`df -h`） | `node`（必填，节点名） |
 | `node_memory` | 节点内存用量（`free -h`） | `node`（必填） |
 | `node_processes` | 按内存占用排序的进程列表（`ps aux --sort=-%mem`），只返回前 20 行 | `node`（必填） |
 | `node_logs` | kubelet 最近的日志（`journalctl -u kubelet --no-pager`） | `node`（必填）、`lines`（可选，默认 100，上限 500） |
+
+`node_list` 是给模型拿节点名的：KubeCause 的 k8s 工具都不返回节点名，
+没有它，模型连 `node_disk` 的 `node` 参数都填不出来。
+查节点磁盘、内存或日志之前，先调 `node_list` 拿节点名。
 
 每个工具只对应一条固定命令，绝不给任意 shell；
 节点名按 Kubernetes 名字规则校验，带 shell 元字符的直接拒绝。
@@ -109,7 +114,10 @@ go build -o mcp-server ./cmd/mcp-server
 npx @modelcontextprotocol/inspector --cli \
   -e KUBECONFIG=$HOME/.kube/config \
   ./mcp-server --method tools/list
-# 应该列出 4 个工具；然后逐个调一次（节点名换成 kind 的节点，一般是 kind-control-plane）：
+# 应该列出 5 个工具；先调 node_list 拿节点名，再逐个调一次（节点名换成 kind 的节点，一般是 kind-control-plane）：
+npx @modelcontextprotocol/inspector --cli \
+  -e KUBECONFIG=$HOME/.kube/config \
+  ./mcp-server --method tools/call --tool-name node_list
 npx @modelcontextprotocol/inspector --cli \
   -e KUBECONFIG=$HOME/.kube/config \
   ./mcp-server --method tools/call --tool-name node_disk --tool-arg node=kind-control-plane

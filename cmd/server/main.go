@@ -15,6 +15,10 @@
 //	KUBE_DEBUG_MODEL=1      调试模式：对话里每次发给模型的完整请求
 //	                        和模型返回打到服务端 stdout；默认关闭，
 //	                        页面上没有任何调试痕迹
+//	MCP_SERVER_BIN          MCP 节点工具的 Server 二进制路径，默认 ./mcp-server；
+//	                        只在真集群模式（KUBE_MODE=kubeconfig/kind）下尝试拉起，
+//	                        拉不起来只记警告、节点工具不可用，诊断照常跑
+//	MCP_NODE_TOOLS=0        关掉 MCP 节点工具，不拉 mcp-server 子进程
 //	DB_PATH                 SQLite 文件路径，默认 ./kubecause.db
 //	ADDR                    监听地址，默认 :8080
 package main
@@ -37,6 +41,7 @@ import (
 	"kubecause/internal/config"
 	"kubecause/internal/knowledge"
 	"kubecause/internal/kube"
+	"kubecause/internal/mcpclient"
 	"kubecause/internal/model"
 	"kubecause/internal/repair"
 	"kubecause/internal/run"
@@ -234,6 +239,31 @@ func main() {
 	chatSvc.DebugModel = os.Getenv("KUBE_DEBUG_MODEL") == "1"
 	if chatSvc.DebugModel {
 		log.Printf("模型请求调试已开启（KUBE_DEBUG_MODEL=1）：每次调模型的完整请求和返回都会打到 stdout")
+	}
+
+	// 5b. MCP 节点工具（mcp-client）：把 mcp-server 当子进程拉起来，
+	// 走 stdio 用 MCP 协议发现它的工具，并进模型的工具表和分发。
+	// 只在真集群模式（KUBE_MODE=kubeconfig/kind）下尝试：
+	// fake 模式没有真实集群，节点工具就算接通也是查 KUBECONFIG 里的真集群，
+	// 和其他 fake 数据对不上，反而误导模型。
+	// MCP_NODE_TOOLS=0 可以直接关掉。
+	// 接通失败只记警告：节点工具不可用，其他诊断照常跑，
+	// 主流程绝不因此挂掉。
+	if kubeMode != "fake" && env("MCP_NODE_TOOLS", "1") != "0" {
+		bin := env("MCP_SERVER_BIN", "./mcp-server")
+		mc, err := mcpclient.Start(ctx, bin)
+		if err != nil {
+			log.Printf("警告：MCP 节点工具不可用（%v），诊断继续，不影响其他工具；想关掉这个警告可以设 MCP_NODE_TOOLS=0", err)
+		} else {
+			defer mc.Close()
+			log.Printf("MCP 节点工具已接通（%s）：%v", bin, mc.Names())
+			if realModel != nil {
+				realModel.SetExtraTools(mc.ToolDefs())
+			}
+			agent.RegisterNodeTools(mc.Names())
+			worker.SetNodeTools(mc)
+			chatSvc.MCP = mc
+		}
 	}
 
 	// 配置中心应用到各组件（Slice 8）：对话步数、任务默认值、

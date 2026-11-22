@@ -237,6 +237,11 @@ func main() {
 	// 对话里每次发给模型的完整请求和模型返回打到服务端 stdout；
 	// 默认关闭，API 回复里不含调试数据，前端没有任何调试痕迹。
 	chatSvc.DebugModel = os.Getenv("KUBE_DEBUG_MODEL") == "1"
+	if realModel != nil {
+		// 真模型自己的调试日志（报告解析失败的字段与片段）和对话的
+		// 请求/返回日志用同一个开关。
+		realModel.SetDebug(chatSvc.DebugModel)
+	}
 	if chatSvc.DebugModel {
 		log.Printf("模型请求调试已开启（KUBE_DEBUG_MODEL=1）：每次调模型的完整请求和返回都会打到 stdout")
 	}

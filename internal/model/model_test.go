@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -396,5 +398,368 @@ func TestRealNamespaceBackfillOnlyForBuiltinTools(t *testing.T) {
 	}
 	if _, ok := byName["list_namespaces"]["namespace"]; ok {
 		t.Fatalf("list_namespaces 的 schema 没有 namespace，不应补，得到 %+v", byName["list_namespaces"])
+	}
+}
+
+// scriptedOpenAI 按调用次数顺序返回写好的响应体，并把每次的请求体记下来。
+// responses[i] 是第 i+1 次调用的返回；调用次数超过表长时返回最后一项。
+// 用来验证真模型路径在“第一次返回坏报告、第二次纠正”这类剧本下的行为。
+func scriptedOpenAI(t *testing.T, responses []string, calls *int) (*httptest.Server, *[]string) {
+	t.Helper()
+	var bodies []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*calls++
+		if r.Header.Get("Authorization") != "Bearer test-key" {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"message":"bad key"}}`))
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(body))
+		idx := *calls - 1
+		if idx >= len(responses) {
+			idx = len(responses) - 1
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, responses[idx])
+	}))
+	return srv, &bodies
+}
+
+func newTestReal(t *testing.T, srv *httptest.Server) *Real {
+	t.Helper()
+	return NewRealWithConfig(RealConfig{APIKey: "test-key", BaseURL: srv.URL, ModelName: "test-model", HTTPClient: srv.Client(), Timeout: 5 * time.Second})
+}
+
+// requestMessage 是 chat completions 请求体里的一条消息（测试用）。
+type requestMessage struct {
+	Role       string `json:"role"`
+	Content    string `json:"content,omitempty"`
+	ToolCalls  []struct {
+		ID       string `json:"id"`
+		Function struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		} `json:"function"`
+	} `json:"tool_calls,omitempty"`
+	ToolCallID string `json:"tool_call_id,omitempty"`
+}
+
+// requestMessages 把一次 chat completions 请求体里的 messages 数组解出来，
+// 用来断言纠错时追加的是否正好是一对 assistant+tool 消息。
+func requestMessages(t *testing.T, body string) []requestMessage {
+	t.Helper()
+	var req struct {
+		Messages []requestMessage `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(body), &req); err != nil {
+		t.Fatalf("请求体解析失败: %v", err)
+	}
+	return req.Messages
+}
+
+func submitDiagnosisResp(callID, args string) string {
+	return `{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"` + callID + `","type":"function","function":{"name":"submit_diagnosis","arguments":` + strconv.Quote(args) + `}}]}}]}`
+}
+
+// submitDiagnosisRespWithContent 和 submitDiagnosisResp 一样，
+// 只是模型同时还返回了一段文字（content）。
+func submitDiagnosisRespWithContent(callID, content, args string) string {
+	return `{"choices":[{"message":{"role":"assistant","content":` + strconv.Quote(content) + `,"tool_calls":[{"id":"` + callID + `","type":"function","function":{"name":"submit_diagnosis","arguments":` + strconv.Quote(args) + `}}]}}]}`
+}
+
+func TestParseDiagnosisArgsStringFacts(t *testing.T) {
+	// issue #13 的最小复现：facts 是字符串而不是数组。
+	// 截图里的报错就是这一句，修好后应兼容成单元素数组、不再报错。
+	rep, err := parseDiagnosisArgs(`{"facts":"节点状态正常","cause":"节点状态正常，Pod 未受节点影响","evidenceIds":[],"confidence":"low"}`)
+	if err != nil {
+		t.Fatalf("facts 为字符串时应兼容，不应报错: %v", err)
+	}
+	if len(rep.Facts) != 1 || rep.Facts[0] != "节点状态正常" {
+		t.Fatalf("facts 应兼容成 [\"节点状态正常\"]，得到 %+v", rep.Facts)
+	}
+	if rep.Confidence != "low" {
+		t.Fatalf("confidence 应保持 low，得到 %q", rep.Confidence)
+	}
+	// 其他展示用数组字段同样兼容单个字符串。
+	rep, err = parseDiagnosisArgs(`{"facts":["a"],"cause":"c","evidenceIds":"ev-1","recommendations":"调高 limit","openQuestions":"还有疑问吗","confidence":"medium"}`)
+	if err != nil {
+		t.Fatalf("其他数组字段为字符串时也应兼容: %v", err)
+	}
+	if len(rep.EvidenceIDs) != 1 || rep.EvidenceIDs[0] != "ev-1" {
+		t.Fatalf("evidenceIds 应兼容成 [\"ev-1\"]，得到 %+v", rep.EvidenceIDs)
+	}
+	if len(rep.Recommendations) != 1 || rep.Recommendations[0] != "调高 limit" {
+		t.Fatalf("recommendations 应兼容成单元素数组，得到 %+v", rep.Recommendations)
+	}
+	if len(rep.OpenQuestions) != 1 || rep.OpenQuestions[0] != "还有疑问吗" {
+		t.Fatalf("openQuestions 应兼容成单元素数组，得到 %+v", rep.OpenQuestions)
+	}
+}
+
+func TestParseDiagnosisArgsIncompatibleTypes(t *testing.T) {
+	// 完全不兼容的类型：必须返回指明字段名的错误，不要一律 fmt.Sprint 糊过去。
+	cases := []struct {
+		args string
+		want string
+	}{
+		{`{"facts":123,"cause":"c"}`, "facts 应为字符串数组，收到 number"},
+		{`{"facts":{"a":"b"},"cause":"c"}`, "facts 应为字符串数组，收到 object"},
+		{`{"facts":true,"cause":"c"}`, "facts 应为字符串数组，收到 boolean"},
+		{`{"facts":["a",5],"cause":"c"}`, "facts 数组元素应为字符串"},
+		{`{"facts":["a"],"cause":123}`, "cause 应为字符串，收到 number"},
+		{`{"facts":["a"],"cause":"c","confidence":1}`, "confidence 应为字符串，收到 number"},
+	}
+	for _, c := range cases {
+		_, err := parseDiagnosisArgs(c.args)
+		if err == nil {
+			t.Fatalf("args=%s 应报错", c.args)
+		}
+		if !strings.Contains(err.Error(), c.want) {
+			t.Fatalf("args=%s 错误应指明字段，want 包含 %q，得到 %v", c.args, c.want, err)
+		}
+	}
+}
+
+func TestParseDiagnosisArgsDropsInvalidRepair(t *testing.T) {
+	// suggestedRepair / suggestedCreation 严格校验：解析失败时丢弃该建议，
+	// 报告其余部分照常返回，绝不生成审批卡片。
+	rep, err := parseDiagnosisArgs(`{"facts":["a"],"cause":"c","confidence":"medium","suggestedRepair":"not-an-object"}`)
+	if err != nil {
+		t.Fatalf("修复建议非法时报告本身仍应返回: %v", err)
+	}
+	if rep.SuggestedRepair != nil {
+		t.Fatalf("非法的修复建议应被丢弃，得到 %+v", rep.SuggestedRepair)
+	}
+	if len(rep.OpenQuestions) == 0 || !strings.Contains(strings.Join(rep.OpenQuestions, ""), "修复建议格式无效") {
+		t.Fatalf("丢弃修复建议时应在 openQuestions 里说明，得到 %+v", rep.OpenQuestions)
+	}
+	rep, err = parseDiagnosisArgs(`{"facts":["a"],"cause":"c","confidence":"medium","suggestedCreation":{"namespace":"demo","name":"x","image":"nginx","replicas":"3"}}`)
+	if err != nil {
+		t.Fatalf("创建建议非法时报告本身仍应返回: %v", err)
+	}
+	if rep.SuggestedCreation != nil {
+		t.Fatalf("非法的创建建议应被丢弃，得到 %+v", rep.SuggestedCreation)
+	}
+	// 合法的修复建议不受影响：照常保留。
+	rep, err = parseDiagnosisArgs(`{"facts":["a"],"cause":"c","confidence":"medium","suggestedRepair":{"namespace":"demo","deployment":"demo-api","container":"demo-api","reason":"内存不足","patches":[{"op":"replace","path":"/spec/template/spec/containers/0/resources/limits/memory","value":"256Mi"}]}}`)
+	if err != nil {
+		t.Fatalf("合法的修复建议应能解析: %v", err)
+	}
+	if rep.SuggestedRepair == nil || len(rep.SuggestedRepair.Patches) != 1 {
+		t.Fatalf("合法的修复建议应保留，得到 %+v", rep.SuggestedRepair)
+	}
+}
+
+func TestParseDiagnosisArgsDropsIncompleteSuggestions(t *testing.T) {
+	// 结构不完整的修复/创建建议也要丢弃，不生成卡片：
+	// 只验 JSON 能否解码时，空对象 {} 会漏网（全零值也算解码成功）。
+	dropRepair := func(args string) *agent.Report {
+		t.Helper()
+		rep, err := parseDiagnosisArgs(args)
+		if err != nil {
+			t.Fatalf("结构不完整时报告本身仍应返回: %v", err)
+		}
+		if rep.SuggestedRepair != nil {
+			t.Fatalf("不完整的修复建议应被丢弃，得到 %+v", rep.SuggestedRepair)
+		}
+		if len(rep.OpenQuestions) == 0 || !strings.Contains(strings.Join(rep.OpenQuestions, ""), "修复建议不完整") {
+			t.Fatalf("丢弃修复建议时应在 openQuestions 里说明不完整，得到 %+v", rep.OpenQuestions)
+		}
+		return rep
+	}
+	// 空对象：没有 Patches，也没有可转的旧字段。
+	dropRepair(`{"facts":["a"],"cause":"c","confidence":"medium","suggestedRepair":{}}`)
+	// Patches 为空数组。
+	dropRepair(`{"facts":["a"],"cause":"c","confidence":"medium","suggestedRepair":{"namespace":"demo","deployment":"demo-api","patches":[]}}`)
+	// Patch 缺 path。
+	dropRepair(`{"facts":["a"],"cause":"c","confidence":"medium","suggestedRepair":{"namespace":"demo","deployment":"demo-api","patches":[{"op":"replace","value":"256Mi"}]}}`)
+	// Patch 的 value 为 null。
+	dropRepair(`{"facts":["a"],"cause":"c","confidence":"medium","suggestedRepair":{"namespace":"demo","deployment":"demo-api","patches":[{"op":"replace","path":"/spec/template/spec/containers/0/resources/limits/memory","value":null}]}}`)
+	// Patch 的 op 不是 replace。
+	dropRepair(`{"facts":["a"],"cause":"c","confidence":"medium","suggestedRepair":{"namespace":"demo","deployment":"demo-api","patches":[{"op":"add","path":"/spec/replicas","value":3}]}}`)
+	// 目标字段缺失但 Patch 合法：namespace / deployment / container
+	// 能从任务目标、会话历史或第一个容器兜底，不算不合格，照常保留。
+	rep, err := parseDiagnosisArgs(`{"facts":["a"],"cause":"c","confidence":"medium","suggestedRepair":{"patches":[{"op":"replace","path":"/spec/replicas","value":3}]}}`)
+	if err != nil {
+		t.Fatalf("目标字段缺失但 Patch 合法时应能解析: %v", err)
+	}
+	if rep.SuggestedRepair == nil || len(rep.SuggestedRepair.Patches) != 1 {
+		t.Fatalf("目标字段可兜底的修复建议应保留，得到 %+v", rep.SuggestedRepair)
+	}
+	// 只含旧字段但能转成合法 Patch 的，Normalize 之后同样合格。
+	rep, err = parseDiagnosisArgs(`{"facts":["a"],"cause":"c","confidence":"medium","suggestedRepair":{"namespace":"demo","deployment":"demo-api","container":"demo-api","field":"memoryLimit","oldValue":"128Mi","newValue":"256Mi","reason":"内存不足"}}`)
+	if err != nil {
+		t.Fatalf("旧字段合法时应能解析: %v", err)
+	}
+	if rep.SuggestedRepair == nil || len(rep.SuggestedRepair.Patches) != 1 || rep.SuggestedRepair.Patches[0].Op != "replace" {
+		t.Fatalf("旧字段转成的 Patch 应保留，得到 %+v", rep.SuggestedRepair)
+	}
+	// 创建建议：缺 name / image 时丢弃，三字段齐全时保留，
+	// replicas 为 0 时下游默认按 1 处理，不算不合格。
+	dropCreation := func(args string) {
+		t.Helper()
+		rep, err := parseDiagnosisArgs(args)
+		if err != nil {
+			t.Fatalf("结构不完整时报告本身仍应返回: %v", err)
+		}
+		if rep.SuggestedCreation != nil {
+			t.Fatalf("不完整的创建建议应被丢弃，得到 %+v", rep.SuggestedCreation)
+		}
+		if len(rep.OpenQuestions) == 0 || !strings.Contains(strings.Join(rep.OpenQuestions, ""), "创建建议不完整") {
+			t.Fatalf("丢弃创建建议时应在 openQuestions 里说明不完整，得到 %+v", rep.OpenQuestions)
+		}
+	}
+	dropCreation(`{"facts":["a"],"cause":"c","confidence":"medium","suggestedCreation":{"namespace":"demo","image":"nginx"}}`)
+	dropCreation(`{"facts":["a"],"cause":"c","confidence":"medium","suggestedCreation":{"namespace":"demo","name":"web","replicas":2}}`)
+	rep, err = parseDiagnosisArgs(`{"facts":["a"],"cause":"c","confidence":"medium","suggestedCreation":{"namespace":"demo","name":"web","image":"nginx:1.25","replicas":0}}`)
+	if err != nil {
+		t.Fatalf("三字段齐全时应能解析: %v", err)
+	}
+	if rep.SuggestedCreation == nil || rep.SuggestedCreation.Name != "web" {
+		t.Fatalf("三字段齐全的创建建议应保留，得到 %+v", rep.SuggestedCreation)
+	}
+}
+
+func TestRealNextCorrectsMalformedDiagnosisOnce(t *testing.T) {
+	// 第一次交报告时 facts 是数字（完全不兼容），纠错一次后模型重交正确报告。
+	// 纠错只发生一次：总共 2 次模型请求；第 2 次请求的末尾正好是一对
+	// assistant（带失败的 tool_calls）+ tool（字段错误）消息，
+	// 没有追加任何假 user 消息。
+	bad := submitDiagnosisResp("call-1", `{"facts":123,"cause":"节点状态正常","evidenceIds":[],"confidence":"low"}`)
+	good := submitDiagnosisResp("call-2", `{"facts":["节点状态正常"],"cause":"节点状态正常","evidenceIds":["ev-1"],"confidence":"low"}`)
+	calls := 0
+	srv, bodies := scriptedOpenAI(t, []string{bad, good}, &calls)
+	defer srv.Close()
+	m := newTestReal(t, srv)
+	step, err := m.Next(context.Background(), testInput())
+	if err != nil {
+		t.Fatalf("纠错后应返回报告，不应报错: %v", err)
+	}
+	if !step.IsFinal || step.Report == nil {
+		t.Fatalf("纠错后应交最终报告，得到 %+v", step)
+	}
+	if len(step.Report.Facts) != 1 || step.Report.Facts[0] != "节点状态正常" {
+		t.Fatalf("重交的报告内容不对: %+v", step.Report)
+	}
+	if calls != 2 {
+		t.Fatalf("纠错应只多发 1 次请求，总共 2 次，得到 %d 次", calls)
+	}
+	msgs := requestMessages(t, (*bodies)[1])
+	if len(msgs) < 2 {
+		t.Fatalf("第 2 次请求应带纠错消息，得到 %+v", msgs)
+	}
+	// 末尾两条：assistant（带失败的 submit_diagnosis）+ tool（字段错误）。
+	assistantMsg, toolMsg := msgs[len(msgs)-2], msgs[len(msgs)-1]
+	if assistantMsg.Role != "assistant" || len(assistantMsg.ToolCalls) != 1 || assistantMsg.ToolCalls[0].Function.Name != "submit_diagnosis" {
+		t.Fatalf("纠错应追加 assistant + 失败的 submit_diagnosis，得到 %+v", assistantMsg)
+	}
+	if toolMsg.Role != "tool" || toolMsg.ToolCallID != "call-1" || !strings.Contains(toolMsg.Content, "facts 应为字符串数组，收到 number") {
+		t.Fatalf("纠错的 tool 消息应带字段错误，得到 %+v", toolMsg)
+	}
+	// 没有追加假 user 消息：纠错前后 user 角色的消息数不变
+	//（任务消息 + 证据消息都来自最初的 buildRealMessages，
+	// 纠错只追加了 assistant+tool）。
+	countUsers := func(msgs []requestMessage) int {
+		n := 0
+		for _, mm := range msgs {
+			if mm.Role == "user" {
+				n++
+			}
+		}
+		return n
+	}
+	if before, after := countUsers(requestMessages(t, (*bodies)[0])), countUsers(msgs); before != after {
+		t.Fatalf("纠错不应追加 user 消息，纠错前 %d 条、纠错后 %d 条", before, after)
+	}
+}
+
+func TestRealNextFallbackKeepsUnverifiedAnalysis(t *testing.T) {
+	// 两次都交坏报告且都附带文字：降级报告的 facts 里保留
+	// 最后一轮的文字，并标明未经结构化验证。
+	bad1 := submitDiagnosisRespWithContent("call-1", "初步看节点没什么问题。", `{"facts":123,"cause":"c","evidenceIds":[],"confidence":"low"}`)
+	bad2 := submitDiagnosisRespWithContent("call-2", "节点内存充足，未见异常。", `{"facts":{"a":"b"},"cause":"c","evidenceIds":[],"confidence":"low"}`)
+	calls := 0
+	srv, _ := scriptedOpenAI(t, []string{bad1, bad2}, &calls)
+	defer srv.Close()
+	m := newTestReal(t, srv)
+	step, err := m.Next(context.Background(), testInput())
+	if err != nil {
+		t.Fatalf("纠错失败后应降级为收敛报告，不应报错: %v", err)
+	}
+	if !step.IsFinal || step.Report == nil {
+		t.Fatalf("应返回低置信度收敛报告，得到 %+v", step)
+	}
+	if step.Report.Confidence != "low" {
+		t.Fatalf("降级报告置信度应为 low，得到 %q", step.Report.Confidence)
+	}
+	// facts[0] 是格式错误说明，[1] 是附带的未验证分析，其后才是证据摘要。
+	if len(step.Report.Facts) < 2 || !strings.Contains(step.Report.Facts[0], "格式有误") {
+		t.Fatalf("降级报告 facts 首条应说明格式错误，得到 %+v", step.Report.Facts)
+	}
+	if !strings.Contains(step.Report.Facts[1], "节点内存充足，未见异常。") || !strings.Contains(step.Report.Facts[1], "未经结构化验证") {
+		t.Fatalf("降级报告应保留最后一轮附带的文字并标注未经结构化验证，得到 %+v", step.Report.Facts)
+	}
+	if calls != 2 {
+		t.Fatalf("纠错只发生一次，总共 2 次请求，得到 %d 次", calls)
+	}
+}
+
+func TestRealNextStringFactsNeedsNoCorrection(t *testing.T) {
+	// issue #13 的最小示例直接走 Next：facts 是字符串，解析放宽后
+	// 一次就过，不触发纠错。
+	resp := submitDiagnosisResp("call-1", `{"facts":"节点状态正常","cause":"节点状态正常，Pod 未受节点影响","evidenceIds":[],"confidence":"low"}`)
+	calls := 0
+	srv, _ := scriptedOpenAI(t, []string{resp}, &calls)
+	defer srv.Close()
+	m := newTestReal(t, srv)
+	step, err := m.Next(context.Background(), testInput())
+	if err != nil {
+		t.Fatalf("facts 为字符串时应直接解析，不应报错: %v", err)
+	}
+	if !step.IsFinal || step.Report == nil {
+		t.Fatalf("应交最终报告，得到 %+v", step)
+	}
+	if len(step.Report.Facts) != 1 || step.Report.Facts[0] != "节点状态正常" {
+		t.Fatalf("facts 应为 [\"节点状态正常\"]，得到 %+v", step.Report.Facts)
+	}
+	if calls != 1 {
+		t.Fatalf("兼容值不应触发纠错，应只发 1 次请求，得到 %d 次", calls)
+	}
+}
+
+func TestRealNextFallsBackToLowConfidenceReport(t *testing.T) {
+	// 两次都交坏报告：纠错一次仍失败，降级为低置信度收敛报告，
+	// 不直接返回错误让整轮作废。
+	bad1 := submitDiagnosisResp("call-1", `{"facts":123,"cause":"c","evidenceIds":[],"confidence":"low"}`)
+	bad2 := submitDiagnosisResp("call-2", `{"facts":{"a":"b"},"cause":"c","evidenceIds":[],"confidence":"low"}`)
+	calls := 0
+	srv, _ := scriptedOpenAI(t, []string{bad1, bad2}, &calls)
+	defer srv.Close()
+	m := newTestReal(t, srv)
+	step, err := m.Next(context.Background(), testInput())
+	if err != nil {
+		t.Fatalf("纠错失败后应降级为收敛报告，不应报错: %v", err)
+	}
+	if !step.IsFinal || step.Report == nil {
+		t.Fatalf("应返回低置信度收敛报告，得到 %+v", step)
+	}
+	if step.Report.Confidence != "low" {
+		t.Fatalf("降级报告置信度应为 low，得到 %q", step.Report.Confidence)
+	}
+	if !strings.Contains(step.Report.Cause, "格式错误") {
+		t.Fatalf("降级报告应说明是格式错误，得到 %+v", step.Report)
+	}
+	found := false
+	for _, id := range step.Report.EvidenceIDs {
+		if id == "ev-1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("降级报告应带上已有证据 ID ev-1，得到 %+v", step.Report.EvidenceIDs)
+	}
+	if calls != 2 {
+		t.Fatalf("纠错只发生一次，总共 2 次请求，得到 %d 次", calls)
 	}
 }

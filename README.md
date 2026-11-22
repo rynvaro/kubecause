@@ -53,7 +53,7 @@ cd kubecause
 make run
 ```
 
-打开 **http://localhost:8080**，可以尝试：
+打开 [http://localhost:8080](http://localhost:8080)，可以尝试：
 
 ```text
 当前集群状态怎么样？

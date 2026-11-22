@@ -43,6 +43,10 @@ func mockOpenAI(t *testing.T, mode string, calls *int) *httptest.Server {
 			resp = `{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call-1","type":"function","function":{"name":"get_pod","arguments":"{\"namespace\":\"demo\",\"pod\":\"demo-api-7d9f6c4b5-xk2v9\"}"}}]}}]}`
 		case "diagnosis":
 			resp = `{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call-9","type":"function","function":{"name":"submit_diagnosis","arguments":"{\"facts\":[\"Pod 重启 5 次\"],\"cause\":\"容器内存限制过低，触发 OOMKilled\",\"evidenceIds\":[\"ev-1\"],\"recommendations\":[\"调高 limit\"],\"openQuestions\":[],\"confidence\":\"high\"}"}}]}}]}`
+		case "multicall":
+			resp = `{"choices":[{"message":{"role":"assistant","content":"先查 Pod 和事件。","tool_calls":[{"id":"call-1","type":"function","function":{"name":"get_pod","arguments":"{\"namespace\":\"demo\",\"pod\":\"demo-api-7d9f6c4b5-xk2v9\"}"}},{"id":"call-2","type":"function","function":{"name":"get_events","arguments":"{\"namespace\":\"demo\",\"name\":\"demo-api-7d9f6c4b5-xk2v9\"}"}}]}}]}`
+		case "diagmixed":
+			resp = `{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call-1","type":"function","function":{"name":"get_pod","arguments":"{\"namespace\":\"demo\",\"pod\":\"demo-api-7d9f6c4b5-xk2v9\"}"}},{"id":"call-2","type":"function","function":{"name":"submit_diagnosis","arguments":"{\"facts\":[\"Pod 重启 5 次\"],\"cause\":\"容器内存限制过低，触发 OOMKilled\",\"evidenceIds\":[\"ev-1\"],\"recommendations\":[\"调高 limit\"],\"openQuestions\":[],\"confidence\":\"high\"}"}}]}}]}`
 		case "illegal":
 			resp = `{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call-2","type":"function","function":{"name":"delete_pod","arguments":"{\"namespace\":\"demo\",\"pod\":\"x\"}"}}]}}]}`
 		case "text":
@@ -68,11 +72,11 @@ func TestRealMapsToolCall(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Next 失败: %v", err)
 	}
-	if step.ToolCall == nil || step.ToolCall.Name != "get_pod" {
-		t.Fatalf("应映射成 get_pod 调用，得到 %+v", step.ToolCall)
+	if len(step.ToolCalls) != 1 || step.ToolCalls[0].Name != "get_pod" {
+		t.Fatalf("应映射成 get_pod 调用，得到 %+v", step.ToolCalls)
 	}
-	if step.ToolCall.Args["pod"] != "demo-api-7d9f6c4b5-xk2v9" || step.ToolCall.Args["namespace"] != "demo" {
-		t.Fatalf("参数映射不对: %+v", step.ToolCall.Args)
+	if step.ToolCalls[0].Args["pod"] != "demo-api-7d9f6c4b5-xk2v9" || step.ToolCalls[0].Args["namespace"] != "demo" {
+		t.Fatalf("参数映射不对: %+v", step.ToolCalls[0].Args)
 	}
 	if calls != 1 {
 		t.Fatalf("应只调一次模型，实际 %d 次", calls)
@@ -108,11 +112,82 @@ func TestRealIllegalToolCallIsRejectedByAgent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Real 不应在这里吞掉非法调用: %v", err)
 	}
-	if step.ToolCall == nil || step.ToolCall.Name != "delete_pod" {
-		t.Fatalf("应原样返回 delete_pod，得到 %+v", step.ToolCall)
+	if len(step.ToolCalls) != 1 || step.ToolCalls[0].Name != "delete_pod" {
+		t.Fatalf("应原样返回 delete_pod，得到 %+v", step.ToolCalls)
 	}
-	if err := agent.ValidateToolCall("demo", step.ToolCall); err == nil {
+	if err := agent.ValidateToolCall("demo", step.ToolCalls[0]); err == nil {
 		t.Fatalf("Agent 应拒绝 delete_pod")
+	}
+}
+
+func TestRealMapsMultipleToolCalls(t *testing.T) {
+	// 回归：模型一次返回多个工具调用时，全部按返回顺序映射回来，
+	// 不能只取第一个、其余静默丢掉。
+	calls := 0
+	srv := mockOpenAI(t, "multicall", &calls)
+	defer srv.Close()
+	m := NewRealWithConfig(RealConfig{APIKey: "test-key", BaseURL: srv.URL, ModelName: "test-model", HTTPClient: srv.Client(), Timeout: 5 * time.Second})
+	step, err := m.Next(context.Background(), testInput())
+	if err != nil {
+		t.Fatalf("Next 失败: %v", err)
+	}
+	if step.IsFinal {
+		t.Fatalf("没交报告时不应是最终步，得到 %+v", step)
+	}
+	if len(step.ToolCalls) != 2 {
+		t.Fatalf("一次返回 2 个调用，应映射成 2 个，得到 %d 个", len(step.ToolCalls))
+	}
+	if step.ToolCalls[0].Name != "get_pod" || step.ToolCalls[1].Name != "get_events" {
+		t.Fatalf("调用顺序应和模型返回一致，得到 %v", step.ToolCalls)
+	}
+	if step.ToolCalls[0].Args["pod"] != "demo-api-7d9f6c4b5-xk2v9" || step.ToolCalls[1].Args["name"] != "demo-api-7d9f6c4b5-xk2v9" {
+		t.Fatalf("参数映射不对: %+v / %+v", step.ToolCalls[0].Args, step.ToolCalls[1].Args)
+	}
+}
+
+func TestRealChatMapsMultipleToolCalls(t *testing.T) {
+	// Chat 路同样：一批调用全映射回来，顺带的文字也保留。
+	calls := 0
+	srv := mockOpenAI(t, "multicall", &calls)
+	defer srv.Close()
+	m := NewRealWithConfig(RealConfig{APIKey: "test-key", BaseURL: srv.URL, ModelName: "test-model", HTTPClient: srv.Client(), Timeout: 5 * time.Second})
+	st, err := m.Chat(context.Background(), []ChatMessage{{Role: "system", Content: "x"}, {Role: "user", Content: "当前状态怎么样"}})
+	if err != nil {
+		t.Fatalf("Chat 失败: %v", err)
+	}
+	if st.IsFinal {
+		t.Fatalf("没交报告时不应是最终步，得到 %+v", st)
+	}
+	if len(st.ToolCalls) != 2 {
+		t.Fatalf("一次返回 2 个调用，应映射成 2 个，得到 %d 个", len(st.ToolCalls))
+	}
+	if st.ToolCalls[0].Name != "get_pod" || st.ToolCalls[1].Name != "get_events" {
+		t.Fatalf("调用顺序应和模型返回一致，得到 %v", st.ToolCalls)
+	}
+	if st.Content != "先查 Pod 和事件。" {
+		t.Fatalf("顺带的文字应保留，得到 %q", st.Content)
+	}
+}
+
+func TestRealSubmitDiagnosisWinsOverQueryCalls(t *testing.T) {
+	// submit_diagnosis 是终结信号：同一批里只要出现它，只处理它，
+	// 跳过同批其他查询调用——不管它在第几个位置。
+	calls := 0
+	srv := mockOpenAI(t, "diagmixed", &calls)
+	defer srv.Close()
+	m := NewRealWithConfig(RealConfig{APIKey: "test-key", BaseURL: srv.URL, ModelName: "test-model", HTTPClient: srv.Client(), Timeout: 5 * time.Second})
+	step, err := m.Next(context.Background(), testInput())
+	if err != nil {
+		t.Fatalf("Next 失败: %v", err)
+	}
+	if !step.IsFinal || step.Report == nil {
+		t.Fatalf("一批里有 submit_diagnosis 时应直接交报告，得到 %+v", step)
+	}
+	if len(step.ToolCalls) != 0 {
+		t.Fatalf("交报告时同批查询调用应跳过，得到 %+v", step.ToolCalls)
+	}
+	if !strings.Contains(step.Report.Cause, "OOMKilled") {
+		t.Fatalf("报告内容不对: %+v", step.Report)
 	}
 }
 
@@ -125,7 +200,7 @@ func TestRealRetriesOn500ThenSucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("重试后应成功: %v", err)
 	}
-	if step.ToolCall == nil {
+	if len(step.ToolCalls) == 0 {
 		t.Fatalf("重试后应拿到工具调用")
 	}
 	if calls != 2 {

@@ -67,7 +67,7 @@ func (s *Stub) Next(ctx context.Context, in agent.ModelInput) (agent.ModelStep, 
 		}
 		args["namespace"] = ns
 		return agent.ModelStep{
-			ToolCall: &agent.ToolCall{ID: fmt.Sprintf("call-%d", in.StepIndex+1), Name: name, Args: args},
+			ToolCalls: []*agent.ToolCall{{ID: fmt.Sprintf("call-%d", in.StepIndex+1), Name: name, Args: args}},
 		}
 	}
 	switch in.StepIndex {
@@ -655,7 +655,7 @@ const realSystemPrompt = `你是 Kubernetes 故障诊断助手。任务是根据
 
 规则：
 1. 只能调用提供的工具，工具参数里的 namespace 必须和任务一致，不要查其他 namespace，不要查 kube-system。
-2. 一次只调一个工具，先查 Pod 状态、事件和日志，再查 Deployment 和手册，不要凭空猜测。不知道目标在哪时，先用发现工具（list_namespaces、list_problem_pods、get_cluster_overview）看全貌、找问题，再用定向工具深挖。
+2. 先查 Pod 状态、事件和日志，再查 Deployment 和手册，不要凭空猜测。不知道目标在哪时，先用发现工具（list_namespaces、list_problem_pods、get_cluster_overview）看全貌、找问题，再用定向工具深挖。
 3. 证据不足时不要硬编结论，调用 submit_diagnosis 时把 confidence 写成 low，并写清还需要补查什么。
 4. 提交诊断必须调用 submit_diagnosis，evidenceIds 只能引用工具结果里已经出现过的 ID。
 5. 原因按证据自己判断。需要修复时，在 submit_diagnosis 的 suggestedRepair 里用 patches 列表给一个修复建议（op 只支持 replace，path 是白名单里的字段：镜像、内存、副本数，value 是合法的新值）；其他原因给不出具体变更时不要给修复建议。
@@ -677,35 +677,44 @@ func (r *Real) Next(ctx context.Context, in agent.ModelInput) (agent.ModelStep, 
 		return agent.ModelStep{}, fmt.Errorf("模型返回为空，没有 choices")
 	}
 	msg := resp.Choices[0].Message
-	// 优先处理工具调用：一次只取第一个，剩下的下一轮再让模型决定，
-	// 避免一次返回多个调用、Agent 难以按顺序持久化的问题。
+	// 工具调用：一次返回里的多个调用按返回顺序全部执行，
+	// 不能只取第一个、其余静默丢掉——模型以为它们都执行了。
+	// submit_diagnosis 是终结信号：同一批里只要出现它，只处理它，
+	// 跳过同批其他查询调用——交报告意味着本轮诊断结束，
+	// 查询结果已无意义；继续执行查询只会浪费步数，
+	// 还可能把无关证据带进报告。
 	if len(msg.ToolCalls) > 0 {
-		tc := msg.ToolCalls[0]
-		name := tc.Function.Name
-		if name == "submit_diagnosis" {
-			rep, err := parseDiagnosisArgs(tc.Function.Arguments)
+		for _, tc := range msg.ToolCalls {
+			if tc.Function.Name == "submit_diagnosis" {
+				rep, err := parseDiagnosisArgs(tc.Function.Arguments)
+				if err != nil {
+					return agent.ModelStep{}, fmt.Errorf("模型提交的诊断报告解析失败: %w", err)
+				}
+				return agent.ModelStep{IsFinal: true, Report: rep}, nil
+			}
+		}
+		calls := make([]*agent.ToolCall, 0, len(msg.ToolCalls))
+		for i, tc := range msg.ToolCalls {
+			name := tc.Function.Name
+			args, err := parseToolArgs(tc.Function.Arguments)
 			if err != nil {
-				return agent.ModelStep{}, fmt.Errorf("模型提交的诊断报告解析失败: %w", err)
+				return agent.ModelStep{}, fmt.Errorf("模型返回的工具参数解析失败: %w", err)
 			}
-			return agent.ModelStep{IsFinal: true, Report: rep}, nil
-		}
-		args, err := parseToolArgs(tc.Function.Arguments)
-		if err != nil {
-			return agent.ModelStep{}, fmt.Errorf("模型返回的工具参数解析失败: %w", err)
-		}
-		// 模型漏填 namespace 时补上任务的 namespace，缺了它 Agent 会拒绝执行。
-		if _, ok := args["namespace"]; !ok || args["namespace"] == "" {
-			if name != "search_runbooks" {
-				args["namespace"] = in.Namespace
+			// 模型漏填 namespace 时补上任务的 namespace，缺了它 Agent 会拒绝执行。
+			if _, ok := args["namespace"]; !ok || args["namespace"] == "" {
+				if name != "search_runbooks" {
+					args["namespace"] = in.Namespace
+				}
 			}
+			id := tc.ID
+			if id == "" {
+				id = fmt.Sprintf("call-%d-%d", in.StepIndex+1, i+1)
+			}
+			// 注意：这里不做最终校验，未知工具名会原样交给 Agent，
+			// Agent 的 ValidateToolCall 会拒绝它并记一步错误，循环继续。
+			calls = append(calls, &agent.ToolCall{ID: id, Name: name, Args: args})
 		}
-		id := tc.ID
-		if id == "" {
-			id = fmt.Sprintf("call-%d", in.StepIndex+1)
-		}
-		// 注意：这里不做最终校验，未知工具名会原样交给 Agent，
-		// Agent 的 ValidateToolCall 会拒绝它并记一步错误，循环继续。
-		return agent.ModelStep{ToolCall: &agent.ToolCall{ID: id, Name: name, Args: args}}, nil
+		return agent.ModelStep{ToolCalls: calls}, nil
 	}
 	// 没有工具调用时，把文本当作最终结论处理。
 	content := strings.TrimSpace(msg.Content)
@@ -983,18 +992,20 @@ type ChatToolCall struct {
 
 // ChatStep 是 Real.Chat 一次调用的返回：
 // 一次返回里文字和工具调用 / 诊断报告可以同时存在，
-// Content 和 ToolCall / Report 都带上，调用方都要保留——
+// Content 和 ToolCalls / Report 都带上，调用方都要保留——
 // 模型的文字不能因为它同时调了工具、交了报告就被丢掉。
+// ToolCalls 是一批：一次返回里的多个工具调用按返回顺序全部执行，
+// 不能只取第一个、其余静默丢掉。
 type ChatStep struct {
-	Content  string
-	ToolCall *agent.ToolCall
-	Report   *agent.Report
-	IsFinal  bool
+	Content   string
+	ToolCalls []*agent.ToolCall
+	Report    *agent.Report
+	IsFinal   bool
 }
 
 // Chat 问一次真模型，专供对话循环用：
 // 调用方把本会话的历史（最近 10 条）拼成 msgs 传进来，
-// 模型返回一步工具调用或最终回答，调用方执行工具、
+// 模型返回一批工具调用或最终回答，调用方执行工具、
 // 把结果以 tool 角色追加进历史，再调下一次。
 // 工具表和单次诊断是同一套（含 4 个发现工具），
 // 所以对话里模型能先看全貌再深挖；submit_diagnosis 在对话里
@@ -1027,24 +1038,33 @@ func (r *Real) Chat(ctx context.Context, msgs []ChatMessage) (ChatStep, error) {
 	// 或一边写结论一边交 submit_diagnosis）：先把文字取出来，
 	// 下面无论返回工具调用还是诊断报告都带上，不丢。
 	content := strings.TrimSpace(msg.Content)
+	// 工具调用：一次返回里的多个调用按返回顺序全部执行，
+	// 不能只取第一个、其余静默丢掉——模型以为它们都执行了。
+	// submit_diagnosis 是终结信号：同一批里只要出现它，只处理它，
+	// 跳过同批其他查询调用（和 Real.Next 同样处理，见上）。
 	if len(msg.ToolCalls) > 0 {
-		tc := msg.ToolCalls[0]
-		if tc.Function.Name == "submit_diagnosis" {
-			rep, err := parseDiagnosisArgs(tc.Function.Arguments)
-			if err != nil {
-				return ChatStep{}, fmt.Errorf("模型提交的诊断报告解析失败: %w", err)
+		for _, tc := range msg.ToolCalls {
+			if tc.Function.Name == "submit_diagnosis" {
+				rep, err := parseDiagnosisArgs(tc.Function.Arguments)
+				if err != nil {
+					return ChatStep{}, fmt.Errorf("模型提交的诊断报告解析失败: %w", err)
+				}
+				return ChatStep{IsFinal: true, Content: content, Report: rep}, nil
 			}
-			return ChatStep{IsFinal: true, Content: content, Report: rep}, nil
 		}
-		args, err := parseToolArgs(tc.Function.Arguments)
-		if err != nil {
-			return ChatStep{}, fmt.Errorf("模型返回的工具参数解析失败: %w", err)
+		calls := make([]*agent.ToolCall, 0, len(msg.ToolCalls))
+		for i, tc := range msg.ToolCalls {
+			args, err := parseToolArgs(tc.Function.Arguments)
+			if err != nil {
+				return ChatStep{}, fmt.Errorf("模型返回的工具参数解析失败: %w", err)
+			}
+			id := tc.ID
+			if id == "" {
+				id = fmt.Sprintf("call-chat-%d", i+1)
+			}
+			calls = append(calls, &agent.ToolCall{ID: id, Name: tc.Function.Name, Args: args})
 		}
-		id := tc.ID
-		if id == "" {
-			id = "call-chat"
-		}
-		return ChatStep{Content: content, ToolCall: &agent.ToolCall{ID: id, Name: tc.Function.Name, Args: args}}, nil
+		return ChatStep{Content: content, ToolCalls: calls}, nil
 	}
 	if content == "" {
 		return ChatStep{}, fmt.Errorf("模型既没有调工具也没有返回文本")

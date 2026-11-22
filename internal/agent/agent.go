@@ -97,10 +97,10 @@ var allowedTools = map[string]bool{
 
 // 发现工具集合：namespace 为空表示查全部，不用和任务 namespace 一致。
 var discoveryTools = map[string]bool{
-	"list_namespaces":   true,
-	"list_deployments":  true,
-	"list_problem_pods": true,
-	"list_pods":         true,
+	"list_namespaces":      true,
+	"list_deployments":     true,
+	"list_problem_pods":    true,
+	"list_pods":            true,
 	"get_cluster_overview": true,
 }
 
@@ -343,11 +343,13 @@ type Tools interface {
 	GetClusterOverview(ctx context.Context) (ToolOutput, error)
 }
 
-// ModelStep 是模型一次决策的结果：要么调一个工具，要么交最终报告。
+// ModelStep 是模型一次决策的结果：要么调一批工具，要么交最终报告。
+// 一次返回里的多个工具调用要全部执行（按返回顺序），不能只取第一个、
+// 其余静默丢掉——模型以为它们都执行了。
 type ModelStep struct {
-	IsFinal  bool
-	ToolCall *ToolCall
-	Report   *Report
+	IsFinal   bool
+	ToolCalls []*ToolCall
+	Report    *Report
 }
 
 // ModelInput 是每次问模型时给它的上下文。
@@ -585,82 +587,89 @@ func (a *Agent) Run(ctx context.Context, run *store.Run, priorSteps []store.RunS
 			ValidateReport(step.Report, evidence)
 			return step.Report, nil
 		}
-		if step.ToolCall == nil {
+		if len(step.ToolCalls) == 0 {
 			return nil, fmt.Errorf("模型既没有调工具也没有交报告")
 		}
-		call := step.ToolCall
-		// 先校验，再执行，顺序不能反。
-		if err := ValidateToolCall(run.Namespace, call); err != nil {
-			// 校验失败记一步错误，不执行，继续让模型换个合法调用。
-			// 关键修复：错误步也要追加进 priorSteps，否则模型下一次
-			// 看到的历史还是空的，会重复调同一个非法调用，把 8 步烧光。
-			// 之前真模型在 kind 上就是这样连调 8 次 list_workload_pods 的。
-			errStep := &store.RunStep{
-				RunID: run.ID, Kind: "tool_result", ToolName: call.Name,
-				CallID: call.ID, ArgsJSON: mustJSON(call.Args),
-				Summary: "工具调用被拒绝：" + err.Error(), Error: err.Error(),
+		// 一次返回里的多个工具调用按返回顺序全部执行：
+		// 以前这里只取第一个、其余静默丢掉，模型却以为它们都执行了。
+		// 校验、执行、记步都按调用逐个走；某一个失败只跳过它自己，
+		// 不影响同批其他调用。步数预算按模型轮次算（外层 for i 循环），
+		// 一轮里调多个工具不额外占预算。
+		for _, call := range step.ToolCalls {
+			// 先校验，再执行，顺序不能反。
+			if err := ValidateToolCall(run.Namespace, call); err != nil {
+				// 校验失败记一步错误，不执行，跳过这个调用、继续同批下一个。
+				// 关键修复：错误步也要追加进 priorSteps，否则模型下一次
+				// 看到的历史还是空的，会重复调同一个非法调用，把 8 步烧光。
+				// 之前真模型在 kind 上就是这样连调 8 次 list_workload_pods 的。
+				errStep := &store.RunStep{
+					RunID: run.ID, Kind: "tool_result", ToolName: call.Name,
+					CallID: call.ID, ArgsJSON: mustJSON(call.Args),
+					Summary: "工具调用被拒绝：" + err.Error(), Error: err.Error(),
+				}
+				if a.OnStep != nil {
+					_ = a.OnStep(ctx, errStep)
+				}
+				priorSteps = append(priorSteps, *errStep)
+				continue
 			}
+			// 重启恢复：指纹命中说明这一步已经提交过，直接跳过不重复调。
+			fingerprint := call.Name + "|" + mustJSON(call.Args)
+			if usedToolFingerprints[fingerprint] {
+				continue
+			}
+			start := time.Now()
+			out, execErr := a.executeTool(ctx, call)
+			duration := time.Since(start)
+			evidenceID := fmt.Sprintf("ev-%d", nextEvidenceSeq)
+			nextEvidenceSeq++
+			if execErr != nil {
+				// 工具失败也要把错误步追加进 priorSteps，让模型下一次能看到
+				// “这个工具刚才失败了，原因是什么”，从而换个工具重试，
+				// 而不是原地重复调同一个失败的工具。
+				errStep := &store.RunStep{
+					RunID: run.ID, Kind: "tool_result", ToolName: call.Name,
+					CallID: call.ID, ArgsJSON: mustJSON(call.Args),
+					Summary: "工具执行失败：" + execErr.Error(), Error: execErr.Error(),
+					DurationMs: duration.Milliseconds(),
+				}
+				if a.OnStep != nil {
+					_ = a.OnStep(ctx, errStep)
+				}
+				priorSteps = append(priorSteps, *errStep)
+				// 工具失败不让整个任务崩掉，跳过这个调用、继续同批下一个，
+				// 模型可以换工具重试。
+				continue
+			}
+			// 证据 ID 同时记两份：call.ID（模型看到的）和 ev-<seq>（报告引用的），
+			// 报告校验时两边都认，避免模型引用格式不一致导致证据被误过滤。
+			evidence[evidenceID] = true
+			evidence[call.ID] = true
+			evidenceSummary[evidenceID] = out.Summary
+			evidenceSummary[call.ID] = out.Summary
+			usedToolFingerprints[fingerprint] = true
+			resultJSON, _ := json.Marshal(out.Data)
 			if a.OnStep != nil {
-				_ = a.OnStep(ctx, errStep)
+				if err := a.OnStep(ctx, &store.RunStep{
+					RunID: run.ID, Kind: "tool_result", ToolName: call.Name,
+					CallID: call.ID, ArgsJSON: mustJSON(call.Args),
+					ResultJSON: string(resultJSON), Summary: out.Summary,
+					DurationMs: duration.Milliseconds(),
+				}); err != nil {
+					return nil, err
+				}
 			}
-			priorSteps = append(priorSteps, *errStep)
-			continue
-		}
-		// 重启恢复：指纹命中说明这一步已经提交过，直接跳过不重复调。
-		fingerprint := call.Name + "|" + mustJSON(call.Args)
-		if usedToolFingerprints[fingerprint] {
-			continue
-		}
-		start := time.Now()
-		out, execErr := a.executeTool(ctx, call)
-		duration := time.Since(start)
-		evidenceID := fmt.Sprintf("ev-%d", nextEvidenceSeq)
-		nextEvidenceSeq++
-		if execErr != nil {
-			// 工具失败也要把错误步追加进 priorSteps，让模型下一次能看到
-			// “这个工具刚才失败了，原因是什么”，从而换个工具重试，
-			// 而不是原地重复调同一个失败的工具。
-			errStep := &store.RunStep{
+			// 把这一步的结果追加进 priorSteps，让桩模型能按顺序推进。
+			// Slice 2 补上 ResultJSON：Stub 和真模型都靠历史里的结果
+			// 判断场景（例如 ImagePullBackOff 只在 Events / 日志的
+			// ResultJSON 里出现，Summary 里不一定有），不带它
+			// imagepull / probe 用例会识别不到信号。
+			priorSteps = append(priorSteps, store.RunStep{
 				RunID: run.ID, Kind: "tool_result", ToolName: call.Name,
-				CallID: call.ID, ArgsJSON: mustJSON(call.Args),
-				Summary: "工具执行失败：" + execErr.Error(), Error: execErr.Error(),
-				DurationMs: duration.Milliseconds(),
-			}
-			if a.OnStep != nil {
-				_ = a.OnStep(ctx, errStep)
-			}
-			priorSteps = append(priorSteps, *errStep)
-			// 工具失败不让整个任务崩掉，继续循环，模型可以换工具重试。
-			continue
+				CallID: call.ID, ArgsJSON: mustJSON(call.Args), Summary: out.Summary,
+				ResultJSON: string(resultJSON),
+			})
 		}
-		// 证据 ID 同时记两份：call.ID（模型看到的）和 ev-<seq>（报告引用的），
-		// 报告校验时两边都认，避免模型引用格式不一致导致证据被误过滤。
-		evidence[evidenceID] = true
-		evidence[call.ID] = true
-		evidenceSummary[evidenceID] = out.Summary
-		evidenceSummary[call.ID] = out.Summary
-		usedToolFingerprints[fingerprint] = true
-		resultJSON, _ := json.Marshal(out.Data)
-		if a.OnStep != nil {
-			if err := a.OnStep(ctx, &store.RunStep{
-				RunID: run.ID, Kind: "tool_result", ToolName: call.Name,
-				CallID: call.ID, ArgsJSON: mustJSON(call.Args),
-				ResultJSON: string(resultJSON), Summary: out.Summary,
-				DurationMs: duration.Milliseconds(),
-			}); err != nil {
-				return nil, err
-			}
-		}
-		// 把这一步的结果追加进 priorSteps，让桩模型能按顺序推进。
-		// Slice 2 补上 ResultJSON：Stub 和真模型都靠历史里的结果
-		// 判断场景（例如 ImagePullBackOff 只在 Events / 日志的
-		// ResultJSON 里出现，Summary 里不一定有），不带它
-		// imagepull / probe 用例会识别不到信号。
-		priorSteps = append(priorSteps, store.RunStep{
-			RunID: run.ID, Kind: "tool_result", ToolName: call.Name,
-			CallID: call.ID, ArgsJSON: mustJSON(call.Args), Summary: out.Summary,
-			ResultJSON: string(resultJSON),
-		})
 		lastReport = nil
 	}
 

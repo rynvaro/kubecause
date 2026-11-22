@@ -551,6 +551,28 @@ type chatResponse struct {
 	} `json:"error,omitempty"`
 }
 
+// toolsWithNamespace 是内置工具里顶层参数声明了 namespace 的集合，
+// 从 toolDefs() 的 schema 推导出来，不手写工具名：
+// 只有这些工具才会在模型漏填时被补上任务的 namespace。
+// MCP 发现的外部工具不在 toolDefs() 里——它们的 InputSchema 由
+// Server 自己定，模型没给的参数不能硬塞，SDK 会拒绝 schema 之外的
+// 字段（issue #11：正式诊断里调 node_* 工具被多补的 namespace 挡掉）。
+// search_runbooks / list_namespaces / get_cluster_overview 的 schema
+// 里本来就没有 namespace，也不补。
+var toolsWithNamespace = func() map[string]bool {
+	m := map[string]bool{}
+	for _, d := range toolDefs() {
+		props, ok := d.Function.Parameters["properties"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, ok := props["namespace"]; ok {
+			m[d.Function.Name] = true
+		}
+	}
+	return m
+}()
+
 // toolDefs 是发给模型的工具定义。
 // 6 个诊断工具和一个 submit_diagnosis：模型要交最终报告时
 // 必须调 submit_diagnosis，而不是直接写一段自由文本，
@@ -701,8 +723,11 @@ func (r *Real) Next(ctx context.Context, in agent.ModelInput) (agent.ModelStep, 
 				return agent.ModelStep{}, fmt.Errorf("模型返回的工具参数解析失败: %w", err)
 			}
 			// 模型漏填 namespace 时补上任务的 namespace，缺了它 Agent 会拒绝执行。
+			// 只给 schema 里声明了 namespace 的内置工具补（toolsWithNamespace）：
+			// MCP 发现的外部工具只接受自己 InputSchema 声明的参数，
+			// 多余的 namespace 会被 Server 拒绝（issue #11）。
 			if _, ok := args["namespace"]; !ok || args["namespace"] == "" {
-				if name != "search_runbooks" {
+				if toolsWithNamespace[name] {
 					args["namespace"] = in.Namespace
 				}
 			}

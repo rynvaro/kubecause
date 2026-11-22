@@ -608,7 +608,9 @@ func (a *Agent) Run(ctx context.Context, run *store.Run, priorSteps []store.RunS
 					Summary: "工具调用被拒绝：" + err.Error(), Error: err.Error(),
 				}
 				if a.OnStep != nil {
-					_ = a.OnStep(ctx, errStep)
+					if err := a.OnStep(ctx, errStep); err != nil {
+						return nil, err
+					}
 				}
 				priorSteps = append(priorSteps, *errStep)
 				continue
@@ -634,7 +636,9 @@ func (a *Agent) Run(ctx context.Context, run *store.Run, priorSteps []store.RunS
 					DurationMs: duration.Milliseconds(),
 				}
 				if a.OnStep != nil {
-					_ = a.OnStep(ctx, errStep)
+					if err := a.OnStep(ctx, errStep); err != nil {
+						return nil, err
+					}
 				}
 				priorSteps = append(priorSteps, *errStep)
 				// 工具失败不让整个任务崩掉，跳过这个调用、继续同批下一个，

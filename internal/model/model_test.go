@@ -47,6 +47,10 @@ func mockOpenAI(t *testing.T, mode string, calls *int) *httptest.Server {
 			resp = `{"choices":[{"message":{"role":"assistant","content":"先查 Pod 和事件。","tool_calls":[{"id":"call-1","type":"function","function":{"name":"get_pod","arguments":"{\"namespace\":\"demo\",\"pod\":\"demo-api-7d9f6c4b5-xk2v9\"}"}},{"id":"call-2","type":"function","function":{"name":"get_events","arguments":"{\"namespace\":\"demo\",\"name\":\"demo-api-7d9f6c4b5-xk2v9\"}"}}]}}]}`
 		case "diagmixed":
 			resp = `{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call-1","type":"function","function":{"name":"get_pod","arguments":"{\"namespace\":\"demo\",\"pod\":\"demo-api-7d9f6c4b5-xk2v9\"}"}},{"id":"call-2","type":"function","function":{"name":"submit_diagnosis","arguments":"{\"facts\":[\"Pod 重启 5 次\"],\"cause\":\"容器内存限制过低，触发 OOMKilled\",\"evidenceIds\":[\"ev-1\"],\"recommendations\":[\"调高 limit\"],\"openQuestions\":[],\"confidence\":\"high\"}"}}]}}]}`
+		case "mixedns":
+			// 4 个调用都不带 namespace：node_list（MCP 工具）、get_pod（内置）、
+			// search_runbooks（无 namespace 参数）、list_namespaces（无 namespace 参数）。
+			resp = `{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call-1","type":"function","function":{"name":"node_list","arguments":"{}"}},{"id":"call-2","type":"function","function":{"name":"get_pod","arguments":"{\"pod\":\"demo-api-7d9f6c4b5-xk2v9\"}"}},{"id":"call-3","type":"function","function":{"name":"search_runbooks","arguments":"{\"query\":\"OOMKilled\"}"}},{"id":"call-4","type":"function","function":{"name":"list_namespaces","arguments":"{}"}}]}}]}`
 		case "illegal":
 			resp = `{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call-2","type":"function","function":{"name":"delete_pod","arguments":"{\"namespace\":\"demo\",\"pod\":\"x\"}"}}]}}]}`
 		case "text":
@@ -358,5 +362,39 @@ func TestRealExtraTools(t *testing.T) {
 	m.SetExtraTools(nil)
 	if got := len(m.toolDefs()); got != 12 {
 		t.Errorf("清空后工具表 = %d 个, want 12", got)
+	}
+}
+
+func TestRealNamespaceBackfillOnlyForBuiltinTools(t *testing.T) {
+	// issue #11：namespace 只补给 schema 里声明了它的内置工具。
+	// MCP 发现的 node_* 工具不补——Server 会拒绝 schema 之外的字段；
+	// search_runbooks / list_namespaces 的 schema 本来就没有 namespace，也不补。
+	calls := 0
+	srv := mockOpenAI(t, "mixedns", &calls)
+	defer srv.Close()
+	m := NewRealWithConfig(RealConfig{APIKey: "test-key", BaseURL: srv.URL, ModelName: "test-model", HTTPClient: srv.Client(), Timeout: 5 * time.Second})
+	m.SetExtraTools([]mcpclient.ToolDef{{Name: "node_list", Description: "列出节点", Parameters: map[string]any{"type": "object", "properties": map[string]any{}}}})
+	step, err := m.Next(context.Background(), testInput())
+	if err != nil {
+		t.Fatalf("Next 失败: %v", err)
+	}
+	if len(step.ToolCalls) != 4 {
+		t.Fatalf("应返回 4 个调用，得到 %d", len(step.ToolCalls))
+	}
+	byName := map[string]map[string]string{}
+	for _, c := range step.ToolCalls {
+		byName[c.Name] = c.Args
+	}
+	if _, ok := byName["node_list"]["namespace"]; ok {
+		t.Fatalf("node_list 不应被补 namespace，得到 %+v", byName["node_list"])
+	}
+	if byName["get_pod"]["namespace"] != "demo" {
+		t.Fatalf("get_pod 应被补上任务的 namespace，得到 %+v", byName["get_pod"])
+	}
+	if _, ok := byName["search_runbooks"]["namespace"]; ok {
+		t.Fatalf("search_runbooks 不应被补 namespace，得到 %+v", byName["search_runbooks"])
+	}
+	if _, ok := byName["list_namespaces"]["namespace"]; ok {
+		t.Fatalf("list_namespaces 的 schema 没有 namespace，不应补，得到 %+v", byName["list_namespaces"])
 	}
 }

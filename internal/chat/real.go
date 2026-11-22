@@ -30,7 +30,6 @@ const chatSystemPrompt = `你是 Kubernetes 故障诊断助手，正在和用户
    所有 Pod 都查完。等用户追问某个命名空间或 Pod 时再用定向工具
    （get_pod、get_events、get_pod_logs、get_deployment、search_runbooks）深挖。
    总览调几个工具由你自己判断，不用每次都把发现工具全调一遍。
-   一次只调一个工具。
 3. 指代消解：用户说的“这个命名空间”、“刚才那个 Pod”、“它”、“那个一直重启的”要按会话历史里的最近提到的目标来理解。如果历史里没有明确的目标，或者有多个可能的目标，不要猜，直接问用户是哪个命名空间、哪个 Pod。
 4. 系统命名空间可以查、可以诊断，但不要把它当成用户业务下结论：如果查到的有问题 Pod 在 kube-system 等系统命名空间里，要明确说明这是系统组件，并且不要给它出修复建议——修复校验本来就会拒绝系统命名空间的修改。
 5. 证据不足时不要硬编结论，要说还需要补查什么。回答用中文，简明扼要，先给结论再给依据。
@@ -93,13 +92,16 @@ func logModelResponse(conversationID, roundID string, step int, st model.ChatSte
 		return
 	}
 	text := strings.TrimSpace(st.Content)
-	if st.ToolCall != nil {
-		args, _ := json.Marshal(st.ToolCall.Args)
-		if text != "" {
-			log.Printf("[debug model] conv=%s round=%s step=%d response tool=%s args=%s text=%q", conversationID, roundID, step, st.ToolCall.Name, args, truncateForLog(text, 1000))
-			return
+	if len(st.ToolCalls) > 0 {
+		// 一批里多个调用逐条打，顺带的文字只在第一条上打一次。
+		for i, tc := range st.ToolCalls {
+			args, _ := json.Marshal(tc.Args)
+			if i == 0 && text != "" {
+				log.Printf("[debug model] conv=%s round=%s step=%d response tool=%s args=%s text=%q", conversationID, roundID, step, tc.Name, args, truncateForLog(text, 1000))
+				continue
+			}
+			log.Printf("[debug model] conv=%s round=%s step=%d response tool=%s args=%s", conversationID, roundID, step, tc.Name, args)
 		}
-		log.Printf("[debug model] conv=%s round=%s step=%d response tool=%s args=%s", conversationID, roundID, step, st.ToolCall.Name, args)
 		return
 	}
 	if st.IsFinal {
@@ -116,7 +118,8 @@ func logModelResponse(conversationID, roundID string, step int, st model.ChatSte
 }
 
 // runReal 是真模型的对话循环：
-// 每轮最多调 s.maxSteps() 次工具（默认 12，配置中心可改），每次问模型一步，
+// 每轮最多问模型 s.maxSteps() 次（默认 12，配置中心可改），每次问模型一步，
+// 一步里多个工具调用按返回顺序全部执行；
 // 模型调工具就执行并把结果以 tool 角色追加进历史，
 // 模型给最终文本或提交诊断报告就结束本轮。
 // 历史只带最近 s.maxHistory() 条用户/助手消息，tool 消息不占名额
@@ -236,88 +239,94 @@ func (s *Service) runReal(ctx context.Context, conversationID, roundID, text str
 			}
 			return &Reply{Reply: replyText, ToolCalls: recs, Structured: structured, SuggestedRepair: sr, SuggestedCreation: sc}, nil
 		}
-		if st.ToolCall == nil {
+		if len(st.ToolCalls) == 0 {
 			return nil, fmt.Errorf("模型既没有调工具也没有返回文本")
 		}
-		tc := st.ToolCall
-		// 模型调工具时顺带的文字：放进发给模型的上下文（assistant 消息本来
-		// 就该带上它，不能写死成空），同时攒进 sideTexts，拼进最终回复。
+		// 模型调工具时顺带的文字：只记一次（一次返回只带一段文字），
+		// 放进发给模型的上下文（assistant 消息本来就该带上它，
+		// 不能写死成空），同时攒进 sideTexts，拼进最终回复。
 		if strings.TrimSpace(st.Content) != "" {
 			sideTexts = append(sideTexts, strings.TrimSpace(st.Content))
 		}
-		// 模型漏填 namespace 时，用上文解析到的 namespace 补齐；
-		// 补不齐时不猜，让工具校验报错，模型下一轮会主动问用户。
-		if tc.Args == nil {
-			tc.Args = map[string]string{}
-		}
-		if _, ok := tc.Args["namespace"]; !ok || tc.Args["namespace"] == "" {
-			// 节点工具不补 namespace：它们不带这个参数（查的是节点），
-			// 补了也是多余参数，Server 侧会直接忽略。
-			if !isDiscovery(tc.Name) && tc.Name != "search_runbooks" && !agent.IsNodeTool(tc.Name) && lastNS != "" {
-				tc.Args["namespace"] = lastNS
+		// 一次返回里的多个工具调用按返回顺序全部执行；
+		// 以前这里只取第一个、其余静默丢掉，模型却以为它们都执行了。
+		// 每个调用各自校验、执行、记步、回传结果；某一个失败只跳过它自己，
+		// 不影响同批其他调用。
+		for _, tc := range st.ToolCalls {
+			// 模型漏填 namespace 时，用上文解析到的 namespace 补齐；
+			// 补不齐时不猜，让工具校验报错，模型下一轮会主动问用户。
+			if tc.Args == nil {
+				tc.Args = map[string]string{}
 			}
-		}
-		if ns := tc.Args["namespace"]; ns != "" {
-			lastNS = ns
-		}
-		start := time.Now()
-		out, err := s.executeChatTool(ctx, tc)
-		rec := ToolCallRecord{ID: tc.ID, Name: tc.Name, Args: tc.Args, DurationMs: time.Since(start).Milliseconds()}
-		if err != nil {
-			rec.Error = err.Error()
-			rec.Summary = "工具执行失败：" + err.Error()
+			if _, ok := tc.Args["namespace"]; !ok || tc.Args["namespace"] == "" {
+				// 节点工具不补 namespace：它们不带这个参数（查的是节点），
+				// 补了也是多余参数，Server 侧会直接忽略。
+				if !isDiscovery(tc.Name) && tc.Name != "search_runbooks" && !agent.IsNodeTool(tc.Name) && lastNS != "" {
+					tc.Args["namespace"] = lastNS
+				}
+			}
+			if ns := tc.Args["namespace"]; ns != "" {
+				lastNS = ns
+			}
+			start := time.Now()
+			out, err := s.executeChatTool(ctx, tc)
+			rec := ToolCallRecord{ID: tc.ID, Name: tc.Name, Args: tc.Args, DurationMs: time.Since(start).Milliseconds()}
+			if err != nil {
+				rec.Error = err.Error()
+				rec.Summary = "工具执行失败：" + err.Error()
+				recs = append(recs, rec)
+				s.recordTool(ctx, conversationID, roundID, rec, agent.ToolOutput{Summary: rec.Summary})
+				// 工具失败回传给模型：下一轮它能看到失败原因，
+				// 换个工具重试，而不是原地重复调同一个。
+				msgs = append(msgs,
+					model.ChatMessage{Role: "assistant", Content: st.Content, ToolCalls: []model.ChatToolCall{{ID: tc.ID, Name: tc.Name, Arguments: mustJSON(tc.Args)}}},
+					model.ChatMessage{Role: "tool", Content: "工具执行失败：" + err.Error(), ToolCallID: tc.ID},
+				)
+				continue
+			}
+			rec.Summary = out.Summary
 			recs = append(recs, rec)
-			s.recordTool(ctx, conversationID, roundID, rec, agent.ToolOutput{Summary: rec.Summary})
-			// 工具失败回传给模型：下一轮它能看到失败原因，
-			// 换个工具重试，而不是原地重复调同一个。
+			outputs = append(outputs, out)
+			structured[tc.Name] = out.Data
+			// 规范 key 映射（Slice 7 修的“后续追问只剩纯文本”）：
+			// 以前这里只存了 structured[工具名]，例如 structured["get_pod"]，
+			// 但前端 buildBlocks 只认规范 key（overview、problemPods、pod……），
+			// 工具名当 key 的结果会被过滤掉，结果就是聊天里只剩文字、没有卡片，
+			// 刷新后也一样。现在每个工具的结果同时写一份规范 key，
+			// 工具名那份留着做追溯，两份都落盘，刷新后卡片还在。
+			switch tc.Name {
+			case "get_cluster_overview":
+				structured["overview"] = out.Data
+			case "list_problem_pods":
+				structured["problemPods"] = out.Data
+			case "list_pods":
+				structured["pods"] = out.Data
+			case "list_workload_pods":
+				// 注意：这里不再写 "pods"——list_workload_pods 以前返回名字
+				// 字符串数组，和 list_pods 的完整行撞了同一个 key，
+				// 前端按 problemPods ?? pods 读到字符串数组就渲出一排空行。
+				// 现在两个工具各走各的 key：全部 Pod 是 pods，
+				// 某 Deployment 下的 Pod 是 workloadPods。
+				structured["workloadPods"] = out.Data
+			case "get_pod":
+				structured["pod"] = out.Data
+			case "get_deployment":
+				structured["deployment"] = out.Data
+			case "list_deployments":
+				structured["deployments"] = out.Data
+			case "get_events":
+				structured["events"] = out.Data
+			case "get_pod_logs":
+				structured["logs"] = out.Data
+			case "search_runbooks":
+				structured["runbooks"] = out.Data
+			}
+			s.recordTool(ctx, conversationID, roundID, rec, out)
 			msgs = append(msgs,
 				model.ChatMessage{Role: "assistant", Content: st.Content, ToolCalls: []model.ChatToolCall{{ID: tc.ID, Name: tc.Name, Arguments: mustJSON(tc.Args)}}},
-				model.ChatMessage{Role: "tool", Content: "工具执行失败：" + err.Error(), ToolCallID: tc.ID},
+				model.ChatMessage{Role: "tool", Content: out.Summary + "\n" + mustJSON(out.Data), ToolCallID: tc.ID},
 			)
-			continue
 		}
-		rec.Summary = out.Summary
-		recs = append(recs, rec)
-		outputs = append(outputs, out)
-		structured[tc.Name] = out.Data
-		// 规范 key 映射（Slice 7 修的“后续追问只剩纯文本”）：
-		// 以前这里只存了 structured[工具名]，例如 structured["get_pod"]，
-		// 但前端 buildBlocks 只认规范 key（overview、problemPods、pod……），
-		// 工具名当 key 的结果会被过滤掉，结果就是聊天里只剩文字、没有卡片，
-		// 刷新后也一样。现在每个工具的结果同时写一份规范 key，
-		// 工具名那份留着做追溯，两份都落盘，刷新后卡片还在。
-		switch tc.Name {
-		case "get_cluster_overview":
-			structured["overview"] = out.Data
-		case "list_problem_pods":
-			structured["problemPods"] = out.Data
-		case "list_pods":
-			structured["pods"] = out.Data
-		case "list_workload_pods":
-			// 注意：这里不再写 "pods"——list_workload_pods 以前返回名字
-			// 字符串数组，和 list_pods 的完整行撞了同一个 key，
-			// 前端按 problemPods ?? pods 读到字符串数组就渲出一排空行。
-			// 现在两个工具各走各的 key：全部 Pod 是 pods，
-			// 某 Deployment 下的 Pod 是 workloadPods。
-			structured["workloadPods"] = out.Data
-		case "get_pod":
-			structured["pod"] = out.Data
-		case "get_deployment":
-			structured["deployment"] = out.Data
-		case "list_deployments":
-			structured["deployments"] = out.Data
-		case "get_events":
-			structured["events"] = out.Data
-		case "get_pod_logs":
-			structured["logs"] = out.Data
-		case "search_runbooks":
-			structured["runbooks"] = out.Data
-		}
-		s.recordTool(ctx, conversationID, roundID, rec, out)
-		msgs = append(msgs,
-			model.ChatMessage{Role: "assistant", Content: st.Content, ToolCalls: []model.ChatToolCall{{ID: tc.ID, Name: tc.Name, Arguments: mustJSON(tc.Args)}}},
-			model.ChatMessage{Role: "tool", Content: out.Summary + "\n" + mustJSON(out.Data), ToolCallID: tc.ID},
-		)
 	}
 	// 步数用完了：不直接 return error。
 	// 已经查到的工具结果（outputs 的摘要 + structured 的规范 key）

@@ -11,7 +11,7 @@ import (
 type loopModel struct{}
 
 func (loopModel) Next(ctx context.Context, in ModelInput) (ModelStep, error) {
-	return ModelStep{ToolCall: &ToolCall{ID: "call-x", Name: "get_pod", Args: map[string]string{"namespace": in.Namespace, "pod": "demo-api-7d9f6c4b5-xk2v9"}}}, nil
+	return ModelStep{ToolCalls: []*ToolCall{{ID: "call-x", Name: "get_pod", Args: map[string]string{"namespace": in.Namespace, "pod": "demo-api-7d9f6c4b5-xk2v9"}}}}, nil
 }
 
 type stubTools struct{ calls int }

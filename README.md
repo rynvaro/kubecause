@@ -6,7 +6,15 @@ KubeCause 通过自然语言交互，结合大模型工具调用、Kubernetes �
 
 > 当前版本：**v0.14.0** · 项目仍在开发中，主要用于本地演示和技术验证；请勿将默认演示配置直接用于生产环境。
 
-[快速开始](#快速开始) · [核心能力](#核心能力) · [系统架构](#系统架构) · [Roadmap](ROADMAP.md) · [Changelog](CHANGELOG.md)
+[演示视频](#演示视频) · [快速开始](#快速开始) · [核心能力](#核心能力) · [系统架构](#系统架构) · [Roadmap](ROADMAP.md) · [Changelog](CHANGELOG.md)
+
+## 演示视频
+
+以下录屏展示 KubeCause 的对话式故障诊断、Agent 工具调用与结构化结果。演示用于展示交互流程，不代表可以将默认配置直接用于生产环境。
+
+https://github.com/user-attachments/assets/270dff5f-017c-4b61-9ba7-34132ec58207
+
+> 无法播放时，可[直接打开演示视频](https://github.com/user-attachments/assets/270dff5f-017c-4b61-9ba7-34132ec58207)。
 
 ## 核心能力
 

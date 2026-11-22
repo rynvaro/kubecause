@@ -38,11 +38,16 @@ type Config struct {
 		MaxHistoryMessages int `yaml:"maxHistoryMessages" json:"maxHistoryMessages"`
 	} `yaml:"chat" json:"chat"`
 	Run struct {
-		// MaxSteps 是单次诊断（/api/runs）最多调工具的次数，默认 8，
+		// MaxSteps 是单次诊断（/api/runs）最多模型轮次，默认 8，
 		// 和对话的 12 步是分开的两个预算，不要混成一个。
+		// 一轮里模型可以一次返回多个工具调用（见 MaxToolCallsPerRound），
+		// 轮次只算模型决策的次数，不按工具调用的行数算（issue #6）。
 		MaxSteps int `yaml:"maxSteps" json:"maxSteps"`
 		// TimeoutSeconds 是单次诊断的整体超时秒数。
 		TimeoutSeconds int `yaml:"timeoutSeconds" json:"timeoutSeconds"`
+		// MaxToolCallsPerRound 是一轮里模型最多调几个不同的工具调用，
+		// 默认 5。超过上限的调用不执行，记一步错误告诉模型分轮调。
+		MaxToolCallsPerRound int `yaml:"maxToolCallsPerRound" json:"maxToolCallsPerRound"`
 	} `yaml:"run" json:"run"`
 	Model struct {
 		// TimeoutSeconds 是每次模型 API 调用的超时秒数。
@@ -68,6 +73,7 @@ func Defaults() Config {
 	c.Chat.MaxHistoryMessages = 10
 	c.Run.MaxSteps = 8
 	c.Run.TimeoutSeconds = 60
+	c.Run.MaxToolCallsPerRound = 5
 	c.Model.TimeoutSeconds = 30
 	c.Model.Temperature = 0.2
 	c.Repair.MaxMemoryMi = 4096
@@ -94,6 +100,9 @@ func (c Config) Validate() error {
 		return err
 	}
 	if err := check("run.maxSteps", c.Run.MaxSteps, 1, 50); err != nil {
+		return err
+	}
+	if err := check("run.maxToolCallsPerRound", c.Run.MaxToolCallsPerRound, 1, 20); err != nil {
 		return err
 	}
 	if err := check("run.timeoutSeconds", c.Run.TimeoutSeconds, 5, 600); err != nil {
@@ -152,6 +161,9 @@ func applyEnv(c *Config) {
 	}
 	if v, ok := envInt("RUN_MAX_STEPS"); ok {
 		c.Run.MaxSteps = v
+	}
+	if v, ok := envInt("RUN_MAX_TOOL_CALLS_PER_ROUND"); ok {
+		c.Run.MaxToolCallsPerRound = v
 	}
 	if v, ok := envInt("RUN_TIMEOUT_SECONDS"); ok {
 		c.Run.TimeoutSeconds = v

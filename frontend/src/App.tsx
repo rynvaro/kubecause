@@ -846,6 +846,21 @@ export default function App() {
                   />
                   <span className="muted small">超时后用已有证据收敛，不是一直等。</span>
                 </label>
+                <label>
+                  每轮最多工具调用数
+                  <input
+                    type="number"
+                    min={1}
+                    max={20}
+                    value={cfg.run.maxToolCallsPerRound}
+                    onChange={(e) =>
+                      setCfg({ ...cfg, run: { ...cfg.run, maxToolCallsPerRound: Number(e.target.value) } })
+                    }
+                  />
+                  <span className="muted small">
+                    一轮里模型一次最多调几个不同的工具，超出部分不执行，会告诉模型分轮调。默认 5。
+                  </span>
+                </label>
                 <h4>模型</h4>
                 <label>
                   模型调用超时（秒）

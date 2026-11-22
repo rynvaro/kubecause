@@ -71,6 +71,10 @@ type Run struct {
 	Status         string `json:"status"`
 	MaxSteps       int    `json:"maxSteps"`
 	TimeoutSeconds int    `json:"timeoutSeconds"`
+	// MaxToolCallsPerRound 是单次诊断里一轮模型最多调几个不同的工具调用，
+	// 默认 5（见 DefaultRunMaxToolCallsPerRound）：超过上限的调用不执行，
+	// 记一步错误告诉模型分轮调。0 表示用默认值，不是不限。
+	MaxToolCallsPerRound int `json:"maxToolCallsPerRound"`
 	// ReportJSON 是诊断报告的 JSON，空字符串表示还没有报告。
 	ReportJSON string `json:"-"`
 	// SuggestedJSON 是对话转正式诊断时带过来的修复建议（Slice 10），
@@ -90,6 +94,9 @@ type Run struct {
 
 // RunStep 对应 run_steps 表，序号在同一个任务内单调递增，
 // 既是 Agent 的决策轨迹，也是前端时间线的唯一来源。
+// Round 是这一步所属的模型轮次（从 0 起）：恢复时按轮次算预算，
+// 不再按行数算（见 issue #6）。Round = -1 表示未知（迁移前没有这一列的
+// 老数据）；新写入的步骤一定是 >=0 的轮次。
 type RunStep struct {
 	ID         int64     `json:"id"`
 	RunID      string    `json:"runId"`
@@ -103,6 +110,11 @@ type RunStep struct {
 	Error      string    `json:"error,omitempty"`
 	DurationMs int64     `json:"durationMs"`
 	RetryCount int       `json:"retryCount"`
+	Round      int       `json:"round,omitempty"`
+	// EvidenceID 是这一步成功时分配的证据 ID（ev-<n>）：只在成功执行时写，
+	// 失败步骤留空。恢复时直接读它，不再从步骤序号推算（见 issue #8）。
+	// 老数据没有这一列时读出来是空字符串，只贡献 CallID。
+	EvidenceID string    `json:"evidenceId,omitempty"`
 	CreatedAt  time.Time `json:"createdAt"`
 }
 
@@ -257,6 +269,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			status TEXT NOT NULL DEFAULT 'queued',
 			max_steps INTEGER NOT NULL DEFAULT 8,
 			timeout_seconds INTEGER NOT NULL DEFAULT 60,
+			max_tool_calls_per_round INTEGER NOT NULL DEFAULT 5,
 			report_json TEXT NOT NULL DEFAULT '',
 			suggested_json TEXT NOT NULL DEFAULT '',
 			creation_json TEXT NOT NULL DEFAULT '',
@@ -277,6 +290,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			error TEXT NOT NULL DEFAULT '',
 			duration_ms INTEGER NOT NULL DEFAULT 0,
 			retry_count INTEGER NOT NULL DEFAULT 0,
+			round INTEGER NOT NULL DEFAULT -1,
+			evidence_id TEXT NOT NULL DEFAULT '',
 			created_at DATETIME NOT NULL,
 			UNIQUE(run_id, seq)
 		)`,
@@ -359,6 +374,23 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := s.ensureColumn(ctx, "messages", "round_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
+	// run_steps 表的老库升级（issue #6）：每一步所属的模型轮次，
+	// 老库没有时补上，默认值 -1 是“未知/老数据”哨兵（和明确跑过
+	// 第 0 轮的 Round=0 区分开）；只有全是 -1 时恢复才宽容处理
+	//（见 internal/agent 的 roundsUsed 计算）。
+	if err := s.ensureColumn(ctx, "run_steps", "round", "INTEGER NOT NULL DEFAULT -1"); err != nil {
+		return err
+	}
+	// runs 表的老库升级（issue #6）：每轮工具调用上限，
+	// 老库没有时补上，读出来是 0 时按默认值 5 算。
+	if err := s.ensureColumn(ctx, "runs", "max_tool_calls_per_round", "INTEGER NOT NULL DEFAULT 5"); err != nil {
+		return err
+	}
+	// run_steps 表的老库升级（issue #8）：成功时分配的证据 ID，
+	// 老库没有时补上，读出来是空字符串，只贡献 CallID，不参与 ev 号分配。
+	if err := s.ensureColumn(ctx, "run_steps", "evidence_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -397,14 +429,21 @@ var DefaultRunMaxSteps = 8
 // DefaultRunTimeoutSeconds 是创建任务时 TimeoutSeconds 没填时的默认值（秒）。
 var DefaultRunTimeoutSeconds = 60
 
+// DefaultRunMaxToolCallsPerRound 是创建任务时 MaxToolCallsPerRound
+// 没填时的默认值：一轮里模型最多调 5 个不同的工具调用（issue #6）。
+var DefaultRunMaxToolCallsPerRound = 5
+
 // ApplyRunDefaults 把配置中心的值应用到任务创建默认值：热加载时调它。
 // 非法值不改，保持旧值。
-func ApplyRunDefaults(maxSteps, timeoutSeconds int) {
+func ApplyRunDefaults(maxSteps, timeoutSeconds, maxToolCallsPerRound int) {
 	if maxSteps >= 1 && maxSteps <= 50 {
 		DefaultRunMaxSteps = maxSteps
 	}
 	if timeoutSeconds >= 5 && timeoutSeconds <= 600 {
 		DefaultRunTimeoutSeconds = timeoutSeconds
+	}
+	if maxToolCallsPerRound >= 1 && maxToolCallsPerRound <= 20 {
+		DefaultRunMaxToolCallsPerRound = maxToolCallsPerRound
 	}
 }
 
@@ -418,21 +457,24 @@ func (s *Store) CreateRun(ctx context.Context, r *Run) error {
 	if r.TimeoutSeconds <= 0 {
 		r.TimeoutSeconds = DefaultRunTimeoutSeconds
 	}
+	if r.MaxToolCallsPerRound <= 0 {
+		r.MaxToolCallsPerRound = DefaultRunMaxToolCallsPerRound
+	}
 	r.CreatedAt = now()
 	r.UpdatedAt = r.CreatedAt
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO runs(id, namespace, kind, name, question, status, max_steps, timeout_seconds, report_json, suggested_json, creation_json, error, created_at, updated_at)
-		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		r.ID, r.Namespace, r.Kind, r.Name, r.Question, r.Status, r.MaxSteps, r.TimeoutSeconds, "", r.SuggestedJSON, r.CreationJSON, "", r.CreatedAt, r.UpdatedAt)
+		`INSERT INTO runs(id, namespace, kind, name, question, status, max_steps, timeout_seconds, max_tool_calls_per_round, report_json, suggested_json, creation_json, error, created_at, updated_at)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		r.ID, r.Namespace, r.Kind, r.Name, r.Question, r.Status, r.MaxSteps, r.TimeoutSeconds, r.MaxToolCallsPerRound, "", r.SuggestedJSON, r.CreationJSON, "", r.CreatedAt, r.UpdatedAt)
 	return err
 }
 
 // GetRun 按 ID 取任务，不存在返回 sql.ErrNoRows。
 func (s *Store) GetRun(ctx context.Context, id string) (*Run, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, namespace, kind, name, question, status, max_steps, timeout_seconds, report_json, suggested_json, creation_json, error, created_at, updated_at FROM runs WHERE id=?`, id)
+		`SELECT id, namespace, kind, name, question, status, max_steps, timeout_seconds, max_tool_calls_per_round, report_json, suggested_json, creation_json, error, created_at, updated_at FROM runs WHERE id=?`, id)
 	r := &Run{}
-	err := row.Scan(&r.ID, &r.Namespace, &r.Kind, &r.Name, &r.Question, &r.Status, &r.MaxSteps, &r.TimeoutSeconds, &r.ReportJSON, &r.SuggestedJSON, &r.CreationJSON, &r.Error, &r.CreatedAt, &r.UpdatedAt)
+	err := row.Scan(&r.ID, &r.Namespace, &r.Kind, &r.Name, &r.Question, &r.Status, &r.MaxSteps, &r.TimeoutSeconds, &r.MaxToolCallsPerRound, &r.ReportJSON, &r.SuggestedJSON, &r.CreationJSON, &r.Error, &r.CreatedAt, &r.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -449,10 +491,10 @@ func (s *Store) ClaimNext(ctx context.Context) (*Run, error) {
 	}
 	defer func() { _ = tx.Rollback() }()
 	row := tx.QueryRowContext(ctx,
-		`SELECT id, namespace, kind, name, question, status, max_steps, timeout_seconds, report_json, suggested_json, creation_json, error, created_at, updated_at
+		`SELECT id, namespace, kind, name, question, status, max_steps, timeout_seconds, max_tool_calls_per_round, report_json, suggested_json, creation_json, error, created_at, updated_at
 		 FROM runs WHERE status='queued' ORDER BY created_at ASC LIMIT 1`)
 	r := &Run{}
-	if err := row.Scan(&r.ID, &r.Namespace, &r.Kind, &r.Name, &r.Question, &r.Status, &r.MaxSteps, &r.TimeoutSeconds, &r.ReportJSON, &r.SuggestedJSON, &r.CreationJSON, &r.Error, &r.CreatedAt, &r.UpdatedAt); err != nil {
+	if err := row.Scan(&r.ID, &r.Namespace, &r.Kind, &r.Name, &r.Question, &r.Status, &r.MaxSteps, &r.TimeoutSeconds, &r.MaxToolCallsPerRound, &r.ReportJSON, &r.SuggestedJSON, &r.CreationJSON, &r.Error, &r.CreatedAt, &r.UpdatedAt); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
@@ -517,9 +559,9 @@ func (s *Store) AppendStep(ctx context.Context, st *RunStep) error {
 	defer func() { _ = tx.Rollback() }()
 	st.CreatedAt = now()
 	_, err = tx.ExecContext(ctx,
-		`INSERT INTO run_steps(run_id, seq, kind, tool_name, call_id, args_json, result_json, summary, error, duration_ms, retry_count, created_at)
-		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
-		st.RunID, st.Seq, st.Kind, st.ToolName, st.CallID, st.ArgsJSON, st.ResultJSON, st.Summary, st.Error, st.DurationMs, st.RetryCount, st.CreatedAt)
+		`INSERT INTO run_steps(run_id, seq, kind, tool_name, call_id, args_json, result_json, summary, error, duration_ms, retry_count, round, evidence_id, created_at)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		st.RunID, st.Seq, st.Kind, st.ToolName, st.CallID, st.ArgsJSON, st.ResultJSON, st.Summary, st.Error, st.DurationMs, st.RetryCount, st.Round, st.EvidenceID, st.CreatedAt)
 	if err != nil {
 		return err
 	}
@@ -532,7 +574,7 @@ func (s *Store) AppendStep(ctx context.Context, st *RunStep) error {
 // ListSteps 按序号返回一个任务的全部步骤，即时间线。
 func (s *Store) ListSteps(ctx context.Context, runID string) ([]RunStep, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, run_id, seq, kind, tool_name, call_id, args_json, result_json, summary, error, duration_ms, retry_count, created_at
+		`SELECT id, run_id, seq, kind, tool_name, call_id, args_json, result_json, summary, error, duration_ms, retry_count, round, evidence_id, created_at
 		 FROM run_steps WHERE run_id=? ORDER BY seq ASC`, runID)
 	if err != nil {
 		return nil, err
@@ -541,7 +583,7 @@ func (s *Store) ListSteps(ctx context.Context, runID string) ([]RunStep, error) 
 	var out []RunStep
 	for rows.Next() {
 		var st RunStep
-		if err := rows.Scan(&st.ID, &st.RunID, &st.Seq, &st.Kind, &st.ToolName, &st.CallID, &st.ArgsJSON, &st.ResultJSON, &st.Summary, &st.Error, &st.DurationMs, &st.RetryCount, &st.CreatedAt); err != nil {
+		if err := rows.Scan(&st.ID, &st.RunID, &st.Seq, &st.Kind, &st.ToolName, &st.CallID, &st.ArgsJSON, &st.ResultJSON, &st.Summary, &st.Error, &st.DurationMs, &st.RetryCount, &st.Round, &st.EvidenceID, &st.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, st)
@@ -552,7 +594,7 @@ func (s *Store) ListSteps(ctx context.Context, runID string) ([]RunStep, error) 
 // ListStepsAfter 返回序号大于 after 的步骤，供前端增量轮询。
 func (s *Store) ListStepsAfter(ctx context.Context, runID string, after int) ([]RunStep, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, run_id, seq, kind, tool_name, call_id, args_json, result_json, summary, error, duration_ms, retry_count, created_at
+		`SELECT id, run_id, seq, kind, tool_name, call_id, args_json, result_json, summary, error, duration_ms, retry_count, round, evidence_id, created_at
 		 FROM run_steps WHERE run_id=? AND seq>? ORDER BY seq ASC`, runID, after)
 	if err != nil {
 		return nil, err
@@ -561,7 +603,7 @@ func (s *Store) ListStepsAfter(ctx context.Context, runID string, after int) ([]
 	var out []RunStep
 	for rows.Next() {
 		var st RunStep
-		if err := rows.Scan(&st.ID, &st.RunID, &st.Seq, &st.Kind, &st.ToolName, &st.CallID, &st.ArgsJSON, &st.ResultJSON, &st.Summary, &st.Error, &st.DurationMs, &st.RetryCount, &st.CreatedAt); err != nil {
+		if err := rows.Scan(&st.ID, &st.RunID, &st.Seq, &st.Kind, &st.ToolName, &st.CallID, &st.ArgsJSON, &st.ResultJSON, &st.Summary, &st.Error, &st.DurationMs, &st.RetryCount, &st.Round, &st.EvidenceID, &st.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, st)

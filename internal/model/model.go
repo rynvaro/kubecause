@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"sort"
@@ -384,6 +385,9 @@ type RealConfig struct {
 	MaxRetries  int           // 网络 / 429 / 5xx 的重试次数，默认 3
 	Timeout     time.Duration // 每次请求的超时，默认 30 秒
 	Temperature float64       // 模型温度，0-1，诊断场景默认 0.2
+	// Debug 打开时，报告解析失败的字段与片段会打到服务端调试日志
+	//（KUBE_DEBUG_MODEL=1，默认关闭）。
+	Debug bool
 }
 
 func (c RealConfig) withDefaults() RealConfig {
@@ -450,6 +454,15 @@ func (r *Real) SetExtraTools(defs []mcpclient.ToolDef) {
 		cd.Function.Parameters = params
 		r.extraTools = append(r.extraTools, cd)
 	}
+}
+
+// SetDebug 打开/关闭真模型的调试日志：
+// 报告解析失败的字段与片段只在打开时记（KUBE_DEBUG_MODEL=1，
+// main.go 里和 chatSvc.DebugModel 一起开），默认关闭。
+func (r *Real) SetDebug(v bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cfg.Debug = v
 }
 
 // toolDefs 返回本次问模型时用的工具表：
@@ -691,14 +704,54 @@ func (r *Real) Next(ctx context.Context, in agent.ModelInput) (agent.ModelStep, 
 		return agent.ModelStep{}, fmt.Errorf("真模型缺少 API Key，请设置 MODEL_API_KEY")
 	}
 	msgs := buildRealMessages(in)
-	resp, err := r.callWithRetry(ctx, msgs, r.toolDefs())
-	if err != nil {
-		return agent.ModelStep{}, err
+	// submit_diagnosis 的解析失败在这里先处理一遍：
+	// 解析成功直接返回报告；解析失败纠错一次——把字段错误当 tool 结果
+	// 回传（下面追加的一对 assistant+tool 消息），模型重交报告；
+	// 纠错一次仍失败就降级为低置信度收敛报告，不让整轮作废。
+	// 纠错是本轮内的一次额外模型调用（最多一次），不另开预算、
+	// 不重新执行工具；追加的是 assistant（带失败的 tool_calls）+ tool
+	// （字段错误）两条消息，是模型已主动交报告后的协议内错误反馈，
+	// 不是 v0.13.0 删掉的追问 hack——绝不追加假 user 消息。
+	// 循环最多跑两轮：第一轮解析失败会 continue，第二轮无论如何都返回，
+	// 不会死循环。跳出循环时 msg 里已没有 submit_diagnosis。
+	var msg chatMessage
+	corrected := false
+	for attempt := 0; attempt < 2; attempt++ {
+		resp, err := r.callWithRetry(ctx, msgs, r.toolDefs())
+		if err != nil {
+			return agent.ModelStep{}, err
+		}
+		if len(resp.Choices) == 0 {
+			return agent.ModelStep{}, fmt.Errorf("模型返回为空，没有 choices")
+		}
+		msg = resp.Choices[0].Message
+		var diag *chatToolCall
+		for i := range msg.ToolCalls {
+			if msg.ToolCalls[i].Function.Name == "submit_diagnosis" {
+				diag = &msg.ToolCalls[i]
+				break
+			}
+		}
+		if diag == nil {
+			break
+		}
+		rep, err := parseDiagnosisArgs(diag.Function.Arguments)
+		if err == nil {
+			return agent.ModelStep{IsFinal: true, Report: rep}, nil
+		}
+		r.logDiagnosisParseError(diag.Function.Arguments, err)
+		if corrected {
+			// 纠错一次仍失败：低置信度收敛报告，不让整轮作废。
+			// 失败那轮附带的文字也留下来（已标注未经结构化验证）。
+			return agent.ModelStep{IsFinal: true, Report: r.diagnosisFallbackReport(in, err, strings.TrimSpace(msg.Content))}, nil
+		}
+		corrected = true
+		perr := &DiagnosisParseError{ToolCallID: diag.ID, ToolName: diag.Function.Name, Arguments: diag.Function.Arguments, Content: strings.TrimSpace(msg.Content), Err: err}
+		msgs = append(msgs,
+			chatMessage{Role: "assistant", Content: strings.TrimSpace(msg.Content), ToolCalls: []chatToolCall{newChatToolCall(diag.ID, diag.Function.Name, diag.Function.Arguments)}},
+			chatMessage{Role: "tool", Content: perr.CorrectionFeedback(), ToolCallID: diag.ID},
+		)
 	}
-	if len(resp.Choices) == 0 {
-		return agent.ModelStep{}, fmt.Errorf("模型返回为空，没有 choices")
-	}
-	msg := resp.Choices[0].Message
 	// 工具调用：一次返回里的多个调用按返回顺序全部执行，
 	// 不能只取第一个、其余静默丢掉——模型以为它们都执行了。
 	// submit_diagnosis 是终结信号：同一批里只要出现它，只处理它，
@@ -706,15 +759,8 @@ func (r *Real) Next(ctx context.Context, in agent.ModelInput) (agent.ModelStep, 
 	// 查询结果已无意义；继续执行查询只会浪费步数，
 	// 还可能把无关证据带进报告。
 	if len(msg.ToolCalls) > 0 {
-		for _, tc := range msg.ToolCalls {
-			if tc.Function.Name == "submit_diagnosis" {
-				rep, err := parseDiagnosisArgs(tc.Function.Arguments)
-				if err != nil {
-					return agent.ModelStep{}, fmt.Errorf("模型提交的诊断报告解析失败: %w", err)
-				}
-				return agent.ModelStep{IsFinal: true, Report: rep}, nil
-			}
-		}
+		// 注意：submit_diagnosis 在上面已处理（解析成功直接返回报告，
+		// 解析失败纠错一次或降级），到这里的调用里不会再有它。
 		calls := make([]*agent.ToolCall, 0, len(msg.ToolCalls))
 		for i, tc := range msg.ToolCalls {
 			name := tc.Function.Name
@@ -760,6 +806,47 @@ func (r *Real) Next(ctx context.Context, in agent.ModelInput) (agent.ModelStep, 
 		OpenQuestions:   []string{"模型未用结构化方式提交诊断，结论需人工复核"},
 		Confidence:      "medium",
 	}}, nil
+}
+
+// newChatToolCall 拼一次工具调用（纠错时把失败的 submit_diagnosis
+// 原样放回 assistant 消息里，tool 结果才能对上号）。
+func newChatToolCall(id, name, args string) chatToolCall {
+	return chatToolCall{ID: id, Type: "function", Function: struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	}{Name: name, Arguments: args}}
+}
+
+// diagnosisFallbackReport 是 submit_diagnosis 纠错一次仍失败时的降级报告：
+// 低置信度、用已有证据收敛，不让整轮作废。
+// 写法和文本回退、Agent.finishWithPartial 同一路数。
+// content 是失败那轮模型附带的文字（可能为空）：保留下来、
+// 标明未经结构化验证，放在格式错误说明之后、证据摘要之前。
+func (r *Real) diagnosisFallbackReport(in agent.ModelInput, parseErr error, content string) *agent.Report {
+	ids := make([]string, 0, len(in.Evidence))
+	for id := range in.Evidence {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	errText := "未知解析错误"
+	if parseErr != nil {
+		errText = parseErr.Error()
+	}
+	facts := []string{"诊断报告格式有误：" + errText + "，已用已有证据收敛"}
+	if strings.TrimSpace(content) != "" {
+		facts = append(facts, UnverifiedAnalysisLabel+"：\n"+strings.TrimSpace(content))
+	}
+	for _, id := range ids {
+		facts = append(facts, in.Evidence[id])
+	}
+	return &agent.Report{
+		Facts:           facts,
+		Cause:           "模型提交的诊断报告格式错误，无法确定根因",
+		EvidenceIDs:     ids,
+		Recommendations: []string{"修正报告格式后重新诊断，或补查 Pod 状态、事件和日志后再下结论"},
+		OpenQuestions:   []string{"模型未用结构化方式提交诊断，结论需人工复核"},
+		Confidence:      "low",
+	}
 }
 
 // buildRealMessages 把任务和历史拼成发给模型的消息。
@@ -902,16 +989,193 @@ func parseToolArgs(raw string) (map[string]string, error) {
 	return out, nil
 }
 
+// UnverifiedAnalysisLabel 是降级回复里附带模型原文时的标注：
+// 这段文字没经过结构化验证，不能当已验证的诊断结论。
+// 对话降级（runReal）和正式诊断降级（diagnosisFallbackReport）共用同一句。
+const UnverifiedAnalysisLabel = "未经结构化验证的模型分析（仅供参考，不能作为已验证的诊断结论）"
+
+// DiagnosisParseError 是 submit_diagnosis 参数解析失败的错误：
+// 模型主动交了报告，但字段类型不符合 schema。
+// 调用方可以拿它把字段错误当 tool 结果回传给模型纠错一次，
+// 也可以据此降级为部分回复。它不是追问——
+// 模型已经交过报告了，这里只是把解析错误按协议反馈回去。
+type DiagnosisParseError struct {
+	ToolCallID string // 失败那次 submit_diagnosis 调用的 ID
+	ToolName   string // "submit_diagnosis"
+	Arguments  string // 失败那次调用的原始参数
+	Content    string // 模型同批返回的文字（可能为空）
+	Err        error  // 字段级解析错误
+}
+
+func (e *DiagnosisParseError) Error() string {
+	return fmt.Sprintf("模型提交的诊断报告解析失败: %v", e.Err)
+}
+
+func (e *DiagnosisParseError) Unwrap() error { return e.Err }
+
+// CorrectionFeedback 是回传给模型的纠错内容：
+// 字段错误 + 按正确格式重新提交的要求。
+// 明确告诉模型不要重复调用已经执行过的工具——
+// 纠错只补一对 assistant+tool 消息，不重新查任何东西。
+func (e *DiagnosisParseError) CorrectionFeedback() string {
+	return "submit_diagnosis 参数解析失败：" + e.Err.Error() + "。请按工具定义的格式重新提交诊断报告：facts、recommendations、openQuestions、evidenceIds 都是字符串数组，即使只有一条也要写成数组（例如 [\"……\"]）。不要重复调用已经执行过的工具，直接重新提交报告。"
+}
+
+// logDiagnosisParseError 在调试日志里记一条报告解析失败：
+// 字段错误（含字段名和收到的类型）+ 截断后的原始参数片段。
+// 只在 Debug 打开时调；参数里是诊断内容、不含密钥，
+// 超长时截断到 500 字，不记完整响应。
+func (r *Real) logDiagnosisParseError(raw string, err error) {
+	if !r.getCfg().Debug {
+		return
+	}
+	log.Printf("[debug model] submit_diagnosis 解析失败：%v；参数片段：%s", err, truncateRunes(raw, 500))
+}
+
+// jsonKindName 返回一段 JSON 值的类型名（string / number / boolean /
+// object / array / null），给字段类型错误用。
+func jsonKindName(raw json.RawMessage) string {
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return "无效 JSON"
+	}
+	switch v.(type) {
+	case string:
+		return "string"
+	case float64:
+		return "number"
+	case bool:
+		return "boolean"
+	case map[string]any:
+		return "object"
+	case []any:
+		return "array"
+	case nil:
+		return "null"
+	default:
+		return "未知类型"
+	}
+}
+
+// parseStringList 解析报告里的字符串数组字段（facts、evidenceIds、
+// recommendations、openQuestions）：
+//   - 数组：原样返回；缺失或 null：当作没给；
+//   - 单个字符串：包成单元素数组——模型偶尔会把只有一条的事实
+//     写成裸字符串，这是最常见的格式走样，兼容它；
+//   - 对象、数字、布尔等无法明确转换的类型：返回指明字段名的错误，
+//     不要一律 fmt.Sprint 糊过去；数组里混了非字符串元素也一样报错。
+func parseStringList(raw json.RawMessage, field string) ([]string, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
+	}
+	var list []string
+	if err := json.Unmarshal(raw, &list); err == nil {
+		return list, nil
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return []string{s}, nil
+	}
+	if jsonKindName(raw) == "array" {
+		return nil, fmt.Errorf("%s 数组元素应为字符串", field)
+	}
+	return nil, fmt.Errorf("%s 应为字符串数组，收到 %s", field, jsonKindName(raw))
+}
+
+// parseStringField 解析报告里的字符串字段（cause、confidence）：
+// 类型不对时返回指明字段名的错误；缺失或 null 当作空字符串。
+func parseStringField(raw json.RawMessage, field string) (string, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return "", nil
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return "", fmt.Errorf("%s 应为字符串，收到 %s", field, jsonKindName(raw))
+	}
+	return s, nil
+}
+
 // parseDiagnosisArgs 解析 submit_diagnosis 的参数。
+// 先按 json.RawMessage 分层解码，再逐字段解析：
+// 展示用数组字段收到单个字符串时兼容成单元素数组；
+// 收到对象、数字等无法明确转换的类型时返回指明字段名的错误，
+// 调用方据此纠错一次或降级。
+// suggestedRepair / suggestedCreation 继续严格校验：
+// 解析失败时丢弃该建议（报告其余部分照常返回），
+// 绝不因此生成审批卡片、绝不自动生成或执行修复。
+// validRepairSuggestion 校验修复建议的结构完整性：
+// Normalize 之后 Patches 必须非空，每条 Patch 的 op 只能是 replace、
+// path 非空、value 存在。目标字段（namespace / deployment / container）
+// 不在这里要求：转换和提案生成时能从任务目标、会话历史或
+// Deployment 的第一个容器兜底，缺了也不影响卡片转换。
+// 只含旧字段但能转成合法 Patch 的，Normalize 之后同样合格。
+// Path 白名单、目标合法性仍由 Worker 的 ValidatePatch 负责，不在这里重复。
+func validRepairSuggestion(s *agent.SuggestedRepair) bool {
+	if s == nil || len(s.Patches) == 0 {
+		return false
+	}
+	for _, p := range s.Patches {
+		if p.Op != "replace" || strings.TrimSpace(p.Path) == "" || p.Value == nil {
+			return false
+		}
+	}
+	return true
+}
+
 func parseDiagnosisArgs(raw string) (*agent.Report, error) {
-	var v struct {
-		Facts           []string `json:"facts"`
-		Cause           string   `json:"cause"`
-		EvidenceIDs     []string `json:"evidenceIds"`
-		Recommendations []string `json:"recommendations"`
-		OpenQuestions   []string `json:"openQuestions"`
-		Confidence      string   `json:"confidence"`
-		SuggestedRepair *struct {
+	var dto struct {
+		Facts           json.RawMessage `json:"facts"`
+		Cause           json.RawMessage `json:"cause"`
+		EvidenceIDs     json.RawMessage `json:"evidenceIds"`
+		Recommendations json.RawMessage `json:"recommendations"`
+		OpenQuestions   json.RawMessage `json:"openQuestions"`
+		Confidence      json.RawMessage `json:"confidence"`
+		SuggestedRepair json.RawMessage `json:"suggestedRepair"`
+		SuggestedCreation json.RawMessage `json:"suggestedCreation"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &dto); err != nil {
+		return nil, err
+	}
+	facts, err := parseStringList(dto.Facts, "facts")
+	if err != nil {
+		return nil, err
+	}
+	evidenceIDs, err := parseStringList(dto.EvidenceIDs, "evidenceIds")
+	if err != nil {
+		return nil, err
+	}
+	recommendations, err := parseStringList(dto.Recommendations, "recommendations")
+	if err != nil {
+		return nil, err
+	}
+	openQuestions, err := parseStringList(dto.OpenQuestions, "openQuestions")
+	if err != nil {
+		return nil, err
+	}
+	cause, err := parseStringField(dto.Cause, "cause")
+	if err != nil {
+		return nil, err
+	}
+	confidence, err := parseStringField(dto.Confidence, "confidence")
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(cause) == "" {
+		return nil, fmt.Errorf("诊断报告缺少 cause")
+	}
+	if confidence == "" {
+		confidence = "medium"
+	}
+	rep := &agent.Report{
+		Facts: facts, Cause: cause, EvidenceIDs: evidenceIDs,
+		Recommendations: recommendations, OpenQuestions: openQuestions,
+		Confidence: confidence,
+	}
+	// 模型 JSON 缺字段时解出来是 nil，归一化成空数组再返回，
+	// 否则序列化成 null，前端读 .length 会白屏（见 agent.Report.Normalize）。
+	rep.Normalize()
+	if len(dto.SuggestedRepair) > 0 && string(dto.SuggestedRepair) != "null" {
+		var sr struct {
 			Namespace  string `json:"namespace"`
 			Deployment string `json:"deployment"`
 			Container  string `json:"container"`
@@ -924,10 +1188,38 @@ func parseDiagnosisArgs(raw string) (*agent.Report, error) {
 				Path  string `json:"path"`
 				Value any    `json:"value"`
 			} `json:"patches"`
-		} `json:"suggestedRepair"`
+		}
+		if err := json.Unmarshal(dto.SuggestedRepair, &sr); err != nil {
+			// 修复建议严格校验失败：丢弃该建议，不让整份报告作废，
+			// 也不生成审批卡片；丢弃的原因写进 openQuestions，免得悄悄丢了。
+			rep.OpenQuestions = append(rep.OpenQuestions, "模型给出的修复建议格式无效，已丢弃，未生成审批卡片")
+		} else {
+			s := &agent.SuggestedRepair{
+				Namespace: sr.Namespace, Deployment: sr.Deployment,
+				Container: sr.Container, Field: sr.Field,
+				OldValue: sr.OldValue, NewValue: sr.NewValue,
+				Reason: sr.Reason,
+			}
+			for _, p := range sr.Patches {
+				s.Patches = append(s.Patches, agent.PatchOperation{Op: p.Op, Path: p.Path, Value: p.Value})
+			}
+			// 只有旧字段时转成通用 Patch，有 Patches 的直接保留。
+			s.Normalize()
+			if !validRepairSuggestion(s) {
+				// 结构不完整（例如空对象 {}、Patches 为空、Patch 缺字段）：
+				// 丢弃该建议，不生成审批卡片；原因写进 openQuestions。
+				// 只验结构完整性，白名单、目标校验仍由 Worker 的
+				// ValidatePatch / 提案生成负责。
+				rep.OpenQuestions = append(rep.OpenQuestions, "模型给出的修复建议不完整，已丢弃，未生成审批卡片")
+			} else {
+				rep.SuggestedRepair = s
+			}
+		}
+	}
+	if len(dto.SuggestedCreation) > 0 && string(dto.SuggestedCreation) != "null" {
 		// 创建建议（Slice 10）：只有用户明确要求创建 Deployment 时模型才给，
 		// 字段缺一不可（namespace / name / image），缺了后面校验会清掉。
-		SuggestedCreation *struct {
+		var sc struct {
 			Namespace     string  `json:"namespace"`
 			Name          string  `json:"name"`
 			Image         string  `json:"image"`
@@ -938,47 +1230,27 @@ func parseDiagnosisArgs(raw string) (*agent.Report, error) {
 			CpuLimit      string  `json:"cpuLimit"`
 			CpuRequest    string  `json:"cpuRequest"`
 			Reason        string  `json:"reason"`
-		} `json:"suggestedCreation"`
-	}
-	if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &v); err != nil {
-		return nil, err
-	}
-	if strings.TrimSpace(v.Cause) == "" {
-		return nil, fmt.Errorf("诊断报告缺少 cause")
-	}
-	if v.Confidence == "" {
-		v.Confidence = "medium"
-	}
-	rep := &agent.Report{
-		Facts: v.Facts, Cause: v.Cause, EvidenceIDs: v.EvidenceIDs,
-		Recommendations: v.Recommendations, OpenQuestions: v.OpenQuestions,
-		Confidence: v.Confidence,
-	}
-	// 模型 JSON 缺字段时解出来是 nil，归一化成空数组再返回，
-	// 否则序列化成 null，前端读 .length 会白屏（见 agent.Report.Normalize）。
-	rep.Normalize()
-	if v.SuggestedRepair != nil {
-		sr := &agent.SuggestedRepair{
-			Namespace: v.SuggestedRepair.Namespace, Deployment: v.SuggestedRepair.Deployment,
-			Container: v.SuggestedRepair.Container, Field: v.SuggestedRepair.Field,
-			OldValue: v.SuggestedRepair.OldValue, NewValue: v.SuggestedRepair.NewValue,
-			Reason: v.SuggestedRepair.Reason,
 		}
-		for _, p := range v.SuggestedRepair.Patches {
-			sr.Patches = append(sr.Patches, agent.PatchOperation{Op: p.Op, Path: p.Path, Value: p.Value})
-		}
-		// 只有旧字段时转成通用 Patch，有 Patches 的直接保留。
-		sr.Normalize()
-		rep.SuggestedRepair = sr
-	}
-	if v.SuggestedCreation != nil {
-		rep.SuggestedCreation = &agent.SuggestedCreation{
-			Namespace: v.SuggestedCreation.Namespace, Name: v.SuggestedCreation.Name,
-			Image: v.SuggestedCreation.Image, Replicas: int(v.SuggestedCreation.Replicas),
-			Container:   v.SuggestedCreation.Container,
-			MemoryLimit: v.SuggestedCreation.MemoryLimit, MemoryRequest: v.SuggestedCreation.MemoryRequest,
-			CpuLimit: v.SuggestedCreation.CpuLimit, CpuRequest: v.SuggestedCreation.CpuRequest,
-			Reason: v.SuggestedCreation.Reason,
+		if err := json.Unmarshal(dto.SuggestedCreation, &sc); err != nil {
+			// 创建建议严格校验失败：同样丢弃，不生成创建卡片。
+			rep.OpenQuestions = append(rep.OpenQuestions, "模型给出的创建建议格式无效，已丢弃，未生成审批卡片")
+		} else {
+			sc := &agent.SuggestedCreation{
+				Namespace: sc.Namespace, Name: sc.Name,
+				Image: sc.Image, Replicas: int(sc.Replicas),
+				Container:   sc.Container,
+				MemoryLimit: sc.MemoryLimit, MemoryRequest: sc.MemoryRequest,
+				CpuLimit: sc.CpuLimit, CpuRequest: sc.CpuRequest,
+				Reason: sc.Reason,
+			}
+			// 创建建议的结构完整性：namespace、name、image 缺一不可
+			//（与 repair.ValidateCreation 的要求一致）；replicas <= 0
+			// 时下游默认按 1 处理，不算不合格。
+			if sc.Namespace == "" || sc.Name == "" || sc.Image == "" {
+				rep.OpenQuestions = append(rep.OpenQuestions, "模型给出的创建建议不完整，已丢弃，未生成审批卡片")
+			} else {
+				rep.SuggestedCreation = sc
+			}
 		}
 	}
 	return rep, nil
@@ -1072,7 +1344,12 @@ func (r *Real) Chat(ctx context.Context, msgs []ChatMessage) (ChatStep, error) {
 			if tc.Function.Name == "submit_diagnosis" {
 				rep, err := parseDiagnosisArgs(tc.Function.Arguments)
 				if err != nil {
-					return ChatStep{}, fmt.Errorf("模型提交的诊断报告解析失败: %w", err)
+					// 解析失败不直接吞成普通错误：调用方（runReal）要拿
+					// 这个错误纠错一次（把字段错误当 tool 结果回传），
+					// 纠错仍失败再降级为部分回复。纠错不在这里做——
+					// 发给模型的消息数组在调用方手里，那里追加才对。
+					r.logDiagnosisParseError(tc.Function.Arguments, err)
+					return ChatStep{}, &DiagnosisParseError{ToolCallID: tc.ID, ToolName: tc.Function.Name, Arguments: tc.Function.Arguments, Content: content, Err: err}
 				}
 				return ChatStep{IsFinal: true, Content: content, Report: rep}, nil
 			}

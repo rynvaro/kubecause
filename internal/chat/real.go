@@ -3,6 +3,7 @@ package chat
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -169,6 +170,10 @@ func (s *Service) runReal(ctx context.Context, conversationID, roundID, text str
 	var sideTexts []string
 	structured := map[string]any{}
 	lastNS := s.resolveNamespace(ctx, text, history)
+	// correctionUsed：submit_diagnosis 解析失败的纠错只做一次。
+	// 纠错是把字段错误当 tool 结果回传、让模型重交报告，
+	// 占一轮步数（下面的 continue 进下一轮循环），不另开预算。
+	correctionUsed := false
 
 	for step := 0; step < s.maxSteps(); step++ {
 		if debug {
@@ -179,6 +184,44 @@ func (s *Service) runReal(ctx context.Context, conversationID, roundID, text str
 			logModelResponse(conversationID, roundID, step+1, st, err)
 		}
 		if err != nil {
+			var perr *model.DiagnosisParseError
+			if errors.As(err, &perr) {
+				// 最后一轮没有下一轮可跑纠错：continue 之后循环直接结束，
+				// 会掉进通用的“步数用完”降级，用户看到的是“步数用完了”，
+				// 而真实原因是报告格式错误、纠错根本没来得及执行。
+				// 所以最后一轮不安排纠错，直接走下面带格式错误说明的降级。
+				if !correctionUsed && step < s.maxSteps()-1 {
+					// 纠错一次：字段错误当 tool 结果回传，模型重交报告。
+					// 注意：这是模型已主动交报告后的协议内错误反馈，
+					// 不是 v0.13.0 删掉的追问 hack——这里不追加任何假 user 消息，
+					// 只补一对 assistant（带失败的 tool_calls）+ tool（字段错误）消息。
+					// 纠错不重新执行前面已成功的工具，只追加消息。
+					correctionUsed = true
+					msgs = append(msgs,
+						model.ChatMessage{Role: "assistant", Content: perr.Content, ToolCalls: []model.ChatToolCall{{ID: perr.ToolCallID, Name: perr.ToolName, Arguments: perr.Arguments}}},
+						model.ChatMessage{Role: "tool", Content: perr.CorrectionFeedback(), ToolCallID: perr.ToolCallID},
+					)
+					continue
+				}
+				// 纠错一次仍失败，或已是最后一轮没机会纠错：
+				// 降级为部分回复，已查到的工具结果不丢，
+				// 错误写进回复里，RunMessage 会把它和工具卡片一起持久化。
+				// 不把不完整证据包装成高置信诊断：这里没有报告，
+				// 只有“部分结果，仅供参考”。
+				// 失败那轮模型附带的文字也保留下来（perr.Content）：
+				// 它没经过结构化验证，不能当已验证的诊断结论，
+				// 但对用户仍有参考价值。放在 sideTexts 之后、部分结果之前。
+				reply := buildPartialReply(recs, outputs, structured, "诊断报告生成失败："+perr.Err.Error()+"。下面是本轮已经查到的部分结果，仅供参考：\n")
+				var head []string
+				head = append(head, sideTexts...)
+				if strings.TrimSpace(perr.Content) != "" {
+					head = append(head, model.UnverifiedAnalysisLabel+"：\n"+strings.TrimSpace(perr.Content))
+				}
+				if len(head) > 0 {
+					reply.Reply = strings.Join(head, "\n\n") + "\n\n" + reply.Reply
+				}
+				return reply, nil
+			}
 			return nil, fmt.Errorf("调用模型失败: %w", err)
 		}
 		if st.IsFinal {
@@ -260,7 +303,7 @@ func (s *Service) runReal(ctx context.Context, conversationID, roundID, text str
 			}
 			if _, ok := tc.Args["namespace"]; !ok || tc.Args["namespace"] == "" {
 				// 节点工具不补 namespace：它们不带这个参数（查的是节点），
-				// 补了也是多余参数，Server 侧会直接忽略。
+				// 多补了会被 Server 拒绝（SDK 校验 schema 之外的字段，见 issue #11）。
 				if !isDiscovery(tc.Name) && tc.Name != "search_runbooks" && !agent.IsNodeTool(tc.Name) && lastNS != "" {
 					tc.Args["namespace"] = lastNS
 				}
@@ -334,21 +377,23 @@ func (s *Service) runReal(ctx context.Context, conversationID, roundID, text str
 	// 前端按 structured 里的 overview / problemPods 正常渲染卡片和表格，
 	// 用户看到的是已经查到的东西，而不是空白加报错。
 	// 顺带的文字也带上，放在最前面，同样不丢。
-	reply := buildPartialReply(recs, outputs, structured)
+	reply := buildPartialReply(recs, outputs, structured, "已经查到了这些，但步数用完了，还没来得及总结：\n")
 	if len(sideTexts) > 0 {
 		reply.Reply = strings.Join(sideTexts, "\n\n") + "\n\n" + reply.Reply
 	}
 	return reply, nil
 }
 
-// buildPartialReply 把步数用完时已查到的工具结果整理成半成品回复。
-// 文字里诚实说明两件事：已经查到了什么、还没来得及做什么（总结），
+// buildPartialReply 把步数用完（或报告生成失败）时已查到的工具结果
+// 整理成半成品回复。intro 说明为什么没能给完整结论
+//（步数用完 / 报告生成失败），文字里诚实说明两件事：
+// 已经查到了什么、还没来得及做什么（总结），
 // 再问用户想深入查哪个命名空间或 Pod，让下一轮从那里继续，
 // 而不是让用户换个更具体的问题重问——问题本身没错，
 // 错的是后端把“预算用完”当成“用户问错了”报出来。
-func buildPartialReply(recs []ToolCallRecord, outputs []agent.ToolOutput, structured map[string]any) *Reply {
+func buildPartialReply(recs []ToolCallRecord, outputs []agent.ToolOutput, structured map[string]any, intro string) *Reply {
 	var b strings.Builder
-	b.WriteString("已经查到了这些，但步数用完了，还没来得及总结：\n")
+	b.WriteString(intro)
 	seen := map[string]bool{}
 	for _, out := range outputs {
 		if out.Summary == "" || seen[out.Summary] {

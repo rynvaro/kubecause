@@ -82,7 +82,7 @@ func applyConfig(cfg config.Config, chatSvc *chat.Service, realModel *model.Real
 	store.ApplyRunDefaults(cfg.Run.MaxSteps, cfg.Run.TimeoutSeconds, cfg.Run.MaxToolCallsPerRound)
 	repair.ApplyLimits(cfg.Repair.MaxMemoryMi, cfg.Repair.MaxRatio)
 	if realModel != nil {
-		realModel.ApplyModelSettings(time.Duration(cfg.Model.TimeoutSeconds)*time.Second, cfg.Model.Temperature)
+		realModel.ApplyModelSettings(time.Duration(cfg.Model.TimeoutSeconds)*time.Second, cfg.Model.Temperature, cfg.Model.MaxTokens)
 	}
 }
 

@@ -346,10 +346,13 @@ type Tools interface {
 // ModelStep 是模型一次决策的结果：要么调一批工具，要么交最终报告。
 // 一次返回里的多个工具调用要全部执行（按返回顺序），不能只取第一个、
 // 其余静默丢掉——模型以为它们都执行了。
+// Usage 是这一次模型调用的 token 用量（token 用量统计）：
+// 响应里没带 usage 时是零值（桩模型也一样），调用方只累加非零值。
 type ModelStep struct {
 	IsFinal   bool
 	ToolCalls []*ToolCall
 	Report    *Report
+	Usage     store.Usage
 }
 
 // ModelInput 是每次问模型时给它的上下文。
@@ -516,6 +519,11 @@ type Agent struct {
 	// OnStep 在每一步工具调用完成后调用，参数是待持久化的步骤
 	// （Seq 由调用方在写库时确定）。如果 OnStep 返回错误，循环停止。
 	OnStep func(ctx context.Context, step *store.RunStep) error
+	// OnUsage 在每次模型调用成功后调用，参数是这一次的 token 用量
+	// （token 用量统计）：调用方负责累加进任务。nil 时不记用量，
+	// 诊断照常跑。和 OnStep 一样，返回错误时循环停止——
+	// 用量写库失败要看得见，不能悄悄丢（见 issue #9 的处理）。
+	OnUsage func(ctx context.Context, u store.Usage) error
 }
 
 // Run 执行一次诊断循环。
@@ -605,6 +613,18 @@ func (a *Agent) Run(ctx context.Context, run *store.Run, priorSteps []store.RunS
 			Evidence:  evidenceSummary,
 		}
 		step, err := a.Model.Next(ctx, in)
+		// Token 用量：每次 Next 调用后都记账（token 用量统计），
+		// 成功失败都记——Next 在出错返回里也带用量（纠错中后续请求失败、
+		// 参数解析失败等），只要收到模型响应就记。
+		// 成功路径保持严格：OnUsage 出错则循环停止、返回该错误；
+		// Next 出错时记账只做 best-effort：OnUsage 失败时忽略，
+		// 绝不能掩盖原来的模型错误，返回的仍是模型错误。
+		// 用量为零（响应没带 usage、或桩模型）时不写库。
+		if !step.Usage.IsZero() && a.OnUsage != nil {
+			if uerr := a.OnUsage(ctx, step.Usage); uerr != nil && err == nil {
+				return nil, uerr
+			}
+		}
 		if err != nil {
 			return nil, fmt.Errorf("模型决策失败: %w", err)
 		}

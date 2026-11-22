@@ -183,6 +183,16 @@ func (s *Service) runReal(ctx context.Context, conversationID, roundID, text str
 		if debug {
 			logModelResponse(conversationID, roundID, step+1, st, err)
 		}
+		// Token 用量：每次调模型后立即累加进会话（token 用量统计），
+		// 成功失败都记——Chat 在出错返回里也带用量（报告解析失败、
+		// 参数解析失败等）；只要收到模型响应就记，包括纠错轮次与
+		// 最终失败的那次，只有请求本身失败（没拿到响应）时无用量可记。
+		// 响应里没带 usage 时是零值，不写库。写库失败不让整轮对话崩掉：
+		// 用量只是记账，丢一个数字不值得把已经查到的结果作废
+		//（和 recordTool 同一路数）。
+		if !st.Usage.IsZero() {
+			_ = s.Store.AddConversationUsage(ctx, conversationID, st.Usage)
+		}
 		if err != nil {
 			var perr *model.DiagnosisParseError
 			if errors.As(err, &perr) {

@@ -165,6 +165,11 @@ func (w *Worker) execute(ctx context.Context, run *store.Run) error {
 		step.RunID = run.ID
 		return w.Store.AppendStep(ctx, step)
 	}
+	// OnUsage 把每次模型调用的用量累加进任务（token 用量统计）：
+	// 只做加法，恢复后库里已有的累计值保留，不重算。
+	ag.OnUsage = func(ctx context.Context, u store.Usage) error {
+		return w.Store.AddRunUsage(ctx, run.ID, u)
+	}
 	report, err := ag.Run(ctx, run, priorSteps)
 	if err != nil {
 		// 模型决策失败属于任务失败，记一步 error 再标 failed，

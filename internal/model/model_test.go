@@ -763,3 +763,195 @@ func TestRealNextFallsBackToLowConfidenceReport(t *testing.T) {
 		t.Fatalf("纠错只发生一次，总共 2 次请求，得到 %d 次", calls)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Token 用量统计 + max_tokens
+// ---------------------------------------------------------------------------
+
+// toolcallRespWithUsage 是 mockOpenAI "toolcall" 模式的响应，
+// 只是多了 usage 对象。
+func toolcallRespWithUsage(prompt, completion, total int) string {
+	return `{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call-1","type":"function","function":{"name":"get_pod","arguments":"{\"namespace\":\"demo\",\"pod\":\"demo-api-7d9f6c4b5-xk2v9\"}"}}]}}],"usage":{"prompt_tokens":` + strconv.Itoa(prompt) + `,"completion_tokens":` + strconv.Itoa(completion) + `,"total_tokens":` + strconv.Itoa(total) + `}}`
+}
+
+// submitDiagnosisRespWithUsage 和 submitDiagnosisResp 一样，
+// 只是多了 usage 对象。
+func submitDiagnosisRespWithUsage(callID, args string, prompt, completion, total int) string {
+	return `{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"` + callID + `","type":"function","function":{"name":"submit_diagnosis","arguments":` + strconv.Quote(args) + `}}]}}],"usage":{"prompt_tokens":` + strconv.Itoa(prompt) + `,"completion_tokens":` + strconv.Itoa(completion) + `,"total_tokens":` + strconv.Itoa(total) + `}}`
+}
+
+func TestRealCapturesUsage(t *testing.T) {
+	// 响应里带 usage 时，Next 和 Chat 都要把用量带回调用方，
+	// 否则上层没法累计。
+	calls := 0
+	srv, _ := scriptedOpenAI(t, []string{toolcallRespWithUsage(100, 50, 150)}, &calls)
+	defer srv.Close()
+	m := newTestReal(t, srv)
+	step, err := m.Next(context.Background(), testInput())
+	if err != nil {
+		t.Fatalf("Next 失败: %v", err)
+	}
+	if want := (store.Usage{PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150}); step.Usage != want {
+		t.Fatalf("Next 应带回用量 %+v，得到 %+v", want, step.Usage)
+	}
+	cs, err := m.Chat(context.Background(), []ChatMessage{{Role: "user", Content: "demo 有几个 Pod"}})
+	if err != nil {
+		t.Fatalf("Chat 失败: %v", err)
+	}
+	if want := (store.Usage{PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150}); cs.Usage != want {
+		t.Fatalf("Chat 应带回用量 %+v，得到 %+v", want, cs.Usage)
+	}
+}
+
+func TestRealUsageMissingIsZero(t *testing.T) {
+	// 响应里没有 usage 时用量就是零值，不编造。
+	// mockOpenAI 的 toolcall 模式不带 usage。
+	calls := 0
+	srv := mockOpenAI(t, "toolcall", &calls)
+	defer srv.Close()
+	m := newTestReal(t, srv)
+	step, err := m.Next(context.Background(), testInput())
+	if err != nil {
+		t.Fatalf("Next 失败: %v", err)
+	}
+	if !step.Usage.IsZero() {
+		t.Fatalf("没有 usage 的响应应用量应为零值，得到 %+v", step.Usage)
+	}
+}
+
+func TestRealUsageTotalDerived(t *testing.T) {
+	// usage 里 total_tokens 缺失时按输入+输出补齐，
+	// 不把 total 留成 0 误导上层。
+	calls := 0
+	resp := `{"choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":80,"completion_tokens":20}}`
+	srv, _ := scriptedOpenAI(t, []string{resp}, &calls)
+	defer srv.Close()
+	m := newTestReal(t, srv)
+	step, err := m.Next(context.Background(), testInput())
+	if err != nil {
+		t.Fatalf("Next 失败: %v", err)
+	}
+	if want := (store.Usage{PromptTokens: 80, CompletionTokens: 20, TotalTokens: 100}); step.Usage != want {
+		t.Fatalf("total 缺失时应按输入+输出补齐为 %+v，得到 %+v", want, step.Usage)
+	}
+}
+
+func TestRealNextAccumulatesUsageAcrossCorrection(t *testing.T) {
+	// 纠错那次额外调用也花了 token：第一次坏报告和第二次好报告的用量
+	// 都要算进来，不能因为最后只返回一份报告就把前面的丢了。
+	bad := submitDiagnosisRespWithUsage("call-1", `{"facts":123,"cause":"节点状态正常","evidenceIds":[],"confidence":"low"}`, 10, 5, 15)
+	good := submitDiagnosisRespWithUsage("call-2", `{"facts":["节点状态正常"],"cause":"节点状态正常","evidenceIds":["ev-1"],"confidence":"low"}`, 20, 10, 30)
+	calls := 0
+	srv, _ := scriptedOpenAI(t, []string{bad, good}, &calls)
+	defer srv.Close()
+	m := newTestReal(t, srv)
+	step, err := m.Next(context.Background(), testInput())
+	if err != nil {
+		t.Fatalf("纠错后应返回报告，不应报错: %v", err)
+	}
+	if want := (store.Usage{PromptTokens: 30, CompletionTokens: 15, TotalTokens: 45}); step.Usage != want {
+		t.Fatalf("两次调用的用量应累加为 %+v，得到 %+v", want, step.Usage)
+	}
+}
+
+func TestRealMaxTokensOmittedWhenZero(t *testing.T) {
+	// MaxTokens=0（默认）时请求体里不应有 max_tokens 字段，
+	// 走模型默认，而不是发一个 0 过去让服务端按 0 截断输出。
+	calls := 0
+	srv, bodies := scriptedOpenAI(t, []string{toolcallRespWithUsage(1, 1, 2)}, &calls)
+	defer srv.Close()
+	m := newTestReal(t, srv)
+	if _, err := m.Next(context.Background(), testInput()); err != nil {
+		t.Fatalf("Next 失败: %v", err)
+	}
+	if strings.Contains((*bodies)[0], "max_tokens") {
+		t.Fatalf("MaxTokens=0 时请求体不应带 max_tokens，得到 %s", (*bodies)[0])
+	}
+}
+
+func TestRealMaxTokensSentWhenSet(t *testing.T) {
+	// MaxTokens 非 0 时请求体里要带上该值，Next 和 Chat 两条路都要走
+	// 同一个 callWithRetry，只测 Next 不够。
+	calls := 0
+	srv, bodies := scriptedOpenAI(t, []string{toolcallRespWithUsage(1, 1, 2)}, &calls)
+	defer srv.Close()
+	m := NewRealWithConfig(RealConfig{APIKey: "test-key", BaseURL: srv.URL, ModelName: "test-model", HTTPClient: srv.Client(), Timeout: 5 * time.Second, MaxTokens: 2048})
+	if _, err := m.Next(context.Background(), testInput()); err != nil {
+		t.Fatalf("Next 失败: %v", err)
+	}
+	if !strings.Contains((*bodies)[0], `"max_tokens":2048`) {
+		t.Fatalf("MaxTokens=2048 时请求体应带 max_tokens:2048，得到 %s", (*bodies)[0])
+	}
+	if _, err := m.Chat(context.Background(), []ChatMessage{{Role: "user", Content: "hi"}}); err != nil {
+		t.Fatalf("Chat 失败: %v", err)
+	}
+	if !strings.Contains((*bodies)[1], `"max_tokens":2048`) {
+		t.Fatalf("Chat 的请求体也应带 max_tokens:2048，得到 %s", (*bodies)[1])
+	}
+}
+
+func TestRealNextKeepsUsageWhenRetryRequestFails(t *testing.T) {
+	// 审查第 1 项：纠错中第二次请求本身失败时，第一轮已经收到的用量
+	// 不能跟着错误丢了——Next 出错返回里也要带上已攒的 totalUsage。
+	bad := submitDiagnosisRespWithUsage("call-1", `{"facts":123,"cause":"节点状态正常","evidenceIds":[],"confidence":"low"}`, 10, 5, 15)
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, bad)
+			return
+		}
+		// 第二次请求直接 400：不进重试、立即失败（500 会进重试退避，测试变慢）。
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"bad request"}}`))
+	}))
+	defer srv.Close()
+	m := newTestReal(t, srv)
+	step, err := m.Next(context.Background(), testInput())
+	if err == nil {
+		t.Fatalf("第二次请求失败时 Next 应返回错误")
+	}
+	if calls != 2 {
+		t.Fatalf("应只发 2 次请求，得到 %d 次", calls)
+	}
+	if want := (store.Usage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15}); step.Usage != want {
+		t.Fatalf("出错返回也应带上第一轮的用量 %+v，得到 %+v", want, step.Usage)
+	}
+}
+
+func TestRealChatKeepsUsageOnParseError(t *testing.T) {
+	// Chat 交坏报告解析失败时，出错返回里也要带上那次响应的用量，
+	// 否则调用方（runReal）没法记账，第一次烧掉的 token 就丢了。
+	bad := submitDiagnosisRespWithUsage("call-1", `{"facts":123,"cause":"容器内存限制过低","evidenceIds":[],"confidence":"low"}`, 40, 20, 60)
+	calls := 0
+	srv, _ := scriptedOpenAI(t, []string{bad}, &calls)
+	defer srv.Close()
+	m := newTestReal(t, srv)
+	cs, err := m.Chat(context.Background(), []ChatMessage{{Role: "user", Content: "demo-api 为什么重启"}})
+	if err == nil {
+		t.Fatalf("解析失败时 Chat 应返回错误")
+	}
+	if _, ok := err.(*DiagnosisParseError); !ok {
+		t.Fatalf("应返回 DiagnosisParseError，得到 %T", err)
+	}
+	if want := (store.Usage{PromptTokens: 40, CompletionTokens: 20, TotalTokens: 60}); cs.Usage != want {
+		t.Fatalf("出错返回也应带上本次用量 %+v，得到 %+v", want, cs.Usage)
+	}
+}
+
+func TestRealNextKeepsUsageOnToolArgsParseError(t *testing.T) {
+	// 工具参数解析失败时，出错返回里也要带上那次响应的用量。
+	resp := `{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call-1","type":"function","function":{"name":"get_pod","arguments":"not-json{"}}]}}],"usage":{"prompt_tokens":30,"completion_tokens":10,"total_tokens":40}}`
+	calls := 0
+	srv, _ := scriptedOpenAI(t, []string{resp}, &calls)
+	defer srv.Close()
+	m := newTestReal(t, srv)
+	step, err := m.Next(context.Background(), testInput())
+	if err == nil {
+		t.Fatalf("参数解析失败时 Next 应返回错误")
+	}
+	if want := (store.Usage{PromptTokens: 30, CompletionTokens: 10, TotalTokens: 40}); step.Usage != want {
+		t.Fatalf("出错返回也应带上本次用量 %+v，得到 %+v", want, step.Usage)
+	}
+}

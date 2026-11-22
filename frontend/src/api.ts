@@ -9,6 +9,7 @@ import type {
   ConvertPayload,
   RunSnapshot,
   RunStep,
+  Usage,
 } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -31,6 +32,7 @@ export interface ConversationListResponse {
 export interface ConversationDetailResponse {
   id: string
   title: string
+  usage?: Usage
   messages: ConversationMessage[]
 }
 

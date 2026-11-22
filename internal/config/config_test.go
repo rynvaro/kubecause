@@ -23,6 +23,9 @@ func TestDefaults(t *testing.T) {
 	if c.Model.Temperature != 0.2 {
 		t.Fatalf("温度默认值应是 0.2，得到 %v", c.Model.Temperature)
 	}
+	if c.Model.MaxTokens != 4096 {
+		t.Fatalf("单次最大输出 Token 默认值应是 4096，得到 %d", c.Model.MaxTokens)
+	}
 	if c.Repair.MaxMemoryMi != 4096 || c.Repair.MaxRatio != 4 {
 		t.Fatalf("修复上限默认值不对: maxMemoryMi=%d maxRatio=%d", c.Repair.MaxMemoryMi, c.Repair.MaxRatio)
 	}
@@ -67,12 +70,16 @@ func TestLoadEnvOverridesFile(t *testing.T) {
 		t.Fatalf("写测试配置失败: %v", err)
 	}
 	t.Setenv("CHAT_MAX_STEPS", "20")
+	t.Setenv("MODEL_MAX_TOKENS", "2048")
 	c, err := Load(path)
 	if err != nil {
 		t.Fatalf("读配置失败: %v", err)
 	}
 	if c.Chat.MaxSteps != 20 {
 		t.Fatalf("环境变量应优先于文件，得到 %d", c.Chat.MaxSteps)
+	}
+	if c.Model.MaxTokens != 2048 {
+		t.Fatalf("MODEL_MAX_TOKENS 应优先于文件，得到 %d", c.Model.MaxTokens)
 	}
 }
 
@@ -91,6 +98,8 @@ func TestValidateRejectsBadValues(t *testing.T) {
 		{"model.timeoutSeconds=0", func(c *Config) { c.Model.TimeoutSeconds = 0 }},
 		{"model.temperature=2", func(c *Config) { c.Model.Temperature = 2 }},
 		{"model.temperature=-0.1", func(c *Config) { c.Model.Temperature = -0.1 }},
+		{"model.maxTokens=-1", func(c *Config) { c.Model.MaxTokens = -1 }},
+		{"model.maxTokens=40000", func(c *Config) { c.Model.MaxTokens = 40000 }},
 		{"repair.maxMemoryMi=64", func(c *Config) { c.Repair.MaxMemoryMi = 64 }},
 		{"repair.maxRatio=0", func(c *Config) { c.Repair.MaxRatio = 0 }},
 		{"repair.maxRatio=99", func(c *Config) { c.Repair.MaxRatio = 99 }},
@@ -101,6 +110,16 @@ func TestValidateRejectsBadValues(t *testing.T) {
 		if err := c.Validate(); err == nil {
 			t.Fatalf("%s 应校验失败", tc.name)
 		}
+	}
+}
+
+// TestValidateAllowsZeroMaxTokens：maxTokens=0 是合法的“不传”——
+// 0 表示不发 max_tokens 字段、走模型默认，不是非法值。
+func TestValidateAllowsZeroMaxTokens(t *testing.T) {
+	c := Defaults()
+	c.Model.MaxTokens = 0
+	if err := c.Validate(); err != nil {
+		t.Fatalf("maxTokens=0 应通过校验: %v", err)
 	}
 }
 

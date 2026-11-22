@@ -127,6 +127,7 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 		"id": run.ID, "namespace": run.Namespace, "kind": run.Kind, "name": run.Name,
 		"question": run.Question, "status": run.Status,
 		"maxSteps": run.MaxSteps, "timeoutSeconds": run.TimeoutSeconds,
+		"usage": run.Usage,
 		"report": report, "error": run.Error,
 		"steps": steps, "stepCount": len(steps),
 		"proposal": proposal,
@@ -319,7 +320,7 @@ func (h *Handler) GetConversation(w http.ResponseWriter, r *http.Request) {
 	if msgs == nil {
 		msgs = []store.ConversationMessage{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"id": c.ID, "title": c.Title, "messages": msgs})
+	writeJSON(w, http.StatusOK, map[string]any{"id": c.ID, "title": c.Title, "usage": c.Usage, "messages": msgs})
 }
 
 // PostMessageRequest 是 POST /api/conversations/{id}/messages 的请求体。

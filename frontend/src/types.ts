@@ -116,6 +116,15 @@ export interface RunStep {
   createdAt: string
 }
 
+// Token 用量（token 用量统计）：一次或累计若干次模型调用的用量，
+// 值直接取模型响应里的 usage 对象。三个值都为 0 表示还没产生用量
+//（或响应里没带 usage），前端这时不显示用量行，不编数字。
+export interface Usage {
+  promptTokens: number
+  completionTokens: number
+  totalTokens: number
+}
+
 export interface RunSnapshot {
   id: string
   namespace: string
@@ -125,6 +134,7 @@ export interface RunSnapshot {
   status: string
   maxSteps: number
   timeoutSeconds: number
+  usage?: Usage
   report?: Report | null
   error?: string
   steps: RunStep[]
@@ -184,7 +194,7 @@ export interface Conversation {
 export interface AppConfig {
   chat: { maxSteps: number; maxHistoryMessages: number }
   run: { maxSteps: number; timeoutSeconds: number; maxToolCallsPerRound: number }
-  model: { timeoutSeconds: number; temperature: number }
+  model: { timeoutSeconds: number; temperature: number; maxTokens: number }
   repair: { maxMemoryMi: number; maxRatio: number }
 }
 

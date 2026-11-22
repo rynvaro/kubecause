@@ -49,7 +49,7 @@ import {
 } from './components'
 import type { ActivityItem } from './components'
 import { parseStructured, parseToolCalls, toolCallsForAssistant } from './types'
-import type { AppConfig, ChangeRequest, Conversation, ConversationMessage, ConvertPayload, RunSnapshot, RunStep } from './types'
+import type { AppConfig, ChangeRequest, Conversation, ConversationMessage, ConvertPayload, RunSnapshot, RunStep, Usage } from './types'
 
 type Mode = 'chat' | 'run'
 
@@ -141,6 +141,9 @@ export default function App() {
   const [messages, setMessages] = useState<ConversationMessage[]>([])
   const [chatInput, setChatInput] = useState('')
   const [chatBusy, setChatBusy] = useState(false)
+  // 当前会话累计的 token 用量（token 用量统计）：轮询会话时跟着刷新，
+  // 显示在右侧活动面板；为 null 或总数为 0 时不显示用量行。
+  const [convUsage, setConvUsage] = useState<Usage | null>(null)
   const [converting, setConverting] = useState(false)
   const [chatError, setChatError] = useState('')
   const [notice, setNotice] = useState('')
@@ -174,6 +177,36 @@ export default function App() {
   const afterRef = useRef(0)
   const chatPollRef = useRef<number | null>(null)
   const runPollRef = useRef<number | null>(null)
+  // 当前会话 id 的 ref（切换会话竞态修复）：轮询回调闭包里读到的
+  // activeConvId 是创建轮询时的旧值，必须走 ref 才能拿到最新的。
+  const activeConvIdRef = useRef('')
+  // 切换会话时同步写 state 与 ref：只靠 useEffect 同步会有短暂窗口，
+  // 切换与 ref 更新之间旧轮询可能已按旧值写回，所以三处切换都走这里。
+  function setActiveConversation(id: string) {
+    activeConvIdRef.current = id
+    setActiveConvId(id)
+  }
+  // 停掉聊天轮询（切换会话竞态修复）：切换/新建会话、开新轮询前
+  // 都先调它，不让旧轮询继续往当前页面写旧会话的消息和用量。
+  function stopChatPoll() {
+    if (chatPollRef.current) {
+      window.clearInterval(chatPollRef.current)
+      chatPollRef.current = null
+    }
+  }
+  // 输入框的引用（回车后丢焦点修复）：sendChat 开头把 chatBusy 置 true，
+  // 输入框 disabled 后浏览器会立刻把它 blur 掉；跑完 chatBusy 回 false
+  // 也不会自己回来，所以跑完要主动把焦点拿回来。
+  const chatInputRef = useRef<HTMLInputElement>(null)
+  // 上一轮 chatBusy 的值：只在 true -> false 的那次恢复焦点，
+  // 挂载时不抢焦点，平时用户自己点的焦点也不动。
+  const prevChatBusyRef = useRef(false)
+  useEffect(() => {
+    if (prevChatBusyRef.current && !chatBusy) {
+      chatInputRef.current?.focus()
+    }
+    prevChatBusyRef.current = chatBusy
+  }, [chatBusy])
   const messagesWrapRef = useRef<HTMLDivElement>(null)
   const nearBottomRef = useRef(true)
   // 审批卡元素的引用（问题 5）：点转换是用户主动操作，点完强制把
@@ -200,7 +233,7 @@ export default function App() {
 
   useEffect(() => {
     return () => {
-      if (chatPollRef.current) window.clearInterval(chatPollRef.current)
+      stopChatPoll()
       if (runPollRef.current) window.clearInterval(runPollRef.current)
     }
   }, [])
@@ -254,24 +287,33 @@ export default function App() {
   }
 
   async function openConversation(id: string) {
-    setActiveConvId(id)
+    // 切走前先停掉旧会话的轮询，不让它继续往当前页面写旧会话的消息和用量。
+    stopChatPoll()
+    setActiveConversation(id)
     setChatError('')
     setSnapshot(null)
     setSnapshotAnchorId(null)
     try {
       const d = await getConversation(id)
-      setMessages(d.messages)
+      // 快速连点切了两次会话时，先点的那次可能后返回：只写仍是当前会话时。
+      if (id === activeConvIdRef.current) {
+        setMessages(d.messages)
+        setConvUsage(d.usage ?? null)
+      }
     } catch (e) {
       setChatError(e instanceof Error ? e.message : '读取会话失败')
     }
   }
 
   async function newConversation() {
+    // 新建前先停掉旧会话的轮询，不让它继续往当前页面写旧会话的消息和用量。
+    stopChatPoll()
     setChatError('')
     try {
       const c = await createConversation()
-      setActiveConvId(c.id)
+      setActiveConversation(c.id)
       setMessages([])
+      setConvUsage(null)
       setSnapshot(null)
       setSnapshotAnchorId(null)
       await refreshConversations()
@@ -322,28 +364,46 @@ export default function App() {
       if (!convId) {
         const c = await createConversation()
         convId = c.id
-        setActiveConvId(convId)
+        setActiveConversation(convId)
         await refreshConversations()
       }
       // POST 在服务端跑整轮：先轮询会话，tool 消息落盘后立刻显示，
       // 用户能在右侧活动面板实时看到 Agent 正在执行哪个工具，不用等整轮结束。
+      // 用量也跟着轮询刷新：服务端每次调模型成功就累加进会话，轮询能看到
+      // 实时累计，不用等整轮跑完。
+      // 防御性：先清掉可能残留的旧轮询再设新的，避免句柄被覆盖后旧轮询泄漏。
+      stopChatPoll()
       chatPollRef.current = window.setInterval(() => {
+        // 切到别的会话后旧轮询不再写当前页面：convId 不是当前会话就跳过，
+        // 不写消息也不写用量。
+        if (convId !== activeConvIdRef.current) return
         void getConversation(convId)
-          .then((d) => setMessages(d.messages))
+          .then((d) => {
+            // 请求发出后、返回前用户可能已切走：写之前再校验一次，
+            // 只写仍是当前会话时，不让已发出的旧请求盖掉新页面。
+            if (convId !== activeConvIdRef.current) return
+            setMessages(d.messages)
+            setConvUsage(d.usage ?? null)
+          })
           .catch(() => undefined)
       }, 800)
       await postChatMessage(convId, content)
     } catch (e) {
       setChatError(e instanceof Error ? e.message : '发送失败')
     } finally {
-      if (chatPollRef.current) {
-        window.clearInterval(chatPollRef.current)
-        chatPollRef.current = null
-      }
+      stopChatPoll()
       setChatBusy(false)
       try {
-        const d = await getConversation(convId)
-        setMessages(d.messages)
+        // 切换会话后不再回写：最终刷新也只写 convId 仍是当前会话时。
+        // 发请求前先判一次（避免发无用请求），await 之后、写之前再判一次
+        //（await 期间用户一切换，旧结果依然会回写）。
+        if (convId === activeConvIdRef.current) {
+          const d = await getConversation(convId)
+          if (convId === activeConvIdRef.current) {
+            setMessages(d.messages)
+            setConvUsage(d.usage ?? null)
+          }
+        }
       } catch {
         // 最终刷新失败时保留轮询到的消息，不清空。
       }
@@ -498,6 +558,10 @@ export default function App() {
   // 单次诊断模式用当前任务的步骤；正在执行时另加一行转圈提示。
   const activityItems = mode === 'chat' ? chatActivityItems(messages) : runActivityItems(events)
   const activityRunning = mode === 'chat' ? chatBusy : snapshot ? runStillActive(snapshot) : false
+  // 活动面板顶上显示的累计 Token 用量（token 用量统计）：
+  // 对话模式取当前会话的累计，单次诊断取任务快照的累计；
+  // 总数为 0 时不显示这行，不编数字。
+  const activityUsage = mode === 'chat' ? convUsage : (snapshot?.usage ?? null)
   const runTotalMs = events.reduce((s, e) => s + (e.durationMs > 0 ? e.durationMs : 0), 0)
 
   // 右侧活动面板的滚动（问题 2）：顺序留在下面（新的在下，和聊天、
@@ -683,9 +747,15 @@ export default function App() {
                   随时都能点的旧按钮——没有建议卡时点它没有意义。 */}
               <div className="composer">
                 <input
+                  ref={chatInputRef}
                   value={chatInput}
                   onChange={(e) => setChatInput(e.target.value)}
                   onKeyDown={(e) => {
+                    // 中文输入法组字中（例如拼音刚敲完 pod 还没选词），
+                    // 回车是确认候选词，不是发送：isComposing 为 true 时
+                    // 直接 return，不走下面的发送分支；组字结束后
+                    // 再按回车才发送。
+                    if (e.nativeEvent.isComposing) return
                     if (e.key === 'Enter' && !e.shiftKey) {
                       e.preventDefault()
                       void sendChat()
@@ -763,6 +833,12 @@ export default function App() {
           <p className="muted small">
             每一步工具一张卡片，可点开展开看参数和结果。正在执行的卡片高亮。
           </p>
+          {activityUsage && activityUsage.totalTokens > 0 && (
+            <p className="muted small">
+              Token 用量：共 {activityUsage.totalTokens}（输入 {activityUsage.promptTokens}／输出{' '}
+              {activityUsage.completionTokens}）
+            </p>
+          )}
           {activityHasNew && (
             <button className="new-below activity-new" onClick={scrollActivityToBottom}>
               ↓ 有新内容
@@ -888,6 +964,22 @@ export default function App() {
                     }
                   />
                   <span className="muted small">越低越按证据说话，越高越自由发挥。诊断场景建议保持 0.2。</span>
+                </label>
+                <label>
+                  单次最大输出 Token
+                  <input
+                    type="number"
+                    min={0}
+                    max={32768}
+                    value={cfg.model.maxTokens}
+                    onChange={(e) =>
+                      setCfg({ ...cfg, model: { ...cfg.model, maxTokens: Number(e.target.value) } })
+                    }
+                  />
+                  <span className="muted small">
+                    限制模型一次回答最多输出多少 Token，0 表示不传、走模型默认。默认 4096，诊断报告一般只有几百
+                    Token，基本碰不到上限，只是防单次输出失控。
+                  </span>
                 </label>
                 <h4>修复上限</h4>
                 <label>

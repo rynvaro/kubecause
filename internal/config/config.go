@@ -55,6 +55,12 @@ type Config struct {
 		// Temperature 是模型温度，0-1。诊断场景默认 0.2，
 		// 温度越低模型越按证据说话、越少自由发挥。
 		Temperature float64 `yaml:"temperature" json:"temperature"`
+		// MaxTokens 是每次模型请求的最大输出 token（token 用量统计的配套配置）：
+		// 0 表示不传 max_tokens 字段，走模型默认；非 0 时按这个值发。
+		// 宽松默认 4096：诊断报告一般只有几百 token，基本碰不到上限，
+		// 只是防单次输出失控。累计预算不在这里做——等真实用量数据
+		// 出来再定，不凭感觉拍一个数。
+		MaxTokens int `yaml:"maxTokens" json:"maxTokens"`
 	} `yaml:"model" json:"model"`
 	Repair struct {
 		// MaxMemoryMi 是修复建议允许的新值上限（MiB），默认 4096 即 4Gi。
@@ -76,6 +82,7 @@ func Defaults() Config {
 	c.Run.MaxToolCallsPerRound = 5
 	c.Model.TimeoutSeconds = 30
 	c.Model.Temperature = 0.2
+	c.Model.MaxTokens = 4096
 	c.Repair.MaxMemoryMi = 4096
 	c.Repair.MaxRatio = 4
 	return c
@@ -113,6 +120,9 @@ func (c Config) Validate() error {
 	}
 	if c.Model.Temperature < 0 || c.Model.Temperature > 1 {
 		return fmt.Errorf("model.temperature 必须在 0-1 之间，得到 %v", c.Model.Temperature)
+	}
+	if err := check("model.maxTokens", c.Model.MaxTokens, 0, 32768); err != nil {
+		return err
 	}
 	if c.Repair.MaxMemoryMi < 128 || c.Repair.MaxMemoryMi > 16384 {
 		return fmt.Errorf("repair.maxMemoryMi 必须在 128-16384 之间，得到 %d", c.Repair.MaxMemoryMi)
@@ -173,6 +183,9 @@ func applyEnv(c *Config) {
 	}
 	if v, ok := envFloat("MODEL_TEMPERATURE"); ok {
 		c.Model.Temperature = v
+	}
+	if v, ok := envInt("MODEL_MAX_TOKENS"); ok {
+		c.Model.MaxTokens = v
 	}
 	if v, ok := envInt("REPAIR_MAX_MEMORY_MI"); ok {
 		c.Repair.MaxMemoryMi = int64(v)

@@ -27,6 +27,7 @@ import (
 
 	"kubecause/internal/agent"
 	"kubecause/internal/mcpclient"
+	"kubecause/internal/store"
 )
 
 // Stub 是确定性桩模型。
@@ -388,6 +389,12 @@ type RealConfig struct {
 	// Debug 打开时，报告解析失败的字段与片段会打到服务端调试日志
 	//（KUBE_DEBUG_MODEL=1，默认关闭）。
 	Debug bool
+	// MaxTokens 是每次请求的最大输出 token（token 用量统计的配套配置）：
+	// 0 表示不传该字段，走模型默认；非 0 时按配置发 max_tokens。
+	// 宽松默认 4096：诊断报告一般只有几百 token，基本碰不到上限，
+	// 只是防单次输出失控。累计预算不在这里做——等真实用量数据
+	// 出来再定，不凭感觉拍一个数。
+	MaxTokens int
 }
 
 func (c RealConfig) withDefaults() RealConfig {
@@ -482,15 +489,16 @@ func (r *Real) toolDefs() []chatToolDef {
 	return out
 }
 
-// ApplyModelSettings 热更新模型的超时和温度（配置中心 POST 后调），
-// 不用重启；温度非法时不改，保持旧值。
-func (r *Real) ApplyModelSettings(timeout time.Duration, temperature float64) {
-	if timeout <= 0 || temperature < 0 || temperature > 1 {
+// ApplyModelSettings 热更新模型的超时、温度和单次最大输出 token
+//（配置中心 POST 后调），不用重启；有任何一个值非法时都不改，保持旧值。
+func (r *Real) ApplyModelSettings(timeout time.Duration, temperature float64, maxTokens int) {
+	if timeout <= 0 || temperature < 0 || temperature > 1 || maxTokens < 0 || maxTokens > 32768 {
 		return
 	}
 	r.mu.Lock()
 	r.cfg.Timeout = timeout
 	r.cfg.Temperature = temperature
+	r.cfg.MaxTokens = maxTokens
 	r.mu.Unlock()
 }
 
@@ -542,6 +550,9 @@ type chatRequest struct {
 	Tools       []chatToolDef `json:"tools,omitempty"`
 	ToolChoice  string        `json:"tool_choice,omitempty"`
 	Temperature float64       `json:"temperature"`
+	// MaxTokens 是单次最大输出 token，0 时不发这个字段（omitempty），
+	// 走模型默认；非 0 时按配置中心 model.maxTokens 发。
+	MaxTokens int `json:"max_tokens,omitempty"`
 }
 
 type chatToolDef struct {
@@ -557,11 +568,31 @@ type chatResponse struct {
 	Choices []struct {
 		Message chatMessage `json:"message"`
 	} `json:"choices"`
+	// Usage 是这次调用的 token 用量（token 用量统计）：
+	// 服务端没返回时全为零，调用方只累加非零值，绝不编造。
+	Usage struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+		TotalTokens      int `json:"total_tokens"`
+	} `json:"usage,omitempty"`
 	Error *struct {
 		Message string `json:"message"`
 		Type    string `json:"type"`
 		Code    string `json:"code"`
 	} `json:"error,omitempty"`
+}
+
+// usageOf 从一次 chat completions 响应里取 token 用量：
+// 没有 usage 字段时返回零值，不编造；total 缺失时按输入+输出补齐。
+func usageOf(resp *chatResponse) store.Usage {
+	if resp == nil {
+		return store.Usage{}
+	}
+	return store.Usage{
+		PromptTokens:     resp.Usage.PromptTokens,
+		CompletionTokens: resp.Usage.CompletionTokens,
+		TotalTokens:      resp.Usage.TotalTokens,
+	}.Normalized()
 }
 
 // toolsWithNamespace 是内置工具里顶层参数声明了 namespace 的集合，
@@ -716,13 +747,21 @@ func (r *Real) Next(ctx context.Context, in agent.ModelInput) (agent.ModelStep, 
 	// 不会死循环。跳出循环时 msg 里已没有 submit_diagnosis。
 	var msg chatMessage
 	corrected := false
+	// totalUsage 攒着本轮 Next 里所有模型调用的用量（token 用量统计）：
+	// 纠错那次额外调用也算，解析失败那次也算——花了就是花了，
+	// 不能因为最后只返回一份报告就把前面的用量丢了。
+	// 统计口径：只要收到模型响应就记用量，包括纠错轮次与最终失败的那次；
+	// 只有请求本身失败（没拿到响应）时无用量可记。所以下面所有出错返回
+	// 都带上已攒的 totalUsage，调用方（Agent.Run）出错时也记账。
+	var totalUsage store.Usage
 	for attempt := 0; attempt < 2; attempt++ {
 		resp, err := r.callWithRetry(ctx, msgs, r.toolDefs())
 		if err != nil {
-			return agent.ModelStep{}, err
+			return agent.ModelStep{Usage: totalUsage}, err
 		}
+		totalUsage = totalUsage.Add(usageOf(resp))
 		if len(resp.Choices) == 0 {
-			return agent.ModelStep{}, fmt.Errorf("模型返回为空，没有 choices")
+			return agent.ModelStep{Usage: totalUsage}, fmt.Errorf("模型返回为空，没有 choices")
 		}
 		msg = resp.Choices[0].Message
 		var diag *chatToolCall
@@ -737,13 +776,13 @@ func (r *Real) Next(ctx context.Context, in agent.ModelInput) (agent.ModelStep, 
 		}
 		rep, err := parseDiagnosisArgs(diag.Function.Arguments)
 		if err == nil {
-			return agent.ModelStep{IsFinal: true, Report: rep}, nil
+			return agent.ModelStep{IsFinal: true, Report: rep, Usage: totalUsage}, nil
 		}
 		r.logDiagnosisParseError(diag.Function.Arguments, err)
 		if corrected {
 			// 纠错一次仍失败：低置信度收敛报告，不让整轮作废。
 			// 失败那轮附带的文字也留下来（已标注未经结构化验证）。
-			return agent.ModelStep{IsFinal: true, Report: r.diagnosisFallbackReport(in, err, strings.TrimSpace(msg.Content))}, nil
+			return agent.ModelStep{IsFinal: true, Report: r.diagnosisFallbackReport(in, err, strings.TrimSpace(msg.Content)), Usage: totalUsage}, nil
 		}
 		corrected = true
 		perr := &DiagnosisParseError{ToolCallID: diag.ID, ToolName: diag.Function.Name, Arguments: diag.Function.Arguments, Content: strings.TrimSpace(msg.Content), Err: err}
@@ -766,7 +805,9 @@ func (r *Real) Next(ctx context.Context, in agent.ModelInput) (agent.ModelStep, 
 			name := tc.Function.Name
 			args, err := parseToolArgs(tc.Function.Arguments)
 			if err != nil {
-				return agent.ModelStep{}, fmt.Errorf("模型返回的工具参数解析失败: %w", err)
+				// 参数解析失败也带上已攒的用量：这轮的响应已经收到了，
+				// 花掉的 token 不能因为参数解析失败就丢了。
+				return agent.ModelStep{Usage: totalUsage}, fmt.Errorf("模型返回的工具参数解析失败: %w", err)
 			}
 			// 模型漏填 namespace 时补上任务的 namespace，缺了它 Agent 会拒绝执行。
 			// 只给 schema 里声明了 namespace 的内置工具补（toolsWithNamespace）：
@@ -785,15 +826,16 @@ func (r *Real) Next(ctx context.Context, in agent.ModelInput) (agent.ModelStep, 
 			// Agent 的 ValidateToolCall 会拒绝它并记一步错误，循环继续。
 			calls = append(calls, &agent.ToolCall{ID: id, Name: name, Args: args})
 		}
-		return agent.ModelStep{ToolCalls: calls}, nil
+		return agent.ModelStep{ToolCalls: calls, Usage: totalUsage}, nil
 	}
 	// 没有工具调用时，把文本当作最终结论处理。
 	content := strings.TrimSpace(msg.Content)
 	if content == "" {
-		return agent.ModelStep{}, fmt.Errorf("模型既没有调工具也没有返回文本")
+		// 空回复也带上已攒的用量：响应已经收到了，用量是真实消耗。
+		return agent.ModelStep{Usage: totalUsage}, fmt.Errorf("模型既没有调工具也没有返回文本")
 	}
 	if rep, err := tryParseReportJSON(content); err == nil {
-		return agent.ModelStep{IsFinal: true, Report: rep}, nil
+		return agent.ModelStep{IsFinal: true, Report: rep, Usage: totalUsage}, nil
 	}
 	ids := make([]string, 0, len(in.Evidence))
 	for id := range in.Evidence {
@@ -805,7 +847,7 @@ func (r *Real) Next(ctx context.Context, in agent.ModelInput) (agent.ModelStep, 
 		Recommendations: []string{"根据报告进一步核对证据后再决定是否修复"},
 		OpenQuestions:   []string{"模型未用结构化方式提交诊断，结论需人工复核"},
 		Confidence:      "medium",
-	}}, nil
+	}, Usage: totalUsage}, nil
 }
 
 // newChatToolCall 拼一次工具调用（纠错时把失败的 submit_diagnosis
@@ -900,7 +942,7 @@ func (r *Real) callWithRetry(ctx context.Context, msgs []chatMessage, tools []ch
 	cfg := r.getCfg()
 	body, err := json.Marshal(chatRequest{
 		Model: cfg.ModelName, Messages: msgs, Tools: tools,
-		ToolChoice: "auto", Temperature: cfg.Temperature,
+		ToolChoice: "auto", Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens,
 	})
 	if err != nil {
 		return nil, err
@@ -1298,6 +1340,9 @@ type ChatStep struct {
 	ToolCalls []*agent.ToolCall
 	Report    *agent.Report
 	IsFinal   bool
+	// Usage 是这一次模型调用的 token 用量（token 用量统计）：
+	// 响应里没带 usage 时是零值，调用方只累加非零值。
+	Usage store.Usage
 }
 
 // Chat 问一次真模型，专供对话循环用：
@@ -1327,8 +1372,14 @@ func (r *Real) Chat(ctx context.Context, msgs []ChatMessage) (ChatStep, error) {
 	if err != nil {
 		return ChatStep{}, err
 	}
+	// 用量在拿到响应后立刻算出来：下面所有返回（成功、解析失败、
+	// 参数解析失败、空回复）都带上它——只要收到响应就记用量，
+	// 只有请求本身失败（没拿到响应）时无用量可记。
+	// 解析失败时用量走返回的 ChatStep，不走 DiagnosisParseError，
+	// 调用方（runReal）出错时也记账。
+	u := usageOf(resp)
 	if len(resp.Choices) == 0 {
-		return ChatStep{}, fmt.Errorf("模型返回为空，没有 choices")
+		return ChatStep{Usage: u}, fmt.Errorf("模型返回为空，没有 choices")
 	}
 	msg := resp.Choices[0].Message
 	// 文字和工具调用可以同时存在（模型一边说“我来查一下”一边调工具，
@@ -1349,16 +1400,18 @@ func (r *Real) Chat(ctx context.Context, msgs []ChatMessage) (ChatStep, error) {
 					// 纠错仍失败再降级为部分回复。纠错不在这里做——
 					// 发给模型的消息数组在调用方手里，那里追加才对。
 					r.logDiagnosisParseError(tc.Function.Arguments, err)
-					return ChatStep{}, &DiagnosisParseError{ToolCallID: tc.ID, ToolName: tc.Function.Name, Arguments: tc.Function.Arguments, Content: content, Err: err}
+					return ChatStep{Usage: u}, &DiagnosisParseError{ToolCallID: tc.ID, ToolName: tc.Function.Name, Arguments: tc.Function.Arguments, Content: content, Err: err}
 				}
-				return ChatStep{IsFinal: true, Content: content, Report: rep}, nil
+				return ChatStep{IsFinal: true, Content: content, Report: rep, Usage: u}, nil
 			}
 		}
 		calls := make([]*agent.ToolCall, 0, len(msg.ToolCalls))
 		for i, tc := range msg.ToolCalls {
 			args, err := parseToolArgs(tc.Function.Arguments)
 			if err != nil {
-				return ChatStep{}, fmt.Errorf("模型返回的工具参数解析失败: %w", err)
+				// 参数解析失败也带上用量：这轮的响应已经收到了，
+				// 花掉的 token 不能因为参数解析失败就丢了。
+				return ChatStep{Usage: u}, fmt.Errorf("模型返回的工具参数解析失败: %w", err)
 			}
 			id := tc.ID
 			if id == "" {
@@ -1366,10 +1419,10 @@ func (r *Real) Chat(ctx context.Context, msgs []ChatMessage) (ChatStep, error) {
 			}
 			calls = append(calls, &agent.ToolCall{ID: id, Name: tc.Function.Name, Args: args})
 		}
-		return ChatStep{Content: content, ToolCalls: calls}, nil
+		return ChatStep{Content: content, ToolCalls: calls, Usage: u}, nil
 	}
 	if content == "" {
-		return ChatStep{}, fmt.Errorf("模型既没有调工具也没有返回文本")
+		return ChatStep{Usage: u}, fmt.Errorf("模型既没有调工具也没有返回文本")
 	}
-	return ChatStep{IsFinal: true, Content: content}, nil
+	return ChatStep{IsFinal: true, Content: content, Usage: u}, nil
 }

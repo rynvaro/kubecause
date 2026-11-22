@@ -61,6 +61,39 @@ const (
 	VerifyTimeout    = "timeout"
 )
 
+// Usage 是一次或累计若干次模型调用的 token 用量（token 用量统计）：
+// 值直接取 chat completions 响应里的 usage 对象，不自己估算；
+// 响应里没有 usage 时就是零值，绝不编造。TotalTokens 为 0 但
+// prompt / completion 有值时按两者之和算（部分服务不返回 total）。
+type Usage struct {
+	PromptTokens     int `json:"promptTokens"`
+	CompletionTokens int `json:"completionTokens"`
+	TotalTokens      int `json:"totalTokens"`
+}
+
+// Add 返回两个用量的和。
+func (u Usage) Add(o Usage) Usage {
+	return Usage{
+		PromptTokens:     u.PromptTokens + o.PromptTokens,
+		CompletionTokens: u.CompletionTokens + o.CompletionTokens,
+		TotalTokens:      u.TotalTokens + o.TotalTokens,
+	}
+}
+
+// Normalized 在 TotalTokens 缺失时按输入+输出补齐；
+// 三个值都为 0 时原样返回零值，不编数字。
+func (u Usage) Normalized() Usage {
+	if u.TotalTokens == 0 && (u.PromptTokens > 0 || u.CompletionTokens > 0) {
+		u.TotalTokens = u.PromptTokens + u.CompletionTokens
+	}
+	return u
+}
+
+// IsZero 报告用量是否全为零（响应里没带 usage 时就是零值）。
+func (u Usage) IsZero() bool {
+	return u.PromptTokens == 0 && u.CompletionTokens == 0 && u.TotalTokens == 0
+}
+
 // Run 对应 runs 表，一行就是一次诊断任务。
 type Run struct {
 	ID             string `json:"id"`
@@ -75,6 +108,9 @@ type Run struct {
 	// 默认 5（见 DefaultRunMaxToolCallsPerRound）：超过上限的调用不执行，
 	// 记一步错误告诉模型分轮调。0 表示用默认值，不是不限。
 	MaxToolCallsPerRound int `json:"maxToolCallsPerRound"`
+	// Usage 是本次任务累计的 token 用量：每次模型调用成功后累加，
+	// 恢复后从库里读的累计值保留，只做加法、从不重算。
+	Usage Usage `json:"usage"`
 	// ReportJSON 是诊断报告的 JSON，空字符串表示还没有报告。
 	ReportJSON string `json:"-"`
 	// SuggestedJSON 是对话转正式诊断时带过来的修复建议（Slice 10），
@@ -195,6 +231,9 @@ type ChangeRequest struct {
 type Conversation struct {
 	ID        string    `json:"id"`
 	Title     string    `json:"title"`
+	// Usage 是本会话累计的 token 用量：每轮对话里每次模型调用成功后累加，
+	// 只做加法、从不重算。
+	Usage     Usage     `json:"usage"`
 	CreatedAt time.Time `json:"createdAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
 }
@@ -270,6 +309,9 @@ func (s *Store) migrate(ctx context.Context) error {
 			max_steps INTEGER NOT NULL DEFAULT 8,
 			timeout_seconds INTEGER NOT NULL DEFAULT 60,
 			max_tool_calls_per_round INTEGER NOT NULL DEFAULT 5,
+			prompt_tokens INTEGER NOT NULL DEFAULT 0,
+			completion_tokens INTEGER NOT NULL DEFAULT 0,
+			total_tokens INTEGER NOT NULL DEFAULT 0,
 			report_json TEXT NOT NULL DEFAULT '',
 			suggested_json TEXT NOT NULL DEFAULT '',
 			creation_json TEXT NOT NULL DEFAULT '',
@@ -325,6 +367,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS conversations (
 			id TEXT PRIMARY KEY,
 			title TEXT NOT NULL DEFAULT '',
+			prompt_tokens INTEGER NOT NULL DEFAULT 0,
+			completion_tokens INTEGER NOT NULL DEFAULT 0,
+			total_tokens INTEGER NOT NULL DEFAULT 0,
 			created_at DATETIME NOT NULL,
 			updated_at DATETIME NOT NULL
 		)`,
@@ -390,6 +435,21 @@ func (s *Store) migrate(ctx context.Context) error {
 	// 老库没有时补上，读出来是空字符串，只贡献 CallID，不参与 ev 号分配。
 	if err := s.ensureColumn(ctx, "run_steps", "evidence_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
+	}
+	// runs / conversations 表的老库升级（token 用量统计）：
+	// 累计 token 用量三列，老库没有时补上，读出来是 0，
+	// 新调用的用量只做加法累加，不重算、不覆盖。
+	for _, col := range []struct{ name, typ string }{
+		{"prompt_tokens", "INTEGER NOT NULL DEFAULT 0"},
+		{"completion_tokens", "INTEGER NOT NULL DEFAULT 0"},
+		{"total_tokens", "INTEGER NOT NULL DEFAULT 0"},
+	} {
+		if err := s.ensureColumn(ctx, "runs", col.name, col.typ); err != nil {
+			return err
+		}
+		if err := s.ensureColumn(ctx, "conversations", col.name, col.typ); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -472,9 +532,9 @@ func (s *Store) CreateRun(ctx context.Context, r *Run) error {
 // GetRun 按 ID 取任务，不存在返回 sql.ErrNoRows。
 func (s *Store) GetRun(ctx context.Context, id string) (*Run, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, namespace, kind, name, question, status, max_steps, timeout_seconds, max_tool_calls_per_round, report_json, suggested_json, creation_json, error, created_at, updated_at FROM runs WHERE id=?`, id)
+		`SELECT id, namespace, kind, name, question, status, max_steps, timeout_seconds, max_tool_calls_per_round, prompt_tokens, completion_tokens, total_tokens, report_json, suggested_json, creation_json, error, created_at, updated_at FROM runs WHERE id=?`, id)
 	r := &Run{}
-	err := row.Scan(&r.ID, &r.Namespace, &r.Kind, &r.Name, &r.Question, &r.Status, &r.MaxSteps, &r.TimeoutSeconds, &r.MaxToolCallsPerRound, &r.ReportJSON, &r.SuggestedJSON, &r.CreationJSON, &r.Error, &r.CreatedAt, &r.UpdatedAt)
+	err := row.Scan(&r.ID, &r.Namespace, &r.Kind, &r.Name, &r.Question, &r.Status, &r.MaxSteps, &r.TimeoutSeconds, &r.MaxToolCallsPerRound, &r.Usage.PromptTokens, &r.Usage.CompletionTokens, &r.Usage.TotalTokens, &r.ReportJSON, &r.SuggestedJSON, &r.CreationJSON, &r.Error, &r.CreatedAt, &r.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -491,10 +551,10 @@ func (s *Store) ClaimNext(ctx context.Context) (*Run, error) {
 	}
 	defer func() { _ = tx.Rollback() }()
 	row := tx.QueryRowContext(ctx,
-		`SELECT id, namespace, kind, name, question, status, max_steps, timeout_seconds, max_tool_calls_per_round, report_json, suggested_json, creation_json, error, created_at, updated_at
+		`SELECT id, namespace, kind, name, question, status, max_steps, timeout_seconds, max_tool_calls_per_round, prompt_tokens, completion_tokens, total_tokens, report_json, suggested_json, creation_json, error, created_at, updated_at
 		 FROM runs WHERE status='queued' ORDER BY created_at ASC LIMIT 1`)
 	r := &Run{}
-	if err := row.Scan(&r.ID, &r.Namespace, &r.Kind, &r.Name, &r.Question, &r.Status, &r.MaxSteps, &r.TimeoutSeconds, &r.MaxToolCallsPerRound, &r.ReportJSON, &r.SuggestedJSON, &r.CreationJSON, &r.Error, &r.CreatedAt, &r.UpdatedAt); err != nil {
+	if err := row.Scan(&r.ID, &r.Namespace, &r.Kind, &r.Name, &r.Question, &r.Status, &r.MaxSteps, &r.TimeoutSeconds, &r.MaxToolCallsPerRound, &r.Usage.PromptTokens, &r.Usage.CompletionTokens, &r.Usage.TotalTokens, &r.ReportJSON, &r.SuggestedJSON, &r.CreationJSON, &r.Error, &r.CreatedAt, &r.UpdatedAt); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
@@ -532,6 +592,21 @@ func (s *Store) SetStatus(ctx context.Context, id, status, reportJSON, errMsg st
 	_, err := s.db.ExecContext(ctx,
 		`UPDATE runs SET status=?, report_json=?, error=?, updated_at=? WHERE id=?`,
 		status, reportJSON, errMsg, now(), id)
+	return err
+}
+
+// AddRunUsage 把一次模型调用的用量累加到任务上（token 用量统计）：
+// 每次 Next 成功后调一次；恢复后从库里读的累计值保留，
+// 这里只做加法、从不重算——断点续跑不会丢已花的用量。
+// 用量为零（响应里没带 usage、或桩模型）时不写库。
+func (s *Store) AddRunUsage(ctx context.Context, runID string, u Usage) error {
+	if u.IsZero() {
+		return nil
+	}
+	u = u.Normalized()
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE runs SET prompt_tokens=prompt_tokens+?, completion_tokens=completion_tokens+?, total_tokens=total_tokens+?, updated_at=? WHERE id=?`,
+		u.PromptTokens, u.CompletionTokens, u.TotalTokens, now(), runID)
 	return err
 }
 
@@ -851,9 +926,9 @@ func (s *Store) CreateConversation(ctx context.Context, title string) (*Conversa
 
 // GetConversation 按 ID 取会话。
 func (s *Store) GetConversation(ctx context.Context, id string) (*Conversation, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, title, created_at, updated_at FROM conversations WHERE id=?`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT id, title, prompt_tokens, completion_tokens, total_tokens, created_at, updated_at FROM conversations WHERE id=?`, id)
 	c := &Conversation{}
-	if err := row.Scan(&c.ID, &c.Title, &c.CreatedAt, &c.UpdatedAt); err != nil {
+	if err := row.Scan(&c.ID, &c.Title, &c.Usage.PromptTokens, &c.Usage.CompletionTokens, &c.Usage.TotalTokens, &c.CreatedAt, &c.UpdatedAt); err != nil {
 		return nil, err
 	}
 	return c, nil
@@ -861,7 +936,7 @@ func (s *Store) GetConversation(ctx context.Context, id string) (*Conversation, 
 
 // ListConversations 按更新时间倒序列出会话。
 func (s *Store) ListConversations(ctx context.Context) ([]Conversation, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, title, created_at, updated_at FROM conversations ORDER BY updated_at DESC LIMIT 50`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, title, prompt_tokens, completion_tokens, total_tokens, created_at, updated_at FROM conversations ORDER BY updated_at DESC LIMIT 50`)
 	if err != nil {
 		return nil, err
 	}
@@ -869,12 +944,25 @@ func (s *Store) ListConversations(ctx context.Context) ([]Conversation, error) {
 	out := []Conversation{}
 	for rows.Next() {
 		var c Conversation
-		if err := rows.Scan(&c.ID, &c.Title, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.Title, &c.Usage.PromptTokens, &c.Usage.CompletionTokens, &c.Usage.TotalTokens, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+// AddConversationUsage 把一次模型调用的用量累加到会话上（token 用量统计）：
+// 对话里每次 Chat 成功后调一次；用量为零时不写库。
+func (s *Store) AddConversationUsage(ctx context.Context, conversationID string, u Usage) error {
+	if u.IsZero() {
+		return nil
+	}
+	u = u.Normalized()
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE conversations SET prompt_tokens=prompt_tokens+?, completion_tokens=completion_tokens+?, total_tokens=total_tokens+?, updated_at=? WHERE id=?`,
+		u.PromptTokens, u.CompletionTokens, u.TotalTokens, now(), conversationID)
+	return err
 }
 
 // AppendMessage 往会话里追加一条消息，并更新会话的 updated_at。

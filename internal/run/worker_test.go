@@ -29,8 +29,8 @@ func TestWorkerRestartRecoveryNoDuplicate(t *testing.T) {
 		t.Fatalf("创建任务失败: %v", err)
 	}
 	prior := []store.RunStep{
-		{RunID: r.ID, Seq: 1, Kind: "tool_result", ToolName: "list_workload_pods", CallID: "call-1", ArgsJSON: `{"deployment":"demo-api","namespace":"demo"}`, Summary: "Deployment demo-api 下有 1 个 Pod"},
-		{RunID: r.ID, Seq: 2, Kind: "tool_result", ToolName: "get_pod", CallID: "call-2", ArgsJSON: `{"namespace":"demo","pod":"demo-api-7d9f6c4b5-xk2v9"}`, Summary: "Pod demo-api-7d9f6c4b5-xk2v9 状态 Running，重启 5 次，上次终止原因 OOMKilled"},
+		{RunID: r.ID, Seq: 1, Kind: "tool_result", ToolName: "list_workload_pods", CallID: "call-1", ArgsJSON: `{"deployment":"demo-api","namespace":"demo"}`, Summary: "Deployment demo-api 下有 1 个 Pod", Round: 0},
+		{RunID: r.ID, Seq: 2, Kind: "tool_result", ToolName: "get_pod", CallID: "call-2", ArgsJSON: `{"namespace":"demo","pod":"demo-api-7d9f6c4b5-xk2v9"}`, Summary: "Pod demo-api-7d9f6c4b5-xk2v9 状态 Running，重启 5 次，上次终止原因 OOMKilled", Round: 1},
 	}
 	for _, st := range prior {
 		st := st

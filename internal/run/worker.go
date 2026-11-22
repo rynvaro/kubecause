@@ -53,7 +53,9 @@ func (w *Worker) SetNodeTools(nt agent.NodeTools) {
 
 // StartupRecovery 在进程启动时调用：把上次崩掉时停在 running 的任务
 // 改回 queued，步骤保留，Agent 会根据已提交步骤续跑。
-// 这是“重启恢复不重复执行”的第一步，第二步在 Agent.Run 里做指纹去重。
+// 重复执行靠历史结果本身避免：已执行的调用结果已在步骤里，模型不会
+// 无故重发；如果它主动重发，那就是它要 fresh 数据，按合法重查处理
+//（issue #7：跨轮重查放开，模型决定、代码不拦）。
 // 同时把执行中途崩掉的提案改回待执行，重启后重新领取，
 // 重跑是安全的（执行前校验会先看当前值是否已是新值）。
 func (w *Worker) StartupRecovery(ctx context.Context) (int64, error) {

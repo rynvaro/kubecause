@@ -183,7 +183,7 @@ export interface Conversation {
 // 绝不进配置文件、绝不在 GET /api/config 里返回、绝不在前端显示。
 export interface AppConfig {
   chat: { maxSteps: number; maxHistoryMessages: number }
-  run: { maxSteps: number; timeoutSeconds: number }
+  run: { maxSteps: number; timeoutSeconds: number; maxToolCallsPerRound: number }
   model: { timeoutSeconds: number; temperature: number }
   repair: { maxMemoryMi: number; maxRatio: number }
 }

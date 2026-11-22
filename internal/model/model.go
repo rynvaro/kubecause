@@ -31,7 +31,7 @@ import (
 
 // Stub 是确定性桩模型。
 //
-// 它按 StepIndex 决定下一步：
+// 它按 StepIndex（轮次）决定下一步：
 //
 //	0: list_workload_pods（Deployment 任务）或 get_pod（Pod 任务）
 //	1: get_pod
@@ -42,7 +42,7 @@ import (
 //	   其次 ImagePullBackOff，再次探针失败）
 //	6: 交最终报告
 //
-// 如果是重启恢复，StepIndex 会从已用步数继续，不会从头重走。
+// 如果是重启恢复，StepIndex 会从已用轮次继续，不会从头重走。
 // Slice 2 把 Stub 扩展到三类场景（OOM / 镜像拉取 / 探针），
 // 仍是确定性剧本，只为让 eval 的三个用例都能在 stub 模式下跑通，
 // 不是让 Stub 假装会思考。
@@ -856,7 +856,7 @@ func (r *Real) diagnosisFallbackReport(in agent.ModelInput, parseErr error, cont
 func buildRealMessages(in agent.ModelInput) []chatMessage {
 	msgs := []chatMessage{
 		{Role: "system", Content: realSystemPrompt},
-		{Role: "user", Content: fmt.Sprintf("任务：namespace=%s，类型=%s，名称=%s，问题：%s\n已走 %d 步，请继续诊断。", in.Namespace, in.Kind, in.Name, in.Question, in.StepIndex)},
+		{Role: "user", Content: fmt.Sprintf("任务：namespace=%s，类型=%s，名称=%s，问题：%s\n已走 %d 轮，请继续诊断。", in.Namespace, in.Kind, in.Name, in.Question, in.StepIndex)},
 	}
 	// 历史只取最近 6 步，避免上下文无限增长。
 	hist := in.History

@@ -2,7 +2,11 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"path/filepath"
 	"testing"
+
+	_ "modernc.org/sqlite"
 )
 
 func openTest(t *testing.T) *Store {
@@ -127,5 +131,88 @@ func TestClaimApprovedChangeAndResetExecuting(t *testing.T) {
 	claimed2, err := s.ClaimApprovedChange(ctx)
 	if err != nil || claimed2 == nil || claimed2.ID != c.ID {
 		t.Fatalf("恢复后应能重新领取: %v %+v", err, claimed2)
+	}
+}
+
+func TestMigrateAddsRoundAndEvidenceColumns(t *testing.T) {
+	// 模拟修复前的老库：先用裸 SQL 建不带 round / evidence_id /
+	// max_tool_calls_per_round 的表并写一行老数据，再 Open——
+	// migrate 应自动补列，老数据不丢，Round 读出来是 -1（未知/老数据哨兵）。
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "old.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("建老库失败: %v", err)
+	}
+	_, err = raw.Exec(`
+		CREATE TABLE runs (
+			id TEXT PRIMARY KEY, namespace TEXT NOT NULL, kind TEXT NOT NULL,
+			name TEXT NOT NULL, question TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'queued',
+			max_steps INTEGER NOT NULL DEFAULT 8,
+			timeout_seconds INTEGER NOT NULL DEFAULT 60,
+			report_json TEXT NOT NULL DEFAULT '',
+			suggested_json TEXT NOT NULL DEFAULT '',
+			creation_json TEXT NOT NULL DEFAULT '',
+			error TEXT NOT NULL DEFAULT '',
+			created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL
+		);
+		CREATE TABLE run_steps (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			run_id TEXT NOT NULL REFERENCES runs(id),
+			seq INTEGER NOT NULL, kind TEXT NOT NULL,
+			tool_name TEXT NOT NULL DEFAULT '',
+			call_id TEXT NOT NULL DEFAULT '',
+			args_json TEXT NOT NULL DEFAULT '',
+			result_json TEXT NOT NULL DEFAULT '',
+			summary TEXT NOT NULL DEFAULT '',
+			error TEXT NOT NULL DEFAULT '',
+			duration_ms INTEGER NOT NULL DEFAULT 0,
+			retry_count INTEGER NOT NULL DEFAULT 0,
+			created_at DATETIME NOT NULL,
+			UNIQUE(run_id, seq)
+		);
+		INSERT INTO runs(id, namespace, kind, name, question, status, created_at, updated_at)
+		VALUES('run_old', 'demo', 'Deployment', 'demo-api', '为什么重启', 'queued', '2026-11-22 00:00:00', '2026-11-22 00:00:00');
+		INSERT INTO run_steps(run_id, seq, kind, tool_name, call_id, summary, created_at)
+		VALUES('run_old', 1, 'tool_result', 'get_pod', 'call-1', 'Pod ok', '2026-11-22 00:00:00');
+	`)
+	if err != nil {
+		t.Fatalf("写老数据失败: %v", err)
+	}
+	_ = raw.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("打开老库失败: %v", err)
+	}
+	defer s.Close()
+	// 老数据读出来：Round 是 -1（未知/老数据哨兵），EvidenceID 为空。
+	steps, err := s.ListSteps(ctx, "run_old")
+	if err != nil || len(steps) != 1 {
+		t.Fatalf("老步骤应读出 1 条: %v %+v", err, steps)
+	}
+	if steps[0].Round != -1 || steps[0].EvidenceID != "" {
+		t.Fatalf("老步骤的 Round 应是 -1、EvidenceID 为空，得到 %+v", steps[0])
+	}
+	// 新写入带 Round / EvidenceID 的步骤能 round-trip。
+	if err := s.AppendStep(ctx, &RunStep{RunID: "run_old", Seq: 2, Kind: "tool_result", ToolName: "get_events", CallID: "call-2", Summary: "events", Round: 1, EvidenceID: "ev-1"}); err != nil {
+		t.Fatalf("写新步骤失败: %v", err)
+	}
+	steps, _ = s.ListSteps(ctx, "run_old")
+	if len(steps) != 2 || steps[1].Round != 1 || steps[1].EvidenceID != "ev-1" {
+		t.Fatalf("新步骤的 Round / EvidenceID 应 round-trip，得到 %+v", steps)
+	}
+	// 新任务的 MaxToolCallsPerRound 默认 5。
+	r := &Run{Namespace: "demo", Kind: "Deployment", Name: "demo-api", Question: "为什么重启"}
+	if err := s.CreateRun(ctx, r); err != nil {
+		t.Fatalf("创建任务失败: %v", err)
+	}
+	if r.MaxToolCallsPerRound != 5 {
+		t.Fatalf("新任务的每轮调用上限默认应是 5，得到 %d", r.MaxToolCallsPerRound)
+	}
+	got, err := s.GetRun(ctx, r.ID)
+	if err != nil || got.MaxToolCallsPerRound != 5 {
+		t.Fatalf("读回的任务每轮调用上限应是 5: %v %+v", err, got)
 	}
 }

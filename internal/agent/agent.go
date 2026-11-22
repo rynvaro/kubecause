@@ -358,7 +358,7 @@ type ModelInput struct {
 	Kind      string
 	Name      string
 	Question  string
-	StepIndex int // 已经走了几步，模型据此决定下一步，不会无限循环
+	StepIndex int // 已经走了几轮，模型据此决定下一步，不会无限循环
 	History   []store.RunStep
 	Evidence  map[string]string // evidenceID -> 摘要
 }
@@ -519,10 +519,12 @@ type Agent struct {
 }
 
 // Run 执行一次诊断循环。
-//   - priorSteps 是重启后已提交的步骤，Agent 会复用它们的证据，
-//     不再重复调已经调过的工具；剩余预算 = MaxSteps - 已用工具步数。
-//   - 步数上限和时限是防失控的两道闸：模型一旦开始瞎循环，
-//     到 8 步或 60 秒就强制收敛，返回已有证据下的报告，
+//   - priorSteps 是重启后已提交的步骤，Agent 会复用它们的证据；
+//     剩余预算 = MaxSteps - 已用轮次（issue #6：按模型轮次算，
+//     不按 tool_result 行数算——一轮里模型可以返回多个工具调用，
+//     按行数算会多扣预算）。
+//   - 轮次上限和时限是防失控的两道闸：模型一旦开始瞎循环，
+//     到 8 轮或 60 秒就强制收敛，返回已有证据下的报告，
 //     而不是一直烧 token、一直调工具。
 func (a *Agent) Run(ctx context.Context, run *store.Run, priorSteps []store.RunStep) (*Report, error) {
 	// 时限用 context 超时实现，到点后工具调用会被取消。
@@ -531,35 +533,57 @@ func (a *Agent) Run(ctx context.Context, run *store.Run, priorSteps []store.RunS
 
 	evidence := map[string]bool{}
 	evidenceSummary := map[string]string{}
-	usedToolFingerprints := map[string]bool{}
-	toolStepsUsed := 0
+	// 预算按模型轮次算（issue #6）：恢复时从已提交步骤的 Round 列
+	// 取最大轮次 +1。一轮里模型可以返回多个工具调用，
+	// 按 tool_result 行数算会多扣预算（两轮 5 个调用，恢复后只剩 3 轮而不是 6 轮）。
+	// Round = -1 是“未知/老数据”哨兵：迁移前没有 Round 列的步骤读出来
+	// 是 -1，和明确跑过第 0 轮的步骤（Round=0）区分开。
+	// 只有全是 -1（真正老数据）时才按 0 算、宽容地不扣预算。
+	roundsUsed := 0
+	maxRound := -1
 	for _, st := range priorSteps {
-		if st.Kind == "tool_result" && st.CallID != "" {
+		if st.Kind == "tool_result" && st.Round > maxRound {
+			maxRound = st.Round
+		}
+	}
+	if maxRound >= 0 {
+		roundsUsed = maxRound + 1
+	}
+	// 证据只登记成功步骤（issue #8）：失败、校验拒绝的步骤可以留在
+	// 历史里供模型理解错误过程，但不能作为可引用的成功证据。
+	// 证据 ID 在执行成功时分配并写进步骤（EvidenceID），恢复时直接读，
+	// 不再从步骤序号推算 ev-<Seq>——校验失败的步骤占 Seq 但不消耗 ev 号，
+	// 推算出来的 ID 在恢复前后会对不上（成功步骤运行时是 ev-1，恢复后变 ev-2）。
+	// 老数据没有 EvidenceID：只贡献 CallID，新分配的 ev 号从 1 起。
+	nextEvidenceSeq := 1
+	for _, st := range priorSteps {
+		if st.Kind != "tool_result" || st.Error != "" {
+			continue
+		}
+		if st.CallID != "" {
 			evidence[st.CallID] = true
 			evidenceSummary[st.CallID] = st.Summary
-			// 用工具名+参数做指纹，重启后同一个调用不再重复执行。
-			usedToolFingerprints[st.ToolName+"|"+st.ArgsJSON] = true
-			toolStepsUsed++
 		}
-		if st.Kind == "tool_result" {
-			// 兼容旧步骤：CallID 即证据 ID。
-			if st.ResultJSON != "" {
-				evidence[fmt.Sprintf("ev-%d", st.Seq)] = true
+		if st.EvidenceID != "" {
+			evidence[st.EvidenceID] = true
+			evidenceSummary[st.EvidenceID] = st.Summary
+			if n, ok := parseEvidenceSeq(st.EvidenceID); ok && n >= nextEvidenceSeq {
+				nextEvidenceSeq = n + 1
 			}
 		}
 	}
 
-	// 证据 ID 按步骤序号生成，ev-<seq>，保证属于当前任务、可追溯。
-	nextEvidenceSeq := 1
-	for _, st := range priorSteps {
-		if st.Seq >= nextEvidenceSeq {
-			nextEvidenceSeq = st.Seq + 1
-		}
-	}
-
-	remaining := run.MaxSteps - toolStepsUsed
+	remaining := run.MaxSteps - roundsUsed
 	if remaining < 0 {
 		remaining = 0
+	}
+
+	// 每轮工具调用上限（issue #6）：一轮里最多处理 cap 个不同的调用，
+	// 超出的不执行，记一步错误告诉模型分轮调。
+	// 0 表示用默认值 5，不是不限。
+	maxToolCallsPerRound := run.MaxToolCallsPerRound
+	if maxToolCallsPerRound <= 0 {
+		maxToolCallsPerRound = 5
 	}
 
 	var lastReport *Report
@@ -567,12 +591,16 @@ func (a *Agent) Run(ctx context.Context, run *store.Run, priorSteps []store.RunS
 		if err := ctx.Err(); err != nil {
 			return a.finishWithPartial(run, evidenceSummary, lastReport, "诊断超时，已用已有证据收敛"), nil
 		}
+		// 本轮的轮次号：恢复后已用的轮次数 + 本次循环的第几轮。
+		// 每一步（包括校验失败、执行失败的错误步）都带上它，
+		// 恢复时才能从 Round 列算出已用轮次。
+		roundIndex := roundsUsed + i
 		in := ModelInput{
 			Namespace: run.Namespace,
 			Kind:      run.Kind,
 			Name:      run.Name,
 			Question:  run.Question,
-			StepIndex: toolStepsUsed + i,
+			StepIndex: roundIndex,
 			History:   priorSteps,
 			Evidence:  evidenceSummary,
 		}
@@ -595,7 +623,68 @@ func (a *Agent) Run(ctx context.Context, run *store.Run, priorSteps []store.RunS
 		// 校验、执行、记步都按调用逐个走；某一个失败只跳过它自己，
 		// 不影响同批其他调用。步数预算按模型轮次算（外层 for i 循环），
 		// 一轮里调多个工具不额外占预算。
+		//
+		// 同批内去重（issue #7）：同一轮里同一个调用出现两次，
+		// 第二次不重新执行，把第一次的结果作为它的 tool 结果回传。
+		// 只记成功的调用：失败的调用不进表，同一批里重复出现就再执行一次。
+		// 跨轮、跨恢复不再去重：所有工具都是只读查询，重查无害；
+		// 模型看得到历史结果，只有它认为需要 fresh 数据时才会重查——
+		// 模型决定、代码不拦。恢复后“相同调用实例不重复执行”靠历史本身保证：
+		// 已执行的调用结果已在 priorSteps 里，模型不会无故重发；
+		// 如果它主动重发，那就是它要 fresh 数据，按合法重查处理。
+		type batchResult struct {
+			resultJSON string
+			summary    string
+		}
+		batchResults := map[string]*batchResult{}
+		// processed 是本轮已处理的不同调用数：回放不占名额，
+		// 校验失败的占一个名额——它已经进了一次处理流程。
+		processed := 0
 		for _, call := range step.ToolCalls {
+			fingerprint := call.Name + "|" + mustJSON(call.Args)
+			if prev, ok := batchResults[fingerprint]; ok {
+				// 同批重复：不重新执行。给这个 call ID 单独记一步，
+				// 结果和第一次的一样，模型能按 call ID 对上。
+				// 不另分一个 ev 号：这是同一份证据，凭各自的 call ID 引用。
+				if a.OnStep != nil {
+					if err := a.OnStep(ctx, &store.RunStep{
+						RunID: run.ID, Kind: "tool_result", ToolName: call.Name,
+						CallID: call.ID, ArgsJSON: mustJSON(call.Args),
+						ResultJSON: prev.resultJSON, Summary: prev.summary,
+						Round: roundIndex,
+					}); err != nil {
+						return nil, err
+					}
+				}
+				evidence[call.ID] = true
+				evidenceSummary[call.ID] = prev.summary
+				priorSteps = append(priorSteps, store.RunStep{
+					RunID: run.ID, Kind: "tool_result", ToolName: call.Name,
+					CallID: call.ID, ArgsJSON: mustJSON(call.Args),
+					ResultJSON: prev.resultJSON, Summary: prev.summary,
+					Round: roundIndex,
+				})
+				continue
+			}
+			// 每轮工具调用上限（issue #6）：一批里超过上限的调用不执行，
+			// 记一步错误告诉模型分轮调——模型下一轮能看到并重试，
+			// 而不是以为它们都执行了。
+			if processed >= maxToolCallsPerRound {
+				overLimit := fmt.Sprintf("本轮工具调用已达上限（%d 个），未执行，请分轮调用", maxToolCallsPerRound)
+				errStep := &store.RunStep{
+					RunID: run.ID, Kind: "tool_result", ToolName: call.Name,
+					CallID: call.ID, ArgsJSON: mustJSON(call.Args),
+					Summary: overLimit, Error: overLimit, Round: roundIndex,
+				}
+				if a.OnStep != nil {
+					if err := a.OnStep(ctx, errStep); err != nil {
+						return nil, err
+					}
+				}
+				priorSteps = append(priorSteps, *errStep)
+				continue
+			}
+			processed++
 			// 先校验，再执行，顺序不能反。
 			if err := ValidateToolCall(run.Namespace, call); err != nil {
 				// 校验失败记一步错误，不执行，跳过这个调用、继续同批下一个。
@@ -606,6 +695,7 @@ func (a *Agent) Run(ctx context.Context, run *store.Run, priorSteps []store.RunS
 					RunID: run.ID, Kind: "tool_result", ToolName: call.Name,
 					CallID: call.ID, ArgsJSON: mustJSON(call.Args),
 					Summary: "工具调用被拒绝：" + err.Error(), Error: err.Error(),
+					Round: roundIndex,
 				}
 				if a.OnStep != nil {
 					if err := a.OnStep(ctx, errStep); err != nil {
@@ -615,16 +705,9 @@ func (a *Agent) Run(ctx context.Context, run *store.Run, priorSteps []store.RunS
 				priorSteps = append(priorSteps, *errStep)
 				continue
 			}
-			// 重启恢复：指纹命中说明这一步已经提交过，直接跳过不重复调。
-			fingerprint := call.Name + "|" + mustJSON(call.Args)
-			if usedToolFingerprints[fingerprint] {
-				continue
-			}
 			start := time.Now()
 			out, execErr := a.executeTool(ctx, call)
 			duration := time.Since(start)
-			evidenceID := fmt.Sprintf("ev-%d", nextEvidenceSeq)
-			nextEvidenceSeq++
 			if execErr != nil {
 				// 工具失败也要把错误步追加进 priorSteps，让模型下一次能看到
 				// “这个工具刚才失败了，原因是什么”，从而换个工具重试，
@@ -633,7 +716,7 @@ func (a *Agent) Run(ctx context.Context, run *store.Run, priorSteps []store.RunS
 					RunID: run.ID, Kind: "tool_result", ToolName: call.Name,
 					CallID: call.ID, ArgsJSON: mustJSON(call.Args),
 					Summary: "工具执行失败：" + execErr.Error(), Error: execErr.Error(),
-					DurationMs: duration.Milliseconds(),
+					DurationMs: duration.Milliseconds(), Round: roundIndex,
 				}
 				if a.OnStep != nil {
 					if err := a.OnStep(ctx, errStep); err != nil {
@@ -645,20 +728,25 @@ func (a *Agent) Run(ctx context.Context, run *store.Run, priorSteps []store.RunS
 				// 模型可以换工具重试。
 				continue
 			}
-			// 证据 ID 同时记两份：call.ID（模型看到的）和 ev-<seq>（报告引用的），
+			// 证据 ID 只在成功时分配（issue #8）：失败的执行不消耗 ev 号，
+			// 否则恢复时按成功步骤重算会和运行时对不上。
+			// 证据 ID 同时记两份：call.ID（模型看到的）和 ev-<n>（报告引用的），
 			// 报告校验时两边都认，避免模型引用格式不一致导致证据被误过滤。
+			evidenceID := fmt.Sprintf("ev-%d", nextEvidenceSeq)
+			nextEvidenceSeq++
 			evidence[evidenceID] = true
 			evidence[call.ID] = true
 			evidenceSummary[evidenceID] = out.Summary
 			evidenceSummary[call.ID] = out.Summary
-			usedToolFingerprints[fingerprint] = true
 			resultJSON, _ := json.Marshal(out.Data)
+			batchResults[fingerprint] = &batchResult{resultJSON: string(resultJSON), summary: out.Summary}
 			if a.OnStep != nil {
 				if err := a.OnStep(ctx, &store.RunStep{
 					RunID: run.ID, Kind: "tool_result", ToolName: call.Name,
 					CallID: call.ID, ArgsJSON: mustJSON(call.Args),
 					ResultJSON: string(resultJSON), Summary: out.Summary,
-					DurationMs: duration.Milliseconds(),
+					DurationMs: duration.Milliseconds(), Round: roundIndex,
+					EvidenceID: evidenceID,
 				}); err != nil {
 					return nil, err
 				}
@@ -671,15 +759,15 @@ func (a *Agent) Run(ctx context.Context, run *store.Run, priorSteps []store.RunS
 			priorSteps = append(priorSteps, store.RunStep{
 				RunID: run.ID, Kind: "tool_result", ToolName: call.Name,
 				CallID: call.ID, ArgsJSON: mustJSON(call.Args), Summary: out.Summary,
-				ResultJSON: string(resultJSON),
+				ResultJSON: string(resultJSON), Round: roundIndex, EvidenceID: evidenceID,
 			})
 		}
 		lastReport = nil
 	}
 
-	// 步数耗尽还没交报告：用已有证据收敛出一份“证据不足”的报告，
+	// 轮数耗尽还没交报告：用已有证据收敛出一份“证据不足”的报告，
 	// 而不是报错丢掉已经查到的东西。
-	return a.finishWithPartial(run, evidenceSummary, lastReport, "已达最大步数，用已有证据收敛"), nil
+	return a.finishWithPartial(run, evidenceSummary, lastReport, "已达最大轮数，用已有证据收敛"), nil
 }
 
 func (a *Agent) finishWithPartial(run *store.Run, evidenceSummary map[string]string, _ *Report, note string) *Report {
@@ -739,6 +827,19 @@ func (a *Agent) executeTool(ctx context.Context, call *ToolCall) (ToolOutput, er
 func mustJSON(v any) string {
 	b, _ := json.Marshal(v)
 	return string(b)
+}
+
+// parseEvidenceSeq 从 "ev-<n>" 里解析 n，格式不对返回 ok=false。
+// 恢复时用它从已持久化的 EvidenceID 算下一个 ev 号。
+func parseEvidenceSeq(id string) (int, bool) {
+	if !strings.HasPrefix(id, "ev-") {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimPrefix(id, "ev-"))
+	if err != nil || n < 1 {
+		return 0, false
+	}
+	return n, true
 }
 
 // TruncateLog 按行数和字节数截断日志，返回截断后的内容和是否被截断。

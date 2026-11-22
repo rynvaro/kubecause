@@ -62,8 +62,8 @@ func TestStepLimit(t *testing.T) {
 	if report == nil || report.Confidence != "low" {
 		t.Fatalf("步数耗尽应返回证据不足的低置信报告: %+v", report)
 	}
-	// loopModel 每次返回同一个调用，指纹去重后只执行一次；
-	// 关键是循环必须在 MaxSteps 内结束，不会无限跑。
+	// loopModel 每次返回同一个调用：跨轮重查不再去重（issue #7），
+	// 每轮都会执行一次；关键是循环必须在 MaxSteps 内结束，不会无限跑。
 	if tools.calls > 3 {
 		t.Fatalf("工具调用超过上限: %d", tools.calls)
 	}

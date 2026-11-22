@@ -79,7 +79,7 @@ func findConfigPath() string {
 // realModel 为 nil 时（stub 模式）跳过模型那一项。
 func applyConfig(cfg config.Config, chatSvc *chat.Service, realModel *model.Real) {
 	chatSvc.ApplyConfig(cfg)
-	store.ApplyRunDefaults(cfg.Run.MaxSteps, cfg.Run.TimeoutSeconds)
+	store.ApplyRunDefaults(cfg.Run.MaxSteps, cfg.Run.TimeoutSeconds, cfg.Run.MaxToolCallsPerRound)
 	repair.ApplyLimits(cfg.Repair.MaxMemoryMi, cfg.Repair.MaxRatio)
 	if realModel != nil {
 		realModel.ApplyModelSettings(time.Duration(cfg.Model.TimeoutSeconds)*time.Second, cfg.Model.Temperature)

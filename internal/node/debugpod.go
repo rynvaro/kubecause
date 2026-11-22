@@ -137,6 +137,26 @@ func (e *DebugPodExecutor) ExecOnNode(ctx context.Context, node string, command 
 	return e.execInPod(ctx, podName, command)
 }
 
+// ListNodes 列出集群的全部节点（名字 + Ready 状态）。
+// 不起调试 Pod，直接调 Nodes API——列节点本身不需要进宿主机。
+func (e *DebugPodExecutor) ListNodes(ctx context.Context) ([]NodeInfo, error) {
+	list, err := e.client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("列出节点失败: %w", err)
+	}
+	out := make([]NodeInfo, 0, len(list.Items))
+	for _, n := range list.Items {
+		ready := false
+		for _, c := range n.Status.Conditions {
+			if c.Type == corev1.NodeReady {
+				ready = c.Status == corev1.ConditionTrue
+			}
+		}
+		out = append(out, NodeInfo{Name: n.Name, Ready: ready})
+	}
+	return out, nil
+}
+
 // waitRunning 等调试 Pod 进入 Running。Pod 进入 Failed/Succeeded
 // （容器没能持续运行，例如镜像有问题）时直接报错，不傻等超时。
 func (e *DebugPodExecutor) waitRunning(ctx context.Context, podName string) error {

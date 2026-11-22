@@ -70,7 +70,7 @@ func TestProtocolListTools(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListTools 失败: %v", err)
 	}
-	want := map[string]bool{"node_disk": true, "node_memory": true, "node_processes": true, "node_logs": true}
+	want := map[string]bool{"node_list": true, "node_disk": true, "node_memory": true, "node_processes": true, "node_logs": true}
 	if len(res.Tools) != len(want) {
 		t.Fatalf("ListTools 返回 %d 个工具, want %d: %v", len(res.Tools), len(want), res.Tools)
 	}
@@ -114,8 +114,7 @@ func TestProtocolListTools(t *testing.T) {
 	}
 }
 
-func TestProtocolCallToolFake(t *testing.T) {
-	ctx := context.Background()
+func TestProtocolCallToolFake(t *testing.T) {	ctx := context.Background()
 	fake := &FakeExecutor{Output: "fake-disk-output"}
 	cs := startTestServer(t, fake)
 	res, err := cs.CallTool(ctx, &mcp.CallToolParams{
@@ -137,6 +136,33 @@ func TestProtocolCallToolFake(t *testing.T) {
 	}
 	if len(fake.Calls) != 1 || fake.Calls[0].Node != "kind-control-plane" {
 		t.Fatalf("fake 调用记录 = %+v, want 1 次、节点 kind-control-plane", fake.Calls)
+	}
+}
+
+func TestProtocolCallToolNodeList(t *testing.T) {
+	ctx := context.Background()
+	fake := &FakeExecutor{Nodes: []NodeInfo{
+		{Name: "kind-control-plane", Ready: true},
+		{Name: "kind-worker", Ready: false},
+	}}
+	cs := startTestServer(t, fake)
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "node_list",
+		Arguments: map[string]any{},
+	})
+	if err != nil {
+		t.Fatalf("CallTool 失败: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("CallTool 返回 IsError: %v", res.Content)
+	}
+	text, ok := res.Content[0].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("Content[0] 类型 = %T, want *mcp.TextContent", res.Content[0])
+	}
+	want := "kind-control-plane Ready\nkind-worker NotReady"
+	if text.Text != want {
+		t.Errorf("node_list 文本 = %q, want %q", text.Text, want)
 	}
 }
 

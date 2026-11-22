@@ -82,6 +82,11 @@ type Service struct {
 	Store *store.Store
 	Tools agent.Tools
 	Model agent.Model
+	// MCP 是 MCP 节点工具的调用口（nil 时节点工具不可用）：
+	// main.go 在 MCP Client 接通后才填，模型调 node_* 时走这里，
+	// 不经过 ToolsAdapter。没有 MCP Client 的部署这个字段就是 nil，
+	// 对话照常跑。
+	MCP agent.NodeTools
 	// MaxSteps 是一轮对话的工具步数预算，默认 12。
 	MaxSteps int
 	// MaxHistoryMessages 是每次调用模型带上的历史消息数，默认 10。
@@ -256,6 +261,11 @@ func (s *Service) recordTool(ctx context.Context, conversationID, roundID string
 // 工具失败不让整轮对话崩掉：返回错误给模型/规则层，
 // 由它决定换个工具重试，还是如实告诉用户查不到。
 func (s *Service) executeChatTool(ctx context.Context, call *agent.ToolCall) (agent.ToolOutput, error) {
+	// 节点工具先走 MCP：MCP 为 nil 或名字不在 MCP 工具表里时，
+	// 说明这次调用本来就不是节点工具，再走下面的 k8s 分发。
+	if s.MCP != nil && s.MCP.HasTool(call.Name) {
+		return s.MCP.CallTool(ctx, call.Name, call.Args)
+	}
 	// 先过 Agent 的通用校验（namespace 为 "" 时对话的发现工具放行，
 	// 定向工具仍会被“缺少 namespace”拦住，调用方要先补齐）。
 	if err := agent.ValidateToolCall("", call); err != nil {

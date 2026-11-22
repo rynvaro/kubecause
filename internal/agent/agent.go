@@ -14,11 +14,68 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	"kubecause/internal/store"
 )
+
+// NodeTools 是 MCP 节点工具的调用口（见 internal/mcpclient）：
+// Agent 不关心背后是 MCP 子进程还是测试替身，只按名字调。
+// 没有 MCP Client 时为 nil，节点工具不可用，校验层也会拒绝调它们。
+type NodeTools interface {
+	HasTool(name string) bool
+	CallTool(ctx context.Context, name string, args map[string]string) (ToolOutput, error)
+}
+
+// nodeToolNames 是已注册的 MCP 节点工具名：
+// 启动时 main.go 从 MCP Client 的 tools/list 结果注册进来，
+// 校验和分发只认注册过的名字，模型编一个没注册的名字会被拒绝。
+var nodeToolNames = map[string]bool{}
+
+// RegisterNodeTools 注册 MCP 节点工具名（main.go 在 MCP Client 接通后调一次）。
+func RegisterNodeTools(names []string) {
+	for _, n := range names {
+		nodeToolNames[n] = true
+	}
+}
+
+// IsNodeTool 判断一个工具名是不是已注册的 MCP 节点工具。
+func IsNodeTool(name string) bool {
+	return nodeToolNames[name]
+}
+
+// nodeNameRe 是 Kubernetes 节点名的规则（DNS 子域名，小写字母、数字、-、.），
+// 和 MCP Server 侧（internal/node.ValidateNodeName）同一条规则：
+// 模型给的节点名先在这里拦一道，带 shell 元字符的到不了 MCP Server。
+var nodeNameRe = regexp.MustCompile(`^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$`)
+
+// validateNodeToolCall 校验一次节点工具调用：
+// 节点工具不走 namespace 那套（它们查的是节点，不是某个 namespace 下的资源），
+// 只校验 node 参数（必填、格式合法）和 node_logs 的 lines（1-500 的数字）。
+// 值本身再由 MCP Server 侧校验一次，这里是第一道关。
+func validateNodeToolCall(call *ToolCall) error {
+	if call.Name == "node_list" {
+		return nil
+	}
+	node := call.Args["node"]
+	if node == "" {
+		return fmt.Errorf("工具 %s 缺少 node 参数", call.Name)
+	}
+	if len(node) > 253 || !nodeNameRe.MatchString(node) {
+		return fmt.Errorf("节点名格式非法: %q", node)
+	}
+	if call.Name == "node_logs" {
+		if s := call.Args["lines"]; s != "" {
+			n, err := strconv.Atoi(s)
+			if err != nil || n < 1 || n > 500 {
+				return fmt.Errorf("lines 参数 %q 非法：应为 1-500 的数字", s)
+			}
+		}
+	}
+	return nil
+}
 
 // 允许的工具名，白名单，模型只能叫这些，多一个都不行。
 // 前 6 个是单次诊断的定向工具，后 5 个是发现工具：
@@ -328,6 +385,12 @@ func ValidateToolCall(namespace string, call *ToolCall) error {
 	if call == nil {
 		return fmt.Errorf("工具调用为空")
 	}
+	// 节点工具走自己的校验分支：不查 namespace（它们查节点），
+	// 只校验 node 参数；没注册过的节点工具名在这里就被拒绝，
+	// 不会进后面的 k8s 工具白名单。
+	if IsNodeTool(call.Name) {
+		return validateNodeToolCall(call)
+	}
 	if !allowedTools[call.Name] {
 		return fmt.Errorf("未知工具: %s", call.Name)
 	}
@@ -442,6 +505,12 @@ func ValidateReport(rep *Report, validEvidence map[string]bool) {
 type Agent struct {
 	Tools Tools
 	Model Model
+	// MCP 是 MCP 节点工具的调用口（nil 时节点工具不可用）：
+	// main.go 在 MCP Client 接通后才填，模型调 node_* 时走这里，
+	// 不经过 ToolsAdapter——节点工具不在 Tools 接口里。
+	// 没有 MCP Client 的部署（fake 模式、MCP_NODE_TOOLS=0、
+	// 或 mcp-server 拉不起来）这个字段就是 nil，诊断照常跑。
+	MCP NodeTools
 	// OnStep 在每一步工具调用完成后调用，参数是待持久化的步骤
 	// （Seq 由调用方在写库时确定）。如果 OnStep 返回错误，循环停止。
 	OnStep func(ctx context.Context, step *store.RunStep) error
@@ -618,7 +687,12 @@ func (a *Agent) finishWithPartial(run *store.Run, evidenceSummary map[string]str
 }
 
 // executeTool 按工具名分发，参数已经过 ValidateToolCall 校验。
+// 节点工具先走 MCP：MCP 为 nil 或名字不在 MCP 工具表里时，
+// 说明这次调用本来就不是节点工具，再走下面的 k8s 分发。
 func (a *Agent) executeTool(ctx context.Context, call *ToolCall) (ToolOutput, error) {
+	if a.MCP != nil && a.MCP.HasTool(call.Name) {
+		return a.MCP.CallTool(ctx, call.Name, call.Args)
+	}
 	ns := call.Args["namespace"]
 	switch call.Name {
 	case "get_pod":

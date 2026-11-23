@@ -433,9 +433,9 @@ func newTestReal(t *testing.T, srv *httptest.Server) *Real {
 
 // requestMessage 是 chat completions 请求体里的一条消息（测试用）。
 type requestMessage struct {
-	Role       string `json:"role"`
-	Content    string `json:"content,omitempty"`
-	ToolCalls  []struct {
+	Role      string `json:"role"`
+	Content   string `json:"content,omitempty"`
+	ToolCalls []struct {
 		ID       string `json:"id"`
 		Function struct {
 			Name      string `json:"name"`
@@ -953,5 +953,95 @@ func TestRealNextKeepsUsageOnToolArgsParseError(t *testing.T) {
 	}
 	if want := (store.Usage{PromptTokens: 30, CompletionTokens: 10, TotalTokens: 40}); step.Usage != want {
 		t.Fatalf("出错返回也应带上本次用量 %+v，得到 %+v", want, step.Usage)
+	}
+}
+
+func TestRealSummarizeSendsNoTools(t *testing.T) {
+	// 摘要调用不能带 tools / tool_choice：没有工具可调，模型只能返回纯文本。
+	resp := `{"choices":[{"message":{"role":"assistant","content":"摘要：demo-api 因 OOM 重启。"}}],"usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150}}`
+	calls := 0
+	srv, bodies := scriptedOpenAI(t, []string{resp}, &calls)
+	defer srv.Close()
+	m := newTestReal(t, srv)
+	text, u, err := m.Summarize(context.Background(), "", []string{"用户：demo-api 为什么重启", "助手：查到 OOMKilled，limit 128Mi"})
+	if err != nil {
+		t.Fatalf("Summarize 失败: %v", err)
+	}
+	if text != "摘要：demo-api 因 OOM 重启。" {
+		t.Fatalf("摘要文本不对，得到 %q", text)
+	}
+	if want := (store.Usage{PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150}); u != want {
+		t.Fatalf("摘要用量应是 %+v，得到 %+v", want, u)
+	}
+	if len(*bodies) != 1 {
+		t.Fatalf("摘要应只调一次模型，实际 %d 次", len(*bodies))
+	}
+	if strings.Contains((*bodies)[0], `"tools"`) || strings.Contains((*bodies)[0], "tool_choice") {
+		t.Fatalf("摘要请求里不应有 tools / tool_choice，得到 %s", (*bodies)[0])
+	}
+	// 摘要输入要带上待总结的消息。
+	if !strings.Contains((*bodies)[0], "demo-api 为什么重启") || !strings.Contains((*bodies)[0], "OOMKilled") {
+		t.Fatalf("摘要请求应带上待总结的消息，得到 %s", (*bodies)[0])
+	}
+}
+
+func TestRealSummarizeWithPreviousSummary(t *testing.T) {
+	// 增量摘要：旧摘要要进输入，模型基于它接着总结，不是从头再来。
+	resp := `{"choices":[{"message":{"role":"assistant","content":"新摘要"}}]}`
+	calls := 0
+	srv, bodies := scriptedOpenAI(t, []string{resp}, &calls)
+	defer srv.Close()
+	m := newTestReal(t, srv)
+	if _, _, err := m.Summarize(context.Background(), "旧摘要：demo-api OOM", []string{"用户：后来呢"}); err != nil {
+		t.Fatalf("Summarize 失败: %v", err)
+	}
+	if !strings.Contains((*bodies)[0], "旧摘要：demo-api OOM") {
+		t.Fatalf("增量摘要的输入应带上旧摘要，得到 %s", (*bodies)[0])
+	}
+}
+
+func TestRealSummarizeMissingKey(t *testing.T) {
+	m := NewReal("")
+	if _, _, err := m.Summarize(context.Background(), "", []string{"用户：hi"}); err == nil {
+		t.Fatalf("缺 Key 时 Summarize 应明确报错")
+	}
+}
+
+func TestRealSummarizeEmptyContent(t *testing.T) {
+	// 模型没返回文本时 Summarize 应报错，调用方回退到旧摘要；
+	// 但用量还在（只要收到响应就记），不能跟着错误一起丢了。
+	resp := `{"choices":[{"message":{"role":"assistant","content":""}}],"usage":{"prompt_tokens":10,"completion_tokens":0,"total_tokens":10}}`
+	calls := 0
+	srv, _ := scriptedOpenAI(t, []string{resp}, &calls)
+	defer srv.Close()
+	m := newTestReal(t, srv)
+	_, u, err := m.Summarize(context.Background(), "", []string{"用户：hi"})
+	if err == nil {
+		t.Fatalf("空摘要应报错")
+	}
+	if u.TotalTokens != 10 {
+		t.Fatalf("空回复的用量也应带上，得到 %+v", u)
+	}
+}
+
+func TestStubSummarize(t *testing.T) {
+	s := NewStub()
+	text, u, err := s.Summarize(context.Background(), "", []string{"用户：a", "助手：b"})
+	if err != nil {
+		t.Fatalf("Stub Summarize 不应报错: %v", err)
+	}
+	if !strings.Contains(text, "2 条") {
+		t.Fatalf("占位摘要应带上被总结的消息条数，得到 %q", text)
+	}
+	if !u.IsZero() {
+		t.Fatalf("桩模型不花 token，用量应为零，得到 %+v", u)
+	}
+	// 有旧摘要时接在前面再追加新标记，增量更新后能看出是两次接起来的。
+	text2, _, err := s.Summarize(context.Background(), text, []string{"用户：c"})
+	if err != nil {
+		t.Fatalf("Stub Summarize 不应报错: %v", err)
+	}
+	if !strings.Contains(text2, "2 条") || !strings.Contains(text2, "1 条") {
+		t.Fatalf("增量占位摘要应保留旧标记并追加新标记，得到 %q", text2)
 	}
 }

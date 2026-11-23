@@ -127,7 +127,7 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 		"id": run.ID, "namespace": run.Namespace, "kind": run.Kind, "name": run.Name,
 		"question": run.Question, "status": run.Status,
 		"maxSteps": run.MaxSteps, "timeoutSeconds": run.TimeoutSeconds,
-		"usage": run.Usage,
+		"usage":  run.Usage,
 		"report": report, "error": run.Error,
 		"steps": steps, "stepCount": len(steps),
 		"proposal": proposal,
@@ -407,12 +407,15 @@ func (h *Handler) GetConfig(w http.ResponseWriter, r *http.Request) {
 // UpdateConfig 处理 POST /api/config：
 // 校验新配置 → 写回 config.yaml → 换掉内存里的当前值 → 通知各组件热加载。
 // 校验失败返回 400，旧配置继续生效，文件不被改写。
+// 解码从当前配置开始：请求里没写的字段保持现值，
+// 而不是被 JSON 零值覆盖——布尔开关（例如 chat.summary.enabled）
+// 没有非法值可校验，零值解码会让一次漏字段的旧客户端静默关掉功能。
 func (h *Handler) UpdateConfig(w http.ResponseWriter, r *http.Request) {
 	if h.Config == nil {
 		writeError(w, http.StatusServiceUnavailable, "配置中心未配置")
 		return
 	}
-	var cfg config.Config
+	cfg := h.Config.Current()
 	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
 		writeError(w, http.StatusBadRequest, "请求体不是合法 JSON")
 		return

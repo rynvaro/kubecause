@@ -18,9 +18,10 @@
 // 本轮调工具的结果由真模型循环实时追加进模型输入；上一轮的工具
 // 细节丢掉，但助手消息里的结论和事实摘要还在，能接上文。
 // 超出时只保留系统提示 + 最近 10 条用户/助手消息。10 条以后更早的
-// 消息不会再进模型上下文，但数据库里全量保留，前端翻历史能看到。
-// TODO：以后可把 10 条之前的历史做一次摘要，再把摘要放进系统提示，
-// 现在不做假的摘要——没有摘要就直接截断，并在 README 里写清这一点。
+// 消息不会再以原文进模型上下文，但数据库里全量保留，前端翻历史能看到。
+// 超出窗口的旧对话由自动摘要兜底（issue #19，见 summary.go）：
+// 未覆盖消息攒够阈值时总结成滚动摘要，以 assistant 角色带进模型输入，
+// 摘要失败时回退到只取最近 10 条，聊天不受影响。
 package chat
 
 import (
@@ -29,6 +30,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
 
 	"kubecause/internal/agent"
 	"kubecause/internal/config"
@@ -91,6 +93,15 @@ type Service struct {
 	MaxSteps int
 	// MaxHistoryMessages 是每次调用模型带上的历史消息数，默认 10。
 	MaxHistoryMessages int
+	// SummaryEnabled 是对话自动摘要的总开关（issue #19），默认 true。
+	SummaryEnabled bool
+	// SummaryTriggerMessages 是触发一次摘要需要的未覆盖消息条数，默认 10。
+	SummaryTriggerMessages int
+	// summaryMu / summaryLocks 是摘要更新的 per-conversation 互斥锁
+	//（issue #19 的并发第一层）：同一会话的摘要更新在内存里串行，
+	// 不同会话互不影响；第二层是 store 的乐观更新。
+	summaryMu    sync.Mutex
+	summaryLocks map[string]*sync.Mutex
 	// DebugModel 是模型请求调试的总开关（环境变量 KUBE_DEBUG_MODEL=1 时
 	// 由 main.go 置 true）：打开后 runReal 把每次发给模型的完整请求
 	// 和模型返回打到服务端 stdout；默认关闭，不写进数据库、不进 API 回复。
@@ -103,6 +114,7 @@ func NewService(s *store.Store, tools agent.Tools, m agent.Model) *Service {
 	return &Service{
 		Store: s, Tools: tools, Model: m,
 		MaxSteps: DefaultMaxChatSteps, MaxHistoryMessages: DefaultMaxHistoryMessages,
+		SummaryEnabled: true, SummaryTriggerMessages: DefaultSummaryTriggerMessages,
 	}
 }
 
@@ -113,6 +125,10 @@ func (s *Service) ApplyConfig(c config.Config) {
 	}
 	if c.Chat.MaxHistoryMessages > 0 {
 		s.MaxHistoryMessages = c.Chat.MaxHistoryMessages
+	}
+	s.SummaryEnabled = c.Chat.Summary.Enabled
+	if c.Chat.Summary.TriggerMessages > 0 {
+		s.SummaryTriggerMessages = c.Chat.Summary.TriggerMessages
 	}
 }
 
@@ -194,10 +210,14 @@ func (s *Service) RunMessage(ctx context.Context, conversationID, text string) (
 	if err != nil {
 		return nil, err
 	}
+	// 自动摘要（issue #19）：先看旧消息攒够阈值没有，够了就更新滚动摘要；
+	// best-effort，失败时返回已有摘要（可能为空），聊天照常走。
+	// 摘要只影响发给模型的上下文，不动数据库里的原始消息和前端展示。
+	summary := s.maybeSummarize(ctx, conversationID)
 	var reply *Reply
 	switch m := s.Model.(type) {
 	case *model.Real:
-		reply, err = s.runReal(ctx, conversationID, roundID, text, history, m, s.DebugModel)
+		reply, err = s.runReal(ctx, conversationID, roundID, text, history, summary, m, s.DebugModel)
 	case *model.Stub:
 		reply, err = s.runStub(ctx, conversationID, roundID, text, history)
 	default:

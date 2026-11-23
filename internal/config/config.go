@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 
 	"gopkg.in/yaml.v3"
@@ -36,6 +37,20 @@ type Config struct {
 		// 只算 user 和 assistant，tool 消息不占名额。
 		// 更早的消息数据库里全量保留，只是暂时不进模型上下文。
 		MaxHistoryMessages int `yaml:"maxHistoryMessages" json:"maxHistoryMessages"`
+		// Summary 是对话自动摘要（issue #19）的开关与阈值：
+		// 旧消息攒够 TriggerMessages 条时，把超出近期窗口的那段
+		// 总结成滚动摘要，下次调用模型时以 assistant 角色带上，
+		// 短对话（没攒够阈值）行为完全不变。
+		Summary struct {
+			// Enabled 是总开关，默认 true。关掉后不生成新摘要，
+			// 也不把已有摘要带进上下文，已存的摘要和游标保留在库里，
+			// 再打开时接着增量更新，不用重算。
+			Enabled bool `yaml:"enabled" json:"enabled"`
+			// TriggerMessages 是触发一次摘要需要的未覆盖消息条数，
+			// 默认 10：近期窗口默认 10 条，所以 user/assistant
+			// 消息总数超过 20 条时首次触发。
+			TriggerMessages int `yaml:"triggerMessages" json:"triggerMessages"`
+		} `yaml:"summary" json:"summary"`
 	} `yaml:"chat" json:"chat"`
 	Run struct {
 		// MaxSteps 是单次诊断（/api/runs）最多模型轮次，默认 8，
@@ -77,6 +92,8 @@ func Defaults() Config {
 	var c Config
 	c.Chat.MaxSteps = 12
 	c.Chat.MaxHistoryMessages = 10
+	c.Chat.Summary.Enabled = true
+	c.Chat.Summary.TriggerMessages = 10
 	c.Run.MaxSteps = 8
 	c.Run.TimeoutSeconds = 60
 	c.Run.MaxToolCallsPerRound = 5
@@ -104,6 +121,9 @@ func (c Config) Validate() error {
 		return err
 	}
 	if err := check("chat.maxHistoryMessages", c.Chat.MaxHistoryMessages, 1, 50); err != nil {
+		return err
+	}
+	if err := check("chat.summary.triggerMessages", c.Chat.Summary.TriggerMessages, 1, 100); err != nil {
 		return err
 	}
 	if err := check("run.maxSteps", c.Run.MaxSteps, 1, 50); err != nil {
@@ -160,6 +180,22 @@ func envFloat(key string) (float64, bool) {
 	return f, true
 }
 
+// envBool 从环境变量读一个布尔值：1 / true / 0 / false，
+// 大小写不敏感；读不到或解析失败返回 ok=false，调用方保留文件或默认值。
+func envBool(key string) (bool, bool) {
+	v := os.Getenv(key)
+	if v == "" {
+		return false, false
+	}
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true, true
+	case "0", "false", "no", "off":
+		return false, true
+	}
+	return false, false
+}
+
 // applyEnv 把环境变量覆盖到配置上。环境变量优先于文件，
 // 但只覆盖明确设置了的变量，没设置的字段保持文件或默认值。
 func applyEnv(c *Config) {
@@ -168,6 +204,12 @@ func applyEnv(c *Config) {
 	}
 	if v, ok := envInt("CHAT_MAX_HISTORY_MESSAGES"); ok {
 		c.Chat.MaxHistoryMessages = v
+	}
+	if v, ok := envBool("CHAT_SUMMARY_ENABLED"); ok {
+		c.Chat.Summary.Enabled = v
+	}
+	if v, ok := envInt("CHAT_SUMMARY_TRIGGER_MESSAGES"); ok {
+		c.Chat.Summary.TriggerMessages = v
 	}
 	if v, ok := envInt("RUN_MAX_STEPS"); ok {
 		c.Run.MaxSteps = v

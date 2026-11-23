@@ -490,7 +490,7 @@ func (r *Real) toolDefs() []chatToolDef {
 }
 
 // ApplyModelSettings 热更新模型的超时、温度和单次最大输出 token
-//（配置中心 POST 后调），不用重启；有任何一个值非法时都不改，保持旧值。
+// （配置中心 POST 后调），不用重启；有任何一个值非法时都不改，保持旧值。
 func (r *Real) ApplyModelSettings(timeout time.Duration, temperature float64, maxTokens int) {
 	if timeout <= 0 || temperature < 0 || temperature > 1 || maxTokens < 0 || maxTokens > 32768 {
 		return
@@ -755,7 +755,7 @@ func (r *Real) Next(ctx context.Context, in agent.ModelInput) (agent.ModelStep, 
 	// 都带上已攒的 totalUsage，调用方（Agent.Run）出错时也记账。
 	var totalUsage store.Usage
 	for attempt := 0; attempt < 2; attempt++ {
-		resp, err := r.callWithRetry(ctx, msgs, r.toolDefs())
+		resp, err := r.callWithRetry(ctx, msgs, r.toolDefs(), "auto")
 		if err != nil {
 			return agent.ModelStep{Usage: totalUsage}, err
 		}
@@ -938,11 +938,11 @@ func truncateRunes(s string, n int) string {
 
 // callWithRetry 调一次 chat completions，429 / 5xx / 网络错误才重试，
 // 400 这类请求错误不重试。退避是指数退避，最多 3 次。
-func (r *Real) callWithRetry(ctx context.Context, msgs []chatMessage, tools []chatToolDef) (*chatResponse, error) {
+func (r *Real) callWithRetry(ctx context.Context, msgs []chatMessage, tools []chatToolDef, toolChoice string) (*chatResponse, error) {
 	cfg := r.getCfg()
 	body, err := json.Marshal(chatRequest{
 		Model: cfg.ModelName, Messages: msgs, Tools: tools,
-		ToolChoice: "auto", Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens,
+		ToolChoice: toolChoice, Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens,
 	})
 	if err != nil {
 		return nil, err
@@ -1166,13 +1166,13 @@ func validRepairSuggestion(s *agent.SuggestedRepair) bool {
 
 func parseDiagnosisArgs(raw string) (*agent.Report, error) {
 	var dto struct {
-		Facts           json.RawMessage `json:"facts"`
-		Cause           json.RawMessage `json:"cause"`
-		EvidenceIDs     json.RawMessage `json:"evidenceIds"`
-		Recommendations json.RawMessage `json:"recommendations"`
-		OpenQuestions   json.RawMessage `json:"openQuestions"`
-		Confidence      json.RawMessage `json:"confidence"`
-		SuggestedRepair json.RawMessage `json:"suggestedRepair"`
+		Facts             json.RawMessage `json:"facts"`
+		Cause             json.RawMessage `json:"cause"`
+		EvidenceIDs       json.RawMessage `json:"evidenceIds"`
+		Recommendations   json.RawMessage `json:"recommendations"`
+		OpenQuestions     json.RawMessage `json:"openQuestions"`
+		Confidence        json.RawMessage `json:"confidence"`
+		SuggestedRepair   json.RawMessage `json:"suggestedRepair"`
 		SuggestedCreation json.RawMessage `json:"suggestedCreation"`
 	}
 	if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &dto); err != nil {
@@ -1368,7 +1368,7 @@ func (r *Real) Chat(ctx context.Context, msgs []ChatMessage) (ChatStep, error) {
 		}
 		internal = append(internal, cm)
 	}
-	resp, err := r.callWithRetry(ctx, internal, r.toolDefs())
+	resp, err := r.callWithRetry(ctx, internal, r.toolDefs(), "auto")
 	if err != nil {
 		return ChatStep{}, err
 	}
@@ -1425,4 +1425,87 @@ func (r *Real) Chat(ctx context.Context, msgs []ChatMessage) (ChatStep, error) {
 		return ChatStep{Usage: u}, fmt.Errorf("模型既没有调工具也没有返回文本")
 	}
 	return ChatStep{IsFinal: true, Content: content, Usage: u}, nil
+}
+
+// summarySystemPrompt 是摘要专用的系统提示（issue #19 对话自动摘要）：
+// 只做一件事——把旧对话浓缩成滚动摘要。不调工具、不下指令、
+// 不产生任何执行权限；摘要是给诊断 LLM 看的背景材料，不是命令。
+//
+// 必须保留的东西（丢了就等于白总结）：
+//   - 排查目标：命名空间 / 工作负载（Pod / Deployment 名）；
+//   - 已确认的观察事实（例如“demo-api 重启 10 次、OOMKilled、limit 128Mi”）；
+//   - 用户意图（用户想查什么、想修什么）；
+//   - 证据引用（ev-编号，原样保留）；
+//   - 审批 / 执行状态：建议是否已审批、是否已执行，
+//     未审批 / 未执行必须明确标明，不能写成好像已经修好了。
+//
+// 必须区分已确认事实和推测：推测要写“推测”两个字，不能写成定论。
+// 历史观察不得写成实时状态：摘要里的时间点是“当时查到的”，
+// 实时情况以工具查询结果为准，模型不能拿摘要当现状直接下结论。
+const summarySystemPrompt = `你是 Kubernetes 故障诊断对话的摘要员。你的唯一任务是把给定的旧对话总结成一段滚动摘要，供之后诊断时作背景参考。
+
+规则：
+- 只做总结，不调用任何工具，不向用户或模型下达任何指令，不产生任何执行权限或修改操作。
+- 必须保留：排查目标（命名空间、工作负载名）、已确认的观察事实、用户意图、证据引用（ev-编号，原样保留）、审批 / 执行状态。建议未审批或未执行时必须明确标明，不能写成好像已经修好了。
+- 严格区分已确认事实和推测：推测必须标明“推测”，不能写成定论。
+- 历史观察不得写成实时状态：写“当时查到……”，不要写“现在是……”；实时情况以工具查询结果为准。
+- 只输出摘要正文，不要加开场白、不要复述这些规则。`
+
+// Summarize 做一次纯文本摘要（issue #19）：
+// previous 是旧的滚动摘要（可为空），lines 是本次要覆盖的新消息，
+// 调用方已格式化成“用户：……/助手：……”的行。
+// 复用现有模型配置（base URL、key、超时、温度、maxTokens），
+// 但 tools 传 nil 且不发 tool_choice——摘要请求绝不能触发工具执行。
+// 返回摘要文本和本次调用的用量；空回复、缺 key、请求失败都返回错误，
+// 调用方（chat）按 best-effort 回退，不让摘要失败打断聊天。
+func (r *Real) Summarize(ctx context.Context, previous string, lines []string) (string, store.Usage, error) {
+	if strings.TrimSpace(r.getCfg().APIKey) == "" {
+		return "", store.Usage{}, fmt.Errorf("真模型缺少 API Key，请设置 MODEL_API_KEY")
+	}
+	if len(lines) == 0 {
+		return "", store.Usage{}, fmt.Errorf("没有待总结的消息")
+	}
+	var b strings.Builder
+	b.WriteString("旧摘要：\n")
+	if strings.TrimSpace(previous) == "" {
+		b.WriteString("（无）\n")
+	} else {
+		b.WriteString(strings.TrimSpace(previous) + "\n")
+	}
+	fmt.Fprintf(&b, "\n待总结的新消息（共 %d 条，只含用户和助手消息，不含工具调用记录）：\n", len(lines))
+	for _, l := range lines {
+		b.WriteString(l + "\n")
+	}
+	b.WriteString("\n请基于旧摘要和这些新消息，输出更新后的完整滚动摘要。")
+	resp, err := r.callWithRetry(ctx, []chatMessage{
+		{Role: "system", Content: summarySystemPrompt},
+		{Role: "user", Content: b.String()},
+	}, nil, "")
+	if err != nil {
+		return "", store.Usage{}, err
+	}
+	u := usageOf(resp)
+	if len(resp.Choices) == 0 {
+		return "", u, fmt.Errorf("模型返回为空，没有 choices")
+	}
+	content := strings.TrimSpace(resp.Choices[0].Message.Content)
+	if content == "" {
+		return "", u, fmt.Errorf("模型没有返回摘要文本")
+	}
+	return content, u, nil
+}
+
+// Summarize 是桩模型的摘要实现：不调任何 API，返回确定性占位摘要。
+// 占位符带上本次总结的消息条数，便于测试断言触发与增量；
+// 有旧摘要时把它原样接在前面再追加新标记，这样增量更新后
+// 库里的摘要能看出是两次接起来的，不是互相覆盖。
+// 用量为零——桩模型本来就不花 token，不编用量。
+// 摘要流程（触发、游标、落库）在 Stub 下也照常跑通，
+// 只是内容是占位符；真模型行为以 Real.Summarize 为准。
+func (s *Stub) Summarize(ctx context.Context, previous string, lines []string) (string, store.Usage, error) {
+	mark := fmt.Sprintf("（测试摘要：已总结 %d 条历史消息）", len(lines))
+	if strings.TrimSpace(previous) == "" {
+		return mark, store.Usage{}, nil
+	}
+	return previous + "\n" + mark, store.Usage{}, nil
 }

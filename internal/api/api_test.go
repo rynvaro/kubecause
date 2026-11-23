@@ -199,3 +199,37 @@ func TestConfigGetPost(t *testing.T) {
 		t.Fatalf("temperature=2 应 400，得到 %d: %s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestConfigPartialPostKeepsOtherFields(t *testing.T) {
+	h := newHandler(t)
+	dir := t.TempDir()
+	mgr := config.NewManager(config.Defaults(), filepath.Join(dir, "config.yaml"))
+	h.Config = mgr
+	mux := http.NewServeMux()
+	h.Register(mux)
+	// 只改对话步数：其他字段（包括摘要开关）应保持现值，
+	// 而不是被 JSON 零值覆盖——布尔开关没有非法值可校验，
+	// 零值解码会让一次漏字段的旧客户端静默关掉摘要。
+	req := httptest.NewRequest("POST", "/api/config", bytes.NewReader([]byte(`{"chat":{"maxSteps":20}}`)))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("部分配置 POST 应 200，得到 %d: %s", rec.Code, rec.Body.String())
+	}
+	req = httptest.NewRequest("GET", "/api/config", nil)
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	var got config.Config
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("GET 返回应是合法配置 JSON: %v", err)
+	}
+	if got.Chat.MaxSteps != 20 {
+		t.Fatalf("maxSteps 应改成 20，得到 %d", got.Chat.MaxSteps)
+	}
+	if !got.Chat.Summary.Enabled || got.Chat.Summary.TriggerMessages != 10 {
+		t.Fatalf("没提到的摘要配置应保持原值，得到 %+v", got.Chat.Summary)
+	}
+	if got.Model.MaxTokens != 4096 {
+		t.Fatalf("没提到的 maxTokens 应保持 4096，得到 %d", got.Model.MaxTokens)
+	}
+}

@@ -893,6 +893,34 @@ export default function App() {
                     每次调用模型时带上的最近用户/助手消息条数，工具调用不占名额。调大更记得上文，但更费 token。
                   </span>
                 </label>
+                <label>
+                  启用对话自动摘要
+                  <input
+                    type="checkbox"
+                    checked={cfg.chat.summary.enabled}
+                    onChange={(e) =>
+                      setCfg({ ...cfg, chat: { ...cfg.chat, summary: { ...cfg.chat.summary, enabled: e.target.checked } } })
+                    }
+                  />
+                  <span className="muted small">
+                    旧消息攒够阈值时自动总结成滚动摘要，下次调用模型时带上，长对话不再丢早期的目标和结论。关掉后不生成新摘要，已存的摘要也不带进上下文。
+                  </span>
+                </label>
+                <label>
+                  摘要触发消息数
+                  <input
+                    type="number"
+                    min={1}
+                    max={100}
+                    value={cfg.chat.summary.triggerMessages}
+                    onChange={(e) =>
+                      setCfg({ ...cfg, chat: { ...cfg.chat, summary: { ...cfg.chat.summary, triggerMessages: Number(e.target.value) } } })
+                    }
+                  />
+                  <span className="muted small">
+                    不在最近窗口内、还没被摘要覆盖的消息攒够这个数时触发一次摘要。默认 10，近期窗口也是 10 条，所以消息总数超过 20 条时首次触发。
+                  </span>
+                </label>
                 <h4>单次诊断</h4>
                 <label>
                   单次诊断最大工具步数

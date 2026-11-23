@@ -134,19 +134,19 @@ type Run struct {
 // 不再按行数算（见 issue #6）。Round = -1 表示未知（迁移前没有这一列的
 // 老数据）；新写入的步骤一定是 >=0 的轮次。
 type RunStep struct {
-	ID         int64     `json:"id"`
-	RunID      string    `json:"runId"`
-	Seq        int       `json:"seq"`
-	Kind       string    `json:"kind"` // tool_call / tool_result / report / approval / error
-	ToolName   string    `json:"toolName,omitempty"`
-	CallID     string    `json:"callId,omitempty"`
-	ArgsJSON   string    `json:"args,omitempty"`
-	ResultJSON string    `json:"result,omitempty"`
-	Summary    string    `json:"summary,omitempty"`
-	Error      string    `json:"error,omitempty"`
-	DurationMs int64     `json:"durationMs"`
-	RetryCount int       `json:"retryCount"`
-	Round      int       `json:"round,omitempty"`
+	ID         int64  `json:"id"`
+	RunID      string `json:"runId"`
+	Seq        int    `json:"seq"`
+	Kind       string `json:"kind"` // tool_call / tool_result / report / approval / error
+	ToolName   string `json:"toolName,omitempty"`
+	CallID     string `json:"callId,omitempty"`
+	ArgsJSON   string `json:"args,omitempty"`
+	ResultJSON string `json:"result,omitempty"`
+	Summary    string `json:"summary,omitempty"`
+	Error      string `json:"error,omitempty"`
+	DurationMs int64  `json:"durationMs"`
+	RetryCount int    `json:"retryCount"`
+	Round      int    `json:"round,omitempty"`
 	// EvidenceID 是这一步成功时分配的证据 ID（ev-<n>）：只在成功执行时写，
 	// 失败步骤留空。恢复时直接读它，不再从步骤序号推算（见 issue #8）。
 	// 老数据没有这一列时读出来是空字符串，只贡献 CallID。
@@ -229,13 +229,20 @@ type ChangeRequest struct {
 // 对话和单次诊断是两条线：对话只读、不直接改集群，
 // 需要修复时转成 /api/runs 的正式诊断再走审批。
 type Conversation struct {
-	ID        string    `json:"id"`
-	Title     string    `json:"title"`
+	ID    string `json:"id"`
+	Title string `json:"title"`
 	// Usage 是本会话累计的 token 用量：每轮对话里每次模型调用成功后累加，
 	// 只做加法、从不重算。
-	Usage     Usage     `json:"usage"`
-	CreatedAt time.Time `json:"createdAt"`
-	UpdatedAt time.Time `json:"updatedAt"`
+	Usage Usage `json:"usage"`
+	// Summary 是本会话的滚动摘要（issue #19 对话自动摘要）：
+	// 超出近期窗口的旧对话的浓缩文本；SummaryCursor 是它已覆盖的
+	// 最后消息 ID（messages.id），0 表示还没有摘要。
+	// 这两个字段是内部上下文材料，不进 API 返回（json:"-"），
+	// 前端展示的是 messages 全量历史，不靠它们。
+	Summary       string    `json:"-"`
+	SummaryCursor int64     `json:"-"`
+	CreatedAt     time.Time `json:"createdAt"`
+	UpdatedAt     time.Time `json:"updatedAt"`
 }
 
 // ConversationMessage 对应 messages 表，一条会话消息。
@@ -370,6 +377,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			prompt_tokens INTEGER NOT NULL DEFAULT 0,
 			completion_tokens INTEGER NOT NULL DEFAULT 0,
 			total_tokens INTEGER NOT NULL DEFAULT 0,
+			summary TEXT NOT NULL DEFAULT '',
+			summary_cursor INTEGER NOT NULL DEFAULT 0,
 			created_at DATETIME NOT NULL,
 			updated_at DATETIME NOT NULL
 		)`,
@@ -447,6 +456,18 @@ func (s *Store) migrate(ctx context.Context) error {
 		if err := s.ensureColumn(ctx, "runs", col.name, col.typ); err != nil {
 			return err
 		}
+		if err := s.ensureColumn(ctx, "conversations", col.name, col.typ); err != nil {
+			return err
+		}
+	}
+	// conversations 表的老库升级（issue #19 对话自动摘要）：
+	// 滚动摘要文本 + 已覆盖的最后消息 ID（游标，0 表示还没有摘要）。
+	// 老库没有这两列时补上，读出来是空摘要 + 游标 0，
+	// 下次对话按阈值正常触发，不用重建库、不丢历史。
+	for _, col := range []struct{ name, typ string }{
+		{"summary", "TEXT NOT NULL DEFAULT ''"},
+		{"summary_cursor", "INTEGER NOT NULL DEFAULT 0"},
+	} {
 		if err := s.ensureColumn(ctx, "conversations", col.name, col.typ); err != nil {
 			return err
 		}
@@ -924,19 +945,19 @@ func (s *Store) CreateConversation(ctx context.Context, title string) (*Conversa
 	return c, nil
 }
 
-// GetConversation 按 ID 取会话。
+// GetConversation 按 ID 取会话（含滚动摘要与游标，issue #19）。
 func (s *Store) GetConversation(ctx context.Context, id string) (*Conversation, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, title, prompt_tokens, completion_tokens, total_tokens, created_at, updated_at FROM conversations WHERE id=?`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT id, title, prompt_tokens, completion_tokens, total_tokens, summary, summary_cursor, created_at, updated_at FROM conversations WHERE id=?`, id)
 	c := &Conversation{}
-	if err := row.Scan(&c.ID, &c.Title, &c.Usage.PromptTokens, &c.Usage.CompletionTokens, &c.Usage.TotalTokens, &c.CreatedAt, &c.UpdatedAt); err != nil {
+	if err := row.Scan(&c.ID, &c.Title, &c.Usage.PromptTokens, &c.Usage.CompletionTokens, &c.Usage.TotalTokens, &c.Summary, &c.SummaryCursor, &c.CreatedAt, &c.UpdatedAt); err != nil {
 		return nil, err
 	}
 	return c, nil
 }
 
-// ListConversations 按更新时间倒序列出会话。
+// ListConversations 按更新时间倒序列出会话（含滚动摘要与游标，issue #19）。
 func (s *Store) ListConversations(ctx context.Context) ([]Conversation, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, title, prompt_tokens, completion_tokens, total_tokens, created_at, updated_at FROM conversations ORDER BY updated_at DESC LIMIT 50`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, title, prompt_tokens, completion_tokens, total_tokens, summary, summary_cursor, created_at, updated_at FROM conversations ORDER BY updated_at DESC LIMIT 50`)
 	if err != nil {
 		return nil, err
 	}
@@ -944,12 +965,32 @@ func (s *Store) ListConversations(ctx context.Context) ([]Conversation, error) {
 	out := []Conversation{}
 	for rows.Next() {
 		var c Conversation
-		if err := rows.Scan(&c.ID, &c.Title, &c.Usage.PromptTokens, &c.Usage.CompletionTokens, &c.Usage.TotalTokens, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.Title, &c.Usage.PromptTokens, &c.Usage.CompletionTokens, &c.Usage.TotalTokens, &c.Summary, &c.SummaryCursor, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+// UpdateConversationSummary 乐观更新滚动摘要与游标（issue #19）：
+// 只有当前游标仍等于 expectedCursor 时才写，返回 true；
+// 已被别的请求先推进时返回 false，不写，调用方应重读后跳过，
+// 绝不能用旧摘要覆盖新摘要、绝不能让游标回退。
+// 新游标必须是本次被覆盖消息的最大 id（调用方保证），
+// 0 只在“还没有摘要”时出现，更新永远只往前推。
+func (s *Store) UpdateConversationSummary(ctx context.Context, id, summary string, cursor, expectedCursor int64) (bool, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE conversations SET summary=?, summary_cursor=?, updated_at=? WHERE id=? AND summary_cursor=?`,
+		summary, cursor, now(), id, expectedCursor)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
 }
 
 // AddConversationUsage 把一次模型调用的用量累加到会话上（token 用量统计）：

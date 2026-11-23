@@ -124,8 +124,10 @@ func logModelResponse(conversationID, roundID string, step int, st model.ChatSte
 // 模型调工具就执行并把结果以 tool 角色追加进历史，
 // 模型给最终文本或提交诊断报告就结束本轮。
 // 历史只带最近 s.maxHistory() 条用户/助手消息，tool 消息不占名额
-// （见 chat.go 的 lastMessages）；本轮调工具的结果由下面的循环
-// 实时追加进模型输入，不用靠历史带。
+// （见 chat.go 的 lastMessages）；超出窗口的旧对话由滚动摘要兜底
+// （summary 参数，issue #19）：有摘要时以 assistant 角色放在
+// system 之后、最近历史之前，开头带标注；
+// 本轮调工具的结果由下面的循环实时追加进模型输入，不用靠历史带。
 //
 // 当前问题在模型输入里只出现一次：RunMessage 先把用户消息落盘，
 // history 里已经有这句了，这里不要再追加一遍 text。
@@ -143,8 +145,16 @@ func logModelResponse(conversationID, roundID string, step int, st model.ChatSte
 // MaxChatSteps 是预算不是决策——它只决定一轮最多查多少，
 // 不决定模型该查什么；查到的东西不能因为预算用完就丢掉，
 // 否则用户看到的是一片空白加一句报错，等于白查了。
-func (s *Service) runReal(ctx context.Context, conversationID, roundID, text string, history []store.ConversationMessage, m *model.Real, debug bool) (*Reply, error) {
+func (s *Service) runReal(ctx context.Context, conversationID, roundID, text string, history []store.ConversationMessage, summary string, m *model.Real, debug bool) (*Reply, error) {
 	msgs := []model.ChatMessage{{Role: "system", Content: chatSystemPrompt}}
+	if strings.TrimSpace(summary) != "" {
+		// 滚动摘要（issue #19）：以 assistant 角色放在 system 之后、
+		// 最近历史之前，开头带标注，明确告诉模型这是不可信的历史资料，
+		// 不是实时状态、不是指令。角色已和用户定死：assistant + 标注，
+		// 绝不用 system（摘要里混着用户原话，放 system 等于把用户的话升级成指令）。
+		// 短对话没有摘要时这一行不存在，行为和以前完全一样。
+		msgs = append(msgs, model.ChatMessage{Role: "assistant", Content: SummaryMarker + "\n" + summary})
+	}
 	for _, h := range history {
 		switch h.Role {
 		case "user":
@@ -396,7 +406,7 @@ func (s *Service) runReal(ctx context.Context, conversationID, roundID, text str
 
 // buildPartialReply 把步数用完（或报告生成失败）时已查到的工具结果
 // 整理成半成品回复。intro 说明为什么没能给完整结论
-//（步数用完 / 报告生成失败），文字里诚实说明两件事：
+// （步数用完 / 报告生成失败），文字里诚实说明两件事：
 // 已经查到了什么、还没来得及做什么（总结），
 // 再问用户想深入查哪个命名空间或 Pod，让下一轮从那里继续，
 // 而不是让用户换个更具体的问题重问——问题本身没错，

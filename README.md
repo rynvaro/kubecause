@@ -29,7 +29,7 @@ https://github.com/user-attachments/assets/270dff5f-017c-4b61-9ba7-34132ec58207
 | **模型与配置** | Stub 演示和 OpenAI 兼容模型接口；运行参数支持配置文件及设置页调整 |
 | **Web 界面** | React + TypeScript 对话页面、结构化结果卡片、执行时间线和审批交互 |
 
-**当前范围：** 已有基础上下文和关键词 RAG，但尚无自动摘要、向量长期记忆、语义混合检索、SSE 流式回答或 Kubernetes 工具 MCP Server；这些属于后续规划。
+**当前范围：** 已有基础上下文、对话自动摘要和关键词 RAG，但尚无向量长期记忆、语义混合检索、SSE 流式回答或 Kubernetes 工具 MCP Server；这些属于后续规划。
 
 ## 工作流程
 

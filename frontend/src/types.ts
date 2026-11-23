@@ -192,7 +192,7 @@ export interface Conversation {
 // 注意：这里没有 MODEL_API_KEY——Key 只从环境变量读，
 // 绝不进配置文件、绝不在 GET /api/config 里返回、绝不在前端显示。
 export interface AppConfig {
-  chat: { maxSteps: number; maxHistoryMessages: number }
+  chat: { maxSteps: number; maxHistoryMessages: number; summary: { enabled: boolean; triggerMessages: number } }
   run: { maxSteps: number; timeoutSeconds: number; maxToolCallsPerRound: number }
   model: { timeoutSeconds: number; temperature: number; maxTokens: number }
   repair: { maxMemoryMi: number; maxRatio: number }

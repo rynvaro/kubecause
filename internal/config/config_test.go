@@ -181,3 +181,77 @@ func TestManagerHotReload(t *testing.T) {
 		t.Fatalf("非法更新后内存值应保持不变，得到 %+v", mgr.Current())
 	}
 }
+
+func TestDefaultsSummary(t *testing.T) {
+	c := Defaults()
+	if !c.Chat.Summary.Enabled {
+		t.Fatalf("摘要默认应开启")
+	}
+	if c.Chat.Summary.TriggerMessages != 10 {
+		t.Fatalf("摘要触发阈值默认应是 10，得到 %d", c.Chat.Summary.TriggerMessages)
+	}
+}
+
+func TestValidateRejectsBadSummaryTrigger(t *testing.T) {
+	for _, v := range []int{0, 101} {
+		c := Defaults()
+		c.Chat.Summary.TriggerMessages = v
+		if err := c.Validate(); err == nil {
+			t.Fatalf("triggerMessages=%d 应被校验拒绝", v)
+		}
+	}
+}
+
+func TestLoadEnvSummary(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte("chat:\n  maxSteps: 16\n"), 0644); err != nil {
+		t.Fatalf("写测试配置失败: %v", err)
+	}
+	t.Setenv("CHAT_SUMMARY_ENABLED", "false")
+	t.Setenv("CHAT_SUMMARY_TRIGGER_MESSAGES", "25")
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("读配置失败: %v", err)
+	}
+	if c.Chat.Summary.Enabled {
+		t.Fatalf("CHAT_SUMMARY_ENABLED=false 应关掉摘要")
+	}
+	if c.Chat.Summary.TriggerMessages != 25 {
+		t.Fatalf("CHAT_SUMMARY_TRIGGER_MESSAGES 应是 25，得到 %d", c.Chat.Summary.TriggerMessages)
+	}
+}
+
+func TestLoadEnvSummaryBadBoolIgnored(t *testing.T) {
+	// 环境变量布尔值解析失败时保留文件或默认值，不报错、不关功能。
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte("chat:\n  maxSteps: 16\n"), 0644); err != nil {
+		t.Fatalf("写测试配置失败: %v", err)
+	}
+	t.Setenv("CHAT_SUMMARY_ENABLED", "bogus")
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("读配置失败: %v", err)
+	}
+	if !c.Chat.Summary.Enabled {
+		t.Fatalf("非法布尔值应被忽略、摘要保持开启")
+	}
+}
+
+func TestLoadOldFileKeepsSummaryDefaults(t *testing.T) {
+	// 老 config.yaml 里没有 summary 一节：按默认值解码，
+	// 摘要保持开启、阈值 10，而不是被 YAML 零值关掉。
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte("chat:\n  maxSteps: 16\n"), 0644); err != nil {
+		t.Fatalf("写测试配置失败: %v", err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("读配置失败: %v", err)
+	}
+	if !c.Chat.Summary.Enabled || c.Chat.Summary.TriggerMessages != 10 {
+		t.Fatalf("老文件应保持摘要默认开启 / 阈值 10，得到 %+v", c.Chat.Summary)
+	}
+}
